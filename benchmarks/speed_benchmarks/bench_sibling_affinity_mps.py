@@ -75,6 +75,31 @@ def _flush_caches(ports: List[int]) -> None:
                 raise RuntimeError(f"flush_cache failed on port {port}: status={resp.status}")
 
 
+def _make_kv_usage_poller(ports: List[int]):
+    """Poll SGLang /get_server_info with a 50ms TTL cache for KV occupancy."""
+    cache: Dict[str, Any] = {"ts": 0.0, "vals": [0.0] * len(ports)}
+
+    def poll() -> List[float]:
+        now = time.monotonic()
+        if now - cache["ts"] < 0.05:
+            return cache["vals"]
+        vals: List[float] = []
+        for port in ports:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/get_server_info", timeout=0.2) as resp:
+                    info = json.loads(resp.read().decode("utf-8"))
+                used = float(info.get("token_usage", info.get("num_used_tokens", 0.0)))
+                cap = float(info.get("max_total_num_tokens", 1.0))
+                vals.append(used if used <= 1.0 else min(1.0, used / max(cap, 1.0)))
+            except Exception:
+                vals.append(0.0)
+        cache["ts"] = now
+        cache["vals"] = vals
+        return vals
+
+    return poll
+
+
 def _build_tasks(num_prompts: int, group_size: int, prefix_repeats: int, *, heterogeneous: bool = True) -> List[Sample]:
     base_unit = (
         "You are an analytical assistant solving multi-step reasoning tasks with tool calls. "
@@ -298,6 +323,7 @@ def main() -> None:
             max_new_tokens=8,
         )
 
+        kv_usage_fn = _make_kv_usage_poller(ports)
         experiments = [
             ("v1_least_loaded", {"affinity_policy": "least_loaded", "worker_node_ids": worker_node_ids}),
             ("v2_group_packing", {"affinity_policy": "group_packing", "worker_node_ids": worker_node_ids}),
@@ -319,6 +345,21 @@ def main() -> None:
                     "balance_rel_threshold": 1.5,
                     "max_inflight_tokens": 16384,
                     "worker_node_ids": worker_node_ids,
+                    "kv_usage_fn": kv_usage_fn,
+                },
+            ),
+            (
+                "v4_kv_replicated_steal",
+                {
+                    "affinity_policy": "cache_aware_scored",
+                    "stagger_leader_prefill": True,
+                    "leader_stagger_ms": args.leader_stagger_ms,
+                    "balance_rel_threshold": 1.5,
+                    "max_inflight_tokens": 16384,
+                    "worker_node_ids": worker_node_ids,
+                    "kv_usage_fn": kv_usage_fn,
+                    "kv_replication": "hicache_l2",
+                    "enable_work_stealing": True,
                 },
             ),
         ]

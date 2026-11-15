@@ -389,6 +389,8 @@ class AgenticTrainer(BaseTrainer):
                 "rollout_dispatch/group_single_worker_rate": dispatch_stats["group_single_worker_rate"],
                 "rollout_dispatch/cross_node_spill_rate": dispatch_stats["cross_node_spill_rate"],
                 "rollout_dispatch/stagger_holds": dispatch_stats["stagger_holds"],
+                "rollout_dispatch/kv_replication_hits": dispatch_stats["kv_replication_hits"],
+                "rollout_dispatch/work_steals": dispatch_stats["work_steals"],
                 "rollout_dispatch/tasks_dispatched": dispatch_stats["tasks_dispatched"],
             },
         )

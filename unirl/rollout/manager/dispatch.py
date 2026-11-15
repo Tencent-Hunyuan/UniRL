@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 _WORKER_CONTROL_CONCURRENCY = 2
 AFFINITY_POLICIES = ("least_loaded", "group_packing", "cache_aware_scored")
+KV_REPLICATION_MODES = ("none", "hicache_l2", "mooncake", "p2p_mirror")
 
 
 Launch = Callable[["Sample"], Any]
@@ -74,10 +75,18 @@ class RolloutPool:
         prefix_affinity_weight: float = 1.0,
         load_weight: float = 0.5,
         active_tokens_weight: float = 0.3,
+        kv_replication: str = "none",
+        enable_work_stealing: Optional[bool] = None,
+        kv_usage_fn: Optional[Callable[[], Sequence[float]]] = None,
+        kv_replicator: Optional[Callable[[int, int, str], Any]] = None,
     ) -> None:
         if affinity_policy not in AFFINITY_POLICIES:
             raise ValueError(
                 f"RolloutPool affinity_policy must be one of {AFFINITY_POLICIES}; got {affinity_policy!r}"
+            )
+        if kv_replication not in KV_REPLICATION_MODES:
+            raise ValueError(
+                f"RolloutPool kv_replication must be one of {KV_REPLICATION_MODES}; got {kv_replication!r}"
             )
         if leader_stagger_ms < 0:
             raise ValueError(f"leader_stagger_ms must be non-negative; got {leader_stagger_ms}")
@@ -96,6 +105,10 @@ class RolloutPool:
         self._prefix_affinity_weight = float(prefix_affinity_weight)
         self._load_weight = float(load_weight)
         self._active_tokens_weight = float(active_tokens_weight)
+        self._kv_replication = kv_replication
+        self._enable_work_stealing = (kv_replication != "none") if enable_work_stealing is None else bool(enable_work_stealing)
+        self._kv_usage_fn = kv_usage_fn
+        self._kv_replicator = kv_replicator
         self._launchers = list(launchers)
         self._capacities = [int(capacity) for capacity in capacities]
         if not self._launchers:
@@ -127,10 +140,14 @@ class RolloutPool:
         self._failure: Optional[BaseException] = None
         self._dispatched_tasks = 0
         self._stagger_holds = 0
+        self._kv_replication_hits = 0
+        self._work_steals = 0
         self._root_launchers: Dict[str, set[int]] = {}
         self._root_task_counts: Dict[str, int] = {}
         self._leader_dispatched_at: Dict[str, float] = {}
+        self._leader_primary_worker: Dict[str, int] = {}
         self._leader_completed: set[str] = set()
+        self._replicated_roots: Dict[str, int] = {}
         self._condition = threading.Condition()
         self._thread = threading.Thread(target=self._progress, name="rollout-pool", daemon=True)
         self._thread.start()
@@ -244,14 +261,20 @@ class RolloutPool:
                 "sibling_co_located_rate": float(co_located_rate),
                 "cross_node_spill_rate": float(cross_node_spill_rate),
                 "stagger_holds": float(self._stagger_holds),
+                "kv_replication_hits": float(self._kv_replication_hits),
+                "work_steals": float(self._work_steals),
             }
             if reset:
                 self._dispatched_tasks = 0
                 self._stagger_holds = 0
+                self._kv_replication_hits = 0
+                self._work_steals = 0
                 self._root_launchers.clear()
                 self._root_task_counts.clear()
                 self._leader_dispatched_at.clear()
+                self._leader_primary_worker.clear()
                 self._leader_completed.clear()
+                self._replicated_roots.clear()
             return stats
 
     def close(self) -> None:
@@ -338,6 +361,8 @@ class RolloutPool:
                     self._running_tokens[unit.launcher] = max(0, self._running_tokens[unit.launcher] - unit.est_tokens)
                     if unit.root_id is not None:
                         self._leader_completed.add(unit.root_id)
+                        if self._kv_replication != "none":
+                            self._replicated_roots.setdefault(unit.root_id, unit.launcher)
                     self._completed.append(unit)
                 self._condition.notify_all()
 
@@ -348,6 +373,30 @@ class RolloutPool:
             self._root_task_counts[root_id] = self._root_task_counts.get(root_id, 0) + 1
             if root_id not in self._leader_dispatched_at:
                 self._leader_dispatched_at[root_id] = now
+                self._leader_primary_worker[root_id] = launcher_index
+
+    def _poll_kv_usages(self) -> Optional[List[float]]:
+        """Poll optional per-worker KV occupancy in [0.0, 1.0]; return None if unavailable."""
+        if self._kv_usage_fn is None:
+            return None
+        try:
+            vals = [max(0.0, min(1.0, float(v))) for v in self._kv_usage_fn()]
+        except Exception:
+            return None
+        return vals if len(vals) == len(self._launchers) else None
+
+    def _is_replicated(self, root_id: Optional[str], now: float) -> bool:
+        if self._kv_replication == "none" or root_id is None:
+            return False
+        if root_id in self._replicated_roots:
+            return True
+        if self._stagger_leader_prefill and root_id in self._leader_dispatched_at:
+            if (now - self._leader_dispatched_at[root_id]) >= self._leader_stagger_s:
+                primary = self._leader_primary_worker.get(root_id)
+                if primary is not None:
+                    self._replicated_roots[root_id] = primary
+                    return True
+        return False
 
     def _is_stagger_held(self, root_id: Optional[str], now: float) -> bool:
         if not self._stagger_leader_prefill or root_id is None or root_id in self._leader_completed:
@@ -364,6 +413,8 @@ class RolloutPool:
         est_tokens: int,
         load: List[int],
         tok_load: List[int],
+        kv_usages: Optional[List[float]],
+        now: float,
     ) -> Optional[int]:
         eligible = [i for i in range(len(self._launchers)) if load[i] < self._capacities[i]]
         if not eligible:
@@ -389,15 +440,19 @@ class RolloutPool:
             if (self._worker_node_ids is not None and known_workers)
             else set()
         )
+        replicated = self._is_replicated(root_id, now)
 
         def score(i: int) -> tuple[float, int, int]:
             if i in known_workers:
                 affinity = 1.0
+            elif replicated:
+                same_node = self._worker_node_ids is not None and self._worker_node_ids[i] in known_nodes
+                affinity = 0.85 if same_node else 0.75
             elif self._worker_node_ids is not None and self._worker_node_ids[i] in known_nodes:
                 affinity = 0.35
             else:
                 affinity = 0.0
-            load_ratio = load[i] / self._capacities[i]
+            load_ratio = kv_usages[i] if kv_usages is not None else (load[i] / self._capacities[i])
             tok_ratio = (tok_load[i] / self._max_inflight_tokens) if self._max_inflight_tokens else 0.0
             val = (
                 self._prefix_affinity_weight * affinity
@@ -406,7 +461,16 @@ class RolloutPool:
             )
             return (val, -load[i], -i)
 
-        return max(eligible, key=score)
+        chosen = max(eligible, key=score)
+        if replicated and root_id is not None and chosen not in known_workers:
+            self._kv_replication_hits += 1
+            if self._enable_work_stealing and any(load[w] > load[chosen] for w in known_workers):
+                self._work_steals += 1
+            if self._kv_replicator is not None:
+                src = self._replicated_roots.get(root_id)
+                if src is not None:
+                    self._kv_replicator(src, chosen, root_id)
+        return chosen
 
     def _plan_launches(self) -> List[tuple[int, int, "Sample", Optional[str], int]]:
         """Reserve launcher slots for queued tasks; caller holds the lock."""
@@ -422,6 +486,7 @@ class RolloutPool:
         now = time.monotonic()
 
         if self._affinity_policy == "cache_aware_scored":
+            kv_usages = self._poll_kv_usages()
             deferred: Deque[tuple[int, "Sample"]] = deque()
             while self._queue:
                 if all(load[i] >= self._capacities[i] for i in range(len(self._launchers))):
@@ -438,6 +503,8 @@ class RolloutPool:
                     est_tokens=est_tokens,
                     load=load,
                     tok_load=tok_load,
+                    kv_usages=kv_usages,
+                    now=now,
                 )
                 if index is None:
                     deferred.append((sequence, task))
@@ -569,4 +636,10 @@ def validate_worker_inflight(
         )
 
 
-__all__ = ["AFFINITY_POLICIES", "RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]
+__all__ = [
+    "AFFINITY_POLICIES",
+    "KV_REPLICATION_MODES",
+    "RolloutPool",
+    "required_worker_concurrency",
+    "validate_worker_inflight",
+]
