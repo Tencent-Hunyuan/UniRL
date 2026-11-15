@@ -338,7 +338,7 @@ def _per_sample_rope(
         )
         position_parts.append(position_ids)
         delta_parts.append(torch.as_tensor(rope_delta, device=device).reshape(1, -1))
-    position_ids = torch.cat(position_parts, dim=1).long()
+    position_ids = torch.cat(position_parts, dim=1)  # [3, B, L] float: video temporal positions can be fractional
     rope_deltas = torch.cat(delta_parts, dim=0)
     rope_deltas = rope_deltas - (1 - attention_mask.long()).sum(dim=-1, keepdim=True)
     return position_ids, rope_deltas
