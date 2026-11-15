@@ -5,15 +5,26 @@ from __future__ import annotations
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Deque, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Sequence
+
+from unirl.rollout.manager.buffers import roots_of
 
 if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 _WORKER_CONTROL_CONCURRENCY = 2
+AFFINITY_POLICIES = ("least_loaded", "group_packing")
 
 
 Launch = Callable[["Sample"], Any]
+
+
+def _single_root_id(task: "Sample") -> Optional[str]:
+    """Return ``task``'s single root id when available, else None."""
+    if not getattr(task, "parts", None):
+        return None
+    roots = roots_of(task)
+    return roots[0] if len(roots) == 1 else None
 
 
 @dataclass(frozen=True)
@@ -33,7 +44,14 @@ class RolloutPool:
         self,
         launchers: Sequence[Launch],
         capacities: Sequence[int],
+        *,
+        affinity_policy: str = "least_loaded",
     ) -> None:
+        if affinity_policy not in AFFINITY_POLICIES:
+            raise ValueError(
+                f"RolloutPool affinity_policy must be one of {AFFINITY_POLICIES}; got {affinity_policy!r}"
+            )
+        self._affinity_policy = affinity_policy
         self._launchers = list(launchers)
         self._capacities = [int(capacity) for capacity in capacities]
         if not self._launchers:
@@ -53,6 +71,9 @@ class RolloutPool:
         self._paused = True
         self._closed = False
         self._failure: Optional[BaseException] = None
+        self._dispatched_tasks = 0
+        self._root_launchers: Dict[str, set[int]] = {}
+        self._root_task_counts: Dict[str, int] = {}
         self._condition = threading.Condition()
         self._thread = threading.Thread(target=self._progress, name="rollout-pool", daemon=True)
         self._thread.start()
@@ -128,6 +149,39 @@ class RolloutPool:
             inflight = len(self._queue) + len(self._running) + sum(self._reserved)
             return inflight, len(self._completed)
 
+    def dispatch_stats(self, *, reset: bool = False) -> Dict[str, float]:
+        """Return per-root dispersion & sibling co-location stats for dispatched tasks."""
+        with self._condition:
+            self._raise_if_failed()
+            groups_seen = len(self._root_launchers)
+            if groups_seen > 0:
+                mean_workers = sum(len(workers) for workers in self._root_launchers.values()) / groups_seen
+                single_worker_rate = (
+                    sum(1 for workers in self._root_launchers.values() if len(workers) == 1) / groups_seen
+                )
+                extra_tasks = sum(max(0, count - 1) for count in self._root_task_counts.values())
+                co_located_extra = sum(
+                    max(0, count - len(self._root_launchers[root]))
+                    for root, count in self._root_task_counts.items()
+                )
+                co_located_rate = (co_located_extra / extra_tasks) if extra_tasks > 0 else 1.0
+            else:
+                mean_workers = 0.0
+                single_worker_rate = 0.0
+                co_located_rate = 0.0
+            stats = {
+                "tasks_dispatched": float(self._dispatched_tasks),
+                "groups_seen": float(groups_seen),
+                "mean_workers_per_group": float(mean_workers),
+                "group_single_worker_rate": float(single_worker_rate),
+                "sibling_co_located_rate": float(co_located_rate),
+            }
+            if reset:
+                self._dispatched_tasks = 0
+                self._root_launchers.clear()
+                self._root_task_counts.clear()
+            return stats
+
     def close(self) -> None:
         with self._condition:
             if self._closed:
@@ -191,6 +245,13 @@ class RolloutPool:
                     self._completed.append(unit)
                 self._condition.notify_all()
 
+    def _record_dispatch(self, launcher_index: int, task: "Sample") -> None:
+        self._dispatched_tasks += 1
+        root_id = _single_root_id(task)
+        if root_id is not None:
+            self._root_launchers.setdefault(root_id, set()).add(launcher_index)
+            self._root_task_counts[root_id] = self._root_task_counts.get(root_id, 0) + 1
+
     def _plan_launches(self) -> List[tuple[int, int, "Sample"]]:
         """Reserve launcher slots for queued tasks; caller holds the lock."""
         if self._paused or self._closed:
@@ -200,14 +261,27 @@ class RolloutPool:
             load[unit.launcher] += 1
         plan = []
         # Most-free launcher first, so tasks spread across slots instead of filling slot 0.
+        # Under group_packing, greedily pack contiguous siblings sharing the same root_id
+        # onto that launcher up to its remaining capacity without blocking free slots.
         while self._queue:
             index = max(range(len(self._launchers)), key=lambda i: self._capacities[i] - load[i])
-            if load[index] >= self._capacities[index]:
+            avail = self._capacities[index] - load[index]
+            if avail <= 0:
                 break
             sequence, task = self._queue.popleft()
+            root_id = _single_root_id(task) if self._affinity_policy == "group_packing" else None
             plan.append((sequence, index, task))
             self._reserved[index] += 1
             load[index] += 1
+            avail -= 1
+            self._record_dispatch(index, task)
+            while avail > 0 and self._queue and root_id is not None and _single_root_id(self._queue[0][1]) == root_id:
+                sequence, task = self._queue.popleft()
+                plan.append((sequence, index, task))
+                self._reserved[index] += 1
+                load[index] += 1
+                avail -= 1
+                self._record_dispatch(index, task)
         return plan
 
     def _execute_launches(self, plan: List[tuple[int, int, "Sample"]]) -> bool:
@@ -276,4 +350,4 @@ def validate_worker_inflight(
         )
 
 
-__all__ = ["RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]
+__all__ = ["AFFINITY_POLICIES", "RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]

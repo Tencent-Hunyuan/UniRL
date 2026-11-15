@@ -67,7 +67,9 @@ wrong objective.
   siblings, and applies the configured filter. Async batch trainers own training
   progress and publication cadence; the manager owns the published rollout version
   and preserves completed generations as FIFO batch chunks. `AgenticTrainer` collects
-  one complete barrier batch per step. Async AR refills the same manager immediately
+  one complete barrier batch per step (and accepts `affinity_policy="group_packing"`
+  to pack contiguous `root_id` siblings onto the same rollout worker for prefix-KV
+  reuse, logging `rollout_dispatch/*` dispersion/co-location metrics). Async AR refills the same manager immediately
   after collection, so its existing progress thread overlaps the next generation
   with scoring and training. Publication and durable boundaries still quiesce that
   single manager before proceeding.
