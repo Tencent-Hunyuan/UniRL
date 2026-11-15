@@ -16,11 +16,11 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     aggregate_token_losses,
-    backward_if_fully_masked,
     prepare_ar_logp_anchor,
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
+    zero_loss_backward,
 )
 from .grpo import GRPO
 
@@ -66,6 +66,8 @@ def _drpo_loss(
     ratio, log_diff, quadratic_penalty, adaptive_eps = select_active_tokens(
         mask, ratio, log_diff, quadratic_penalty, adaptive_eps
     )
+    if ratio.numel() == 0:
+        return pg_losses, {}
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -150,9 +152,6 @@ class DRPO(StageAlgorithm):
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
-        masked_result = backward_if_fully_masked(segment.loss_mask, new_logp)
-        if masked_result is not None:
-            return masked_result
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         adv_per_token = GRPO._expand_advantages_to_tokens(
@@ -168,6 +167,8 @@ class DRPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         loss = aggregate_token_losses(
             loss_per_elem,
             lengths=segment.lengths,

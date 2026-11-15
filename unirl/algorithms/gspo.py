@@ -20,6 +20,7 @@ from .base import (
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -125,8 +126,7 @@ class GSPO(StageAlgorithm):
             loss_mask=segment.loss_mask,
         )
         if not bool(valid.any()):
-            (new_logp.sum() * 0.0).backward()
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
+            return zero_loss_backward(new_logp)
 
         log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = grpo_clip_loss(

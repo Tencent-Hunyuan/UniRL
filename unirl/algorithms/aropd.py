@@ -16,11 +16,11 @@ from .base import (
     AlgorithmStepResult,
     StageAlgorithm,
     aggregate_token_losses,
-    backward_if_fully_masked,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -129,9 +129,6 @@ class AROPD(StageAlgorithm):
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
-        masked_result = backward_if_fully_masked(segment.loss_mask, new_logp)
-        if masked_result is not None:
-            return masked_result
         teacher_logp = segment.teacher_log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         # The stop-gradient teacher-student gap is the per-token advantage; never
@@ -143,6 +140,9 @@ class AROPD(StageAlgorithm):
         # elementwise, grouping-invariant bound that biases the estimator when it
         # clips; the gap_clipped_tokens / gap_active_tokens counters report how often.
         raw_gap = teacher_logp - new_logp.detach()
+        metric_gap = select_active_tokens(segment.loss_mask, raw_gap)[0]
+        if metric_gap.numel() == 0:
+            return zero_loss_backward(new_logp)
         gap = raw_gap if self.gap_clamp is None else raw_gap.clamp(-self.gap_clamp, self.gap_clamp)
         loss = aggregate_token_losses(
             -(gap * new_logp),
@@ -154,7 +154,6 @@ class AROPD(StageAlgorithm):
         (loss * loss_scale).backward()
 
         rollout_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
-        metric_gap = select_active_tokens(segment.loss_mask, raw_gap)[0]
         metrics: Dict[str, Any] = {
             "distill_loss": float(loss.detach().item()),
             "teacher_gap_mean": float(metric_gap.mean().item()),
@@ -166,9 +165,8 @@ class AROPD(StageAlgorithm):
             # Additive counters: the metric aggregator plain-averages values, so a
             # per-micro fraction would be micro-weighted; the ratio of the two
             # averaged counters equals the true token-level clip fraction.
-            metric_clipped = select_active_tokens(segment.loss_mask, raw_gap)[0]
-            metrics["gap_clipped_tokens"] = int((metric_clipped.abs() > self.gap_clamp).sum().item())
-            metrics["gap_active_tokens"] = int(metric_clipped.numel())
+            metrics["gap_clipped_tokens"] = int((metric_gap.abs() > self.gap_clamp).sum().item())
+            metrics["gap_active_tokens"] = int(metric_gap.numel())
         return AlgorithmStepResult(
             loss=float(loss.detach().item()),
             metrics=metrics,

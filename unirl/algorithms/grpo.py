@@ -17,13 +17,13 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     aggregate_token_losses,
-    backward_if_fully_masked,
     grpo_clip_loss,
     prepare_ar_logp_anchor,
     resolve_clip_range_from_schedule,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -120,9 +120,6 @@ class GRPO(StageAlgorithm):
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
-        masked_result = backward_if_fully_masked(segment.loss_mask, new_logp)
-        if masked_result is not None:
-            return masked_result
         # old_logp = the frozen π_old anchor established by prepare_segment:
         # the rollout log-prob by default, or a train-side replay under
         # old_logp_source='replay'. Either way it stays frozen across all
@@ -147,6 +144,8 @@ class GRPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         loss = aggregate_token_losses(
             loss_per_elem,
             lengths=segment.lengths,
