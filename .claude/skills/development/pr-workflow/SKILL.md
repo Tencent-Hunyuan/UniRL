@@ -9,7 +9,7 @@ description: Create and repair UniRL pull requests. Use when creating a PR, edit
 
 1. Read `.github/pull_request_template.md`, `.github/workflows/pr-body.yml`, and `.github/workflows/semantic-pull-request.yml` from the current branch.
 2. Inspect the full diff against the intended base branch, not just the latest commit.
-3. Preserve commit history during rebases — **never squash commits on an existing PR branch when rebasing**, especially when collaborators or review bots have pushed commits (`git fetch`, then `git rebase` or `git rebase --rebase-merges` / replay commit-by-commit).
+3. Preserve collaborator/bot commits during rebases — when collaborators, reviewers, or bots have pushed fix or style commits to an existing PR branch, **never squash those commits into your own** (`git fetch`, then `git rebase` / `git rebase --rebase-merges` or replay them intact to keep their history and authorship).
 4. Keep PRs atomic — split unrelated cleanups or follow-up work into separate PRs, and check for overlapping open PRs or issues before publishing.
 5. Do not include unrelated local files, generated artifacts, datasets, checkpoints, credentials, or outputs.
 6. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first (the submitting human remains accountable for the final diff).
