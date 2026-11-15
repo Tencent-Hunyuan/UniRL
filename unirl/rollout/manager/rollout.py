@@ -29,9 +29,12 @@ class RolloutManager:
         group_size: int,
         filter_fn: RolloutFilter = identity,
         affinity_policy: str = "least_loaded",
+        dispatch_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._rollout = rollout
-        self._pool = RolloutPool(launchers, capacities, affinity_policy=affinity_policy)
+        pool_kwargs = dict(dispatch_kwargs or {})
+        pool_kwargs.setdefault("affinity_policy", affinity_policy)
+        self._pool = RolloutPool(launchers, capacities, **pool_kwargs)
         self._group_size = int(group_size)
         self._pending = PendingGroups(group_size)
         self._complete = CompleteGroups()

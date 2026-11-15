@@ -70,6 +70,7 @@ class AgenticTrainer(BaseTrainer):
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
         affinity_policy: str = "least_loaded",
+        rollout_dispatch_cfg: Optional[DictConfig] = None,
     ) -> None:
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
@@ -113,12 +114,16 @@ class AgenticTrainer(BaseTrainer):
 
             slots = self.rollout.engine_slots
             launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
+            dispatch_kwargs = dict(rollout_dispatch_cfg) if rollout_dispatch_cfg is not None else {}
+            if "policy" in dispatch_kwargs and "affinity_policy" not in dispatch_kwargs:
+                dispatch_kwargs["affinity_policy"] = dispatch_kwargs.pop("policy")
             self._rollout_manager = RolloutManager(
                 self.rollout,
                 launchers=launchers,
                 capacities=[self._per_worker_inflight] * len(launchers),
                 group_size=self._group_size,
                 affinity_policy=affinity_policy,
+                dispatch_kwargs=dispatch_kwargs,
             )
             self._train_version = unwrap_replicated_int(
                 self.backend.get_optimizer_step_count(),
@@ -382,6 +387,8 @@ class AgenticTrainer(BaseTrainer):
                 "rollout_dispatch/sibling_co_located_rate": dispatch_stats["sibling_co_located_rate"],
                 "rollout_dispatch/mean_workers_per_group": dispatch_stats["mean_workers_per_group"],
                 "rollout_dispatch/group_single_worker_rate": dispatch_stats["group_single_worker_rate"],
+                "rollout_dispatch/cross_node_spill_rate": dispatch_stats["cross_node_spill_rate"],
+                "rollout_dispatch/stagger_holds": dispatch_stats["stagger_holds"],
                 "rollout_dispatch/tasks_dispatched": dispatch_stats["tasks_dispatched"],
             },
         )
