@@ -9,10 +9,11 @@ description: Create and repair UniRL pull requests. Use when creating a PR, edit
 
 1. Read `.github/pull_request_template.md`, `.github/workflows/pr-body.yml`, and `.github/workflows/semantic-pull-request.yml` from the current branch.
 2. Inspect the full diff against the intended base branch, not just the latest commit.
-3. Keep PRs atomic — split unrelated cleanups or follow-up work into separate PRs, and check for overlapping open PRs or issues before publishing.
-4. Do not include unrelated local files, generated artifacts, datasets, checkpoints, credentials, or outputs.
-5. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first (the submitting human remains accountable for the final diff).
-6. For operator, backend, rollout-patch, or hot-path changes, verify compliance with `.claude/skills/development/hot-path-and-backend-changes/SKILL.md`.
+3. Preserve commit history during rebases — **never squash commits on an existing PR branch when rebasing**, especially when collaborators or review bots have pushed commits (`git fetch`, then `git rebase` or `git rebase --rebase-merges` / replay commit-by-commit).
+4. Keep PRs atomic — split unrelated cleanups or follow-up work into separate PRs, and check for overlapping open PRs or issues before publishing.
+5. Do not include unrelated local files, generated artifacts, datasets, checkpoints, credentials, or outputs.
+6. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first (the submitting human remains accountable for the final diff).
+7. For operator, backend, rollout-patch, or hot-path changes, verify compliance with `.claude/skills/development/hot-path-and-backend-changes/SKILL.md`.
 
 ## Title
 
