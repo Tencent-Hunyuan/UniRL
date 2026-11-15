@@ -1,4 +1,4 @@
-"""Reduce numeric metrics, preserving additive policy entropy statistics."""
+"""Reduce numeric metrics across repeated metric dictionaries."""
 
 from typing import Any, Dict, List, Mapping, Sequence
 
@@ -6,7 +6,7 @@ import torch
 
 
 def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
-    """Average numeric keys and sum entropy statistics before their token-weighted mean."""
+    """Sum entropy statistics, take extrema for ``*_min``/``*_max``, and average other numeric metrics."""
     aggregated: Dict[str, float] = {}
     if not metrics_list:
         return aggregated
@@ -34,7 +34,13 @@ def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict
             elif isinstance(value, (int, float)):
                 values.append(float(value))
         if values:
-            aggregated[key] = sum(values) / len(values)
+            # torch max/min propagate NaN like the mean does; builtin max/min drop it order-dependently.
+            if key.endswith("_max"):
+                aggregated[key] = torch.tensor(values, dtype=torch.float64).max().item()
+            elif key.endswith("_min"):
+                aggregated[key] = torch.tensor(values, dtype=torch.float64).min().item()
+            else:
+                aggregated[key] = sum(values) / len(values)
 
     if "policy_entropy_count" in aggregated:
         count = aggregated["policy_entropy_count"]
