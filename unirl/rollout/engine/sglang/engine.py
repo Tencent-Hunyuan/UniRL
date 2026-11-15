@@ -192,10 +192,18 @@ class SGLangRolloutEngine(BaseRolloutEngine):
                 sampling_params = payload["sampling_params"]
                 sampling_params["max_new_tokens"] = min(sampling_params["max_new_tokens"], budget - len(ids))
         active_adapter = self._weight_sync.active_adapter
+        wire = prepared.wire
         if active_adapter:
-            for payload in prepared.wire:
+            for payload in wire:
                 payload["lora_path"] = active_adapter
-        raw = self._backend.generate(prepared.wire)
+            if sampling.n > 1 and self.cfg.engine_kwargs.get("max_loaded_loras") is not None:
+                # See the SGLang LoRA-pool gotcha in ../README.md.
+                wire = [
+                    {**payload, "sampling_params": {**payload["sampling_params"], "n": 1}}
+                    for payload in wire
+                    for _ in range(sampling.n)
+                ]
+        raw = self._backend.generate(wire)
         return self._stamp_output_version(self.adapter.build_response(sample, prepared, raw))
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:

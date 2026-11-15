@@ -85,11 +85,13 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
-- **A LoRA-pool cap hangs the sync on SGLang 0.5.19.** With `max_loaded_loras`
-  set, the first sync that has to evict an adapter never returns: an `n > 1`
-  request leaves the adapter's usage counter at −1, and the unload waits for
-  zero (#671). Without a cap every synced adapter stays loaded; host memory
-  grows per sync (about 26 MB for Qwen2.5-VL-7B at rank 16), GPU memory does not.
+- **Capped LoRA pools use one SGLang request per candidate.** With
+  `max_loaded_loras` set and a synced adapter active, UniRL splits `n > 1`
+  payloads into `n = 1` requests in prompt order. SGLang 0.5.19 over-releases
+  the adapter usage counter on the `n > 1` path, so eviction waits indefinitely
+  for zero (#671). The split reuses encoded inputs and keeps replay aligned
+  with the original prompt groups. Recheck the workaround on a SGLang bump.
+  Without a cap, each synced adapter stays in the server's host memory.
 - **`keep_diffusion_resident` is for diffusion servers that cannot sleep.** The
   Qwen-Image-Edit SGLang server fails to move its transformer to CPU, so the
   composed engine leaves it on the GPU and sleeps only the AR child. Both

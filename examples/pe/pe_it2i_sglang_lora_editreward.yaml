@@ -157,8 +157,9 @@ rollout:
         enable_memory_saver: true
         enable_weights_cpu_backup: true
         enable_lora: true
-        max_lora_rank: 16
-        lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
+        max_lora_rank: ${ar.backend.lora_cfg.rank}
+        lora_target_modules: ${ar.backend.lora_cfg.target_modules}
+        max_loaded_loras: 8
         lora_backend: triton
     # Copied from diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft_sglang.yaml.
     diffusion:
