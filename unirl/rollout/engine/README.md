@@ -85,6 +85,22 @@ handler in `../../distributed/weight_sync`.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **A LoRA-pool cap hangs the sync on SGLang 0.5.19.** With `max_loaded_loras`
+  set, the first sync that has to evict an adapter never returns: an `n > 1`
+  request leaves the adapter's usage counter at −1, and the unload waits for
+  zero (#671). Without a cap every synced adapter stays loaded; host memory
+  grows per sync (about 26 MB for Qwen2.5-VL-7B at rank 16), GPU memory does not.
+- **`keep_diffusion_resident` is for diffusion servers that cannot sleep.** The
+  Qwen-Image-Edit SGLang server fails to move its transformer to CPU, so the
+  composed engine leaves it on the GPU and sleeps only the AR child. Both
+  children then share the GPU for the whole run; the image-editing PE recipe
+  peaks near 111 GB on one device.
+- **The composed engine serves one `generate` per LoRA sync.** `generate` puts
+  the AR child to sleep, and the SGLang engine then forgets the loaded adapter;
+  a second `generate` without a new sync samples from the base model. PE
+  training syncs before every rollout. PE eval syncs once, so it is correct only
+  while `eval_num_prompts <= batch_size` (the default) and no eval suite brings
+  its own data source.
 - **Explicit vLLM-Omni AR seeds use one call per sample.** HI3 and Qwen3-Omni
   derive each request's seed from `ARSamplingParams.seed` and the AR Part's
   `sample_id`, using the same `derive_sampling_seed` mapping as SGLang. In
