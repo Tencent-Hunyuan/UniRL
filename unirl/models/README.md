@@ -136,6 +136,18 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   `_apply_selected_by_sequence`) keep the serial BF16 reduction boundaries. It raises
   unless `guidance_scale == 1.0` and `cfg_img_scale == 1.0`, and requires
   `old_logp_source: replay`.
+- **Qwen2.5-VL replay takes image placeholders from the prompt only.** A sampled
+  `<|image_pad|>` in the response is a text action, as it is during rollout. Stock
+  `Qwen2_5_VLModel.forward` counts placeholders over the whole `input_ids`
+  (`get_placeholder_mask`) and `get_rope_index` opens one image group per
+  placeholder run, so both raise on such a response. `QwenVLARStage` installs
+  `_prompt_image_forward` on the transformer: given `image_mask`, it scatters the
+  image features at that mask and calls the stock forward with `inputs_embeds`.
+  The scatter runs inside `forward` because the root `fully_shard` group (which
+  holds the token embedding) is only unsharded there. On a `transformers` bump,
+  check that the stock forward still skips `get_placeholder_mask` when
+  `pixel_values` is `None`. `DELETE-WHEN`: stock `get_rope_index` and
+  `get_placeholder_mask` accept a caller-supplied image mask.
 
 
 ## Conversation composition
