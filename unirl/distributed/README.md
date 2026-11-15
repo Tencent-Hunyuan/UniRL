@@ -116,3 +116,4 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
   same thing (the entrypoint and trainer defaults disagree textually, but the only
   test is `!= "separate"`); the multi-process-same-GPU "real colocate"
   (`shared_workers=False`) path exists but no trainer uses it.
+- **Keep collectives symmetric across ranks, use explicit events across streams, and don't over-claim single-GPU tests.** Never gate a collective behind a rank-local condition (`P0-RANK-DIVERGENCE`). Prefer explicit `torch.cuda.Event` (`event.record(producer)` + `consumer.wait_event(event)`) plus live tensor references over blanket `record_stream`. Single-GPU multi-rank `gloo` runs only test lockstep/sharding logic and cannot validate multi-GPU NCCL, NVLink/P2P, `gpu_store` CUDA-IPC, multi-TP rollout engines, or `DevicePool`.

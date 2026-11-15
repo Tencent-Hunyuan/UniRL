@@ -119,3 +119,12 @@ handler in `../../distributed/weight_sync`.
   replicated per sibling. x_T is keyed per row, so a run may be any contiguous
   part of a group and a `RewardStack` micro may cut a group. Above 1 every row is
   its own request.
+- **Rollout hot paths ban Class A host-device syncs.** Never call `.item()`, `.cpu()`,
+  `.tolist()`, `.numpy()`, `bool(tensor)`, or CUDA `nonzero()` per decode/denoise
+  step or per sample; keep AR termination/EOS checks to `<= 1` batched sync per step
+  or group (Class B), and keep scheduled `sigmas` as `fp32` GPU tensors rather than
+  converting to Python floats ahead of the loop.
+- **Quarantine upstream patches with a `DELETE-WHEN`.** Keep monkeypatches for
+  pinned upstream runtimes inside the owning engine's patch package
+  (`vllm_omni/patches/`, `sglang_diffusion/_patches/`, `fastvideo/_patches/`) with
+  explicit retirement conditions, not inline in adapters or models.

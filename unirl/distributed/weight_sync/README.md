@@ -84,3 +84,7 @@ matching receiver on the engine side (`../../rollout/engine/`).
   model-specific fusion, and layerwise `load_weights`. Its packed producer reads
   one tensor beyond the configured byte boundary before flushing, so UniRL plans
   metadata chunks first to keep lazy materialization bounded.
+- **Quiesce rollout work before committing live weights, and declare capabilities cleanly.**
+  Rollout managers/trainers must drain or quiesce active generation slots before
+  publication commits; new sync paths should check explicit interfaces or capability
+  attributes rather than matching adapter module-name strings.

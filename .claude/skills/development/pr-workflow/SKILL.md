@@ -9,9 +9,10 @@ description: Create and repair UniRL pull requests. Use when creating a PR, edit
 
 1. Read `.github/pull_request_template.md`, `.github/workflows/pr-body.yml`, and `.github/workflows/semantic-pull-request.yml` from the current branch.
 2. Inspect the full diff against the intended base branch, not just the latest commit.
-3. Check for overlapping open PRs or issues when the user is asking to publish a substantive change.
+3. Keep PRs atomic — split unrelated cleanups or follow-up work into separate PRs, and check for overlapping open PRs or issues before publishing.
 4. Do not include unrelated local files, generated artifacts, datasets, checkpoints, credentials, or outputs.
-5. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first.
+5. For a substantive code or config change, finish `.claude/skills/development/pr-review/SKILL.md` first (the submitting human remains accountable for the final diff).
+6. For operator, backend, rollout-patch, or hot-path changes, verify compliance with `.claude/skills/development/hot-path-and-backend-changes/SKILL.md`.
 
 ## Title
 
@@ -32,9 +33,11 @@ Required by the body check:
 
 Recommended:
 
-- Use `N/A` for sections that do not apply.
-- Mention compatibility risks for config, checkpoint, data format, API, resource, or migration changes.
-- Mention AI assistance and duplicate-work checks when relevant.
+- Use `N/A` for sections that do not apply, and keep `## Checklist` boxes accurate.
+- For `perf` or hot-path changes, put baseline -> after metrics with hardware/shape context in `## Summary`.
+- In `## Test Plan`, distinguish single-GPU simulated multi-rank checks from real multi-GPU / IPC / NVLink validation, and write `Not run; reason: ...` for unexecuted tiers.
+- Mention compatibility risks for config, checkpoint, backend/engine matrix, dependency extras, resource, or `DELETE-WHEN` upstream patches.
+- Mention AI assistance and duplicate-work checks (`AGENTS.md` §5).
 - Keep the body concise; do not produce a file-by-file changelog.
 
 ## Fixing PR Body Failures
