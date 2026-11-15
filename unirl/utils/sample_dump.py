@@ -7,7 +7,8 @@ import logging
 import os
 import wave
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
+from uuid import uuid4
 
 import torch
 
@@ -79,36 +80,64 @@ def _write_media(directory: Path, stem: str, decoded: Dict[str, Any], written: L
             output.writeframes(samples.tobytes())
 
 
+def _indexed_media(index: Path) -> set[Path]:
+    """Return the local media paths owned by the previous index."""
+    try:
+        lines = index.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    paths = set()
+    for line in lines:
+        try:
+            media = json.loads(line).get("media") or {}
+        except json.JSONDecodeError as exc:
+            logger.warning("Local sample observation could not read %s: %s", index, exc)
+            continue
+        for key, suffix in (("image", ".png"), ("video", ".mp4"), ("audio", ".wav")):
+            name = media.get(key)
+            if isinstance(name, str) and Path(name).name == name and Path(name).suffix == suffix:
+                paths.add(index.parent / name)
+    return paths
+
+
+def _remove_sample_files(paths: Iterable[Path]) -> None:
+    """Best-effort cleanup for files written by the sample sink."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Local sample observation could not remove %s: %s", path, exc)
+
+
 def dump_sample_records(root: str, records: List[SampleRecord]) -> None:
     """Write a step's JSONL index and PNG, MP4, or WAV files with relative paths."""
     if not records:
         return
+    directory = Path(root) / records[0].phase / f"step_{records[0].step:06d}"
+    index_path = directory / "samples.jsonl"
+    write_id = uuid4().hex
+    staged = directory / f".samples-{write_id}.jsonl"
     written: List[Path] = []
     try:
-        directory = Path(root) / records[0].phase / f"step_{records[0].step:06d}"
         directory.mkdir(parents=True, exist_ok=True)
+        previous = _indexed_media(index_path)
         rows = []
         for index, record in enumerate(records):
-            stem = f"{record.track}_{index}"
+            stem = f"{record.track}_{index}-{write_id}"
             record_files: List[Path] = []
             try:
                 row, decoded = _decode_record(record, stem)
                 _write_media(directory, stem, decoded, record_files)
             except Exception as exc:
-                for path in record_files:
-                    path.unlink(missing_ok=True)
-                logger.warning("Local sample observation skipped %s: %s", stem, exc)
+                _remove_sample_files(record_files)
+                logger.warning("Local sample observation skipped %s: %s", record.sample_id, exc)
                 continue
             written.extend(record_files)
             rows.append(row)
-        staged = directory / ".samples.jsonl"
         staged.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
-        os.replace(staged, directory / "samples.jsonl")
-        fresh = {path.name for path in written}
-        for stale in directory.iterdir():
-            if stale.suffix in (".png", ".mp4", ".wav") and stale.name not in fresh:
-                stale.unlink()
+        os.replace(staged, index_path)
     except Exception as exc:
-        for path in written:
-            path.unlink(missing_ok=True)
+        _remove_sample_files([*written, staged])
         logger.warning("Local sample observation failed: %s", exc)
+        return
+    _remove_sample_files(previous)

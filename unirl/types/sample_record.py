@@ -71,7 +71,7 @@ def build_sample_records(
     }
     records = []
     groups = part.group_ids
-    root_metadata = sample.root_metadata(part_index)
+    root_metadata = selected.root_metadata()
     for row, sample_id in enumerate(part.sample_ids[:limit]):
         media = None
         if preview is not None and row < len(preview):

@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -30,12 +30,15 @@ def _sample_table(rows: List["SampleRecord"]) -> Any:
     """Build the lineage table, serializing per-row containers whose keys differ between rows."""
     columns = ["sample_id", "group_id", "root_id", "prompt", "output_text", "reward"]
     containers = ["context_texts", "component_rewards", "metadata"]
-    data = [
-        [getattr(row, column) for column in columns]
-        + [json.dumps(getattr(row, name), ensure_ascii=False, default=str) for name in containers]
-        for row in rows
-    ]
-    return wandb.Table(columns=columns + containers, data=data)
+    table = wandb.Table(columns=columns + containers)
+    for row in rows:
+        try:
+            values = [getattr(row, column) for column in columns]
+            values.extend(json.dumps(getattr(row, name), ensure_ascii=False, default=str) for name in containers)
+            table.add_data(*values)
+        except Exception as exc:
+            module_logger.warning("W&B sample table skipped %s: %s", row.sample_id, exc)
+    return table
 
 
 def _write_video_with_audio(
@@ -50,66 +53,67 @@ def _write_video_with_audio(
     fd, path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     try:
+        try:
+            import av
+        except ImportError:
+            import imageio
+
+            module_logger.warning("PyAV (av) not installed; writing video without audio. Install with: pip install av")
+            imageio.mimwrite(path, frames, fps=fps, format="FFMPEG", codec="libx264", pixelformat="yuv420p")
+            return path
+
         from fractions import Fraction
 
-        import av
+        with av.open(path, mode="w") as container:
+            video_stream = container.add_stream("libx264", rate=int(fps))
+            video_stream.width = int(frames.shape[2])
+            video_stream.height = int(frames.shape[1])
+            video_stream.pix_fmt = "yuv420p"
 
-        container = av.open(path, mode="w")
-        video_stream = container.add_stream("libx264", rate=int(fps))
-        video_stream.width = int(frames.shape[2])
-        video_stream.height = int(frames.shape[1])
-        video_stream.pix_fmt = "yuv420p"
+            audio_stream = container.add_stream("aac", rate=audio_sample_rate)
+            audio_stream.codec_context.sample_rate = audio_sample_rate
+            audio_stream.codec_context.layout = "stereo"
+            audio_stream.codec_context.time_base = Fraction(1, audio_sample_rate)
 
-        audio_stream = container.add_stream("aac", rate=audio_sample_rate)
-        audio_stream.codec_context.sample_rate = audio_sample_rate
-        audio_stream.codec_context.layout = "stereo"
-        audio_stream.codec_context.time_base = Fraction(1, audio_sample_rate)
-
-        for frame_array in frames:
-            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
-            for packet in video_stream.encode(frame):
+            for frame_array in frames:
+                frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
+                for packet in video_stream.encode(frame):
+                    container.mux(packet)
+            for packet in video_stream.encode():
                 container.mux(packet)
-        for packet in video_stream.encode():
-            container.mux(packet)
 
-        samples = normalize_waveform(audio)
-        if samples.shape[1] == 1:
-            samples = samples.expand(-1, 2)
-        int16_samples = (samples * 32767.0).to(torch.int16)
+            samples = normalize_waveform(audio)
+            if samples.shape[1] == 1:
+                samples = samples.expand(-1, 2)
+            int16_samples = (samples * 32767.0).to(torch.int16)
 
-        audio_frame = av.AudioFrame.from_ndarray(
-            int16_samples.contiguous().reshape(1, -1).numpy(),
-            format="s16",
-            layout="stereo",
-        )
-        audio_frame.sample_rate = audio_sample_rate
+            audio_frame = av.AudioFrame.from_ndarray(
+                int16_samples.contiguous().reshape(1, -1).numpy(),
+                format="s16",
+                layout="stereo",
+            )
+            audio_frame.sample_rate = audio_sample_rate
 
-        target_format = "fltp" if audio_stream.codec_context.format is None else audio_stream.codec_context.format
-        target_layout = "stereo" if audio_stream.codec_context.layout is None else audio_stream.codec_context.layout
-        resampler = av.audio.resampler.AudioResampler(
-            format=target_format,
-            layout=target_layout,
-            rate=audio_sample_rate,
-        )
-        audio_next_pts = 0
-        for rframe in resampler.resample(audio_frame):
-            if rframe.pts is None:
-                rframe.pts = audio_next_pts
-            audio_next_pts += rframe.samples
-            rframe.sample_rate = audio_sample_rate
-            container.mux(audio_stream.encode(rframe))
-        for packet in audio_stream.encode():
-            container.mux(packet)
-
-        container.close()
-    except ImportError:
-        module_logger.warning("PyAV (av) not installed; writing video without audio. Install with: pip install av")
-        os.unlink(path)
-        fd2, path = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd2)
-        import imageio
-
-        imageio.mimwrite(path, frames, fps=fps, format="FFMPEG", codec="libx264", pixelformat="yuv420p")
+            target_format = "fltp" if audio_stream.codec_context.format is None else audio_stream.codec_context.format
+            target_layout = "stereo" if audio_stream.codec_context.layout is None else audio_stream.codec_context.layout
+            resampler = av.audio.resampler.AudioResampler(
+                format=target_format,
+                layout=target_layout,
+                rate=audio_sample_rate,
+            )
+            audio_next_pts = 0
+            for rframe in resampler.resample(audio_frame):
+                if rframe.pts is None:
+                    rframe.pts = audio_next_pts
+                audio_next_pts += rframe.samples
+                rframe.sample_rate = audio_sample_rate
+                container.mux(audio_stream.encode(rframe))
+            for packet in audio_stream.encode():
+                container.mux(packet)
+    except Exception:
+        with suppress(OSError):
+            os.unlink(path)
+        raise
     return path
 
 
@@ -459,7 +463,6 @@ class UniRLWandBLogger:
 
         _muxed_paths: List[str] = []
         try:
-            n = max(len(images) if has_images else 0, len(videos) if has_videos else 0)
 
             def _caption_for(idx: int) -> str:
                 prompt = str(prompts[idx]) if idx < len(prompts) else ""
@@ -470,44 +473,52 @@ class UniRLWandBLogger:
             payload: Dict[str, Any] = {step_key: int(rollout_id)}
 
             if has_images:
-                wandb_images = [
-                    wandb.Image(images[idx], caption=_caption_for(idx)) for idx in range(min(len(images), n))
-                ]
-                payload[key] = wandb_images
+                wandb_images = []
+                for idx, image in enumerate(images):
+                    try:
+                        wandb_images.append(wandb.Image(image, caption=_caption_for(idx)))
+                    except Exception as exc:
+                        module_logger.warning("W&B generated image %s row %d failed: %s", key, idx, exc)
+                if wandb_images:
+                    payload[key] = wandb_images
 
             if has_videos:
                 wandb_videos: List[Any] = []
-                for idx in range(min(len(videos), n)):
-                    vid = videos[idx]
+                for idx, vid in enumerate(videos):
                     if not torch.is_tensor(vid):
                         continue
-                    if vid.dim() != 4:
-                        raise ValueError(
-                            f"log_generated_media: video at idx {idx} must be 4D "
-                            f"[C, T, H, W], got shape {tuple(vid.shape)}"
+                    try:
+                        if vid.dim() != 4:
+                            raise ValueError(f"Expected video [C, T, H, W], got {tuple(vid.shape)}")
+                        arr = (
+                            vid.detach()
+                            .cpu()
+                            .to(dtype=torch.float32)
+                            .clamp(0.0, 1.0)
+                            .mul(255.0)
+                            .to(dtype=torch.uint8)
+                            .permute(1, 0, 2, 3)  # [C, T, H, W] -> [T, C, H, W]
+                            .numpy()
                         )
-                    arr = (
-                        vid.detach()
-                        .cpu()
-                        .to(dtype=torch.float32)
-                        .clamp(0.0, 1.0)
-                        .mul(255.0)
-                        .to(dtype=torch.uint8)
-                        .permute(1, 0, 2, 3)  # [C, T, H, W] -> [T, C, H, W]
-                        .numpy()
-                    )
-                    audio_wf = audios[idx] if idx < len(audios) else None
-                    if audio_wf is not None and audio_sr is not None and torch.is_tensor(audio_wf):
-                        arr_hwc = arr.transpose(0, 2, 3, 1)  # (T, C, H, W) -> (T, H, W, C)
-                        path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
-                        _muxed_paths.append(path)
-                        wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
-                    else:
+                        audio_wf = audios[idx] if idx < len(audios) else None
+                        if audio_sr is not None and torch.is_tensor(audio_wf):
+                            arr_hwc = arr.transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, C]
+                            try:
+                                path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                            except Exception as exc:
+                                module_logger.warning("W&B generated video %s row %d audio failed: %s", key, idx, exc)
+                            else:
+                                _muxed_paths.append(path)
+                                wandb_videos.append(wandb.Video(path, caption=_caption_for(idx), format="mp4"))
+                                continue
                         wandb_videos.append(wandb.Video(arr, caption=_caption_for(idx), fps=int(video_fps)))
+                    except Exception as exc:
+                        module_logger.warning("W&B generated video %s row %d failed: %s", key, idx, exc)
                 if wandb_videos:
                     payload[video_key] = wandb_videos
 
-            wandb.log(payload)
+            if len(payload) > 1:
+                wandb.log(payload)
         except Exception as e:
             print(f"Warning: Failed to log generated media: {e}")
         finally:
@@ -577,11 +588,15 @@ class UniRLWandBLogger:
                 len(missing_rate),
                 missing_rate[:3],
             )
-        clips = [
-            wandb.Audio(normalize_waveform(row.media.audio).numpy(), sample_rate=row.media.audio_sample_rate)
-            for row in audio_only
-            if row.media.audio_sample_rate is not None
-        ]
+        clips = []
+        for row in audio_only:
+            if row.media.audio_sample_rate is None:
+                continue
+            try:
+                samples = normalize_waveform(row.media.audio)
+                clips.append(wandb.Audio(samples.numpy(), sample_rate=row.media.audio_sample_rate))
+            except Exception as exc:
+                module_logger.warning("W&B sample audio failed for %s: %s", row.sample_id, exc)
         if clips:
             wandb.log({f"{prefix}/generated_audio": clips, step_key: step})
 

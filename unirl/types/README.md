@@ -199,17 +199,14 @@ Both sinks warn on output failures instead of interrupting training.
 
 ### Gotchas
 
-Each record is decoded and serialized before any of its files is created, and files
-already written for a record are removed when a later modality fails, so a skipped
-record leaves no media behind. A step's media are written before its index, and media
-the new index no longer names are removed only after the index is replaced. A failure
-or lost process before that point keeps the previous index, which can then name files
-the new run already overwrote or, after a failed index write, removed; rerunning the
-same phase and step rewrites both.
+- **A step's index is replaced after its media are written.** A retry uses new filenames, so a failed
+  index write leaves the previous index and its media intact. After publication the sink removes only
+  files named in the previous index. Failed cleanup warns and leaves the new index usable.
+- **Malformed media are isolated.** The local sink skips the affected record and removes its partial
+  files. The remaining rows still reach the index. W&B skips failed media entries and keeps the rest of
+  their panel and the lineage table. If video audio fails to mux, W&B attempts to log the video alone.
 
 `log_sample_records` serializes `context_texts`, `component_rewards` and `metadata`
 into the table as JSON strings, because `wandb.Table` infers one schema from the
 first row and rejects later rows whose keys differ. Audio without a sample rate is
-warned about and dropped, including audio attached to a video row. In `dump_sample_records` a
-record whose media cannot be written is warned about by its `{track}_{index}` stem
-and skipped, and the remaining rows still reach the index.
+warned about and dropped from W&B, including audio attached to a video row.
