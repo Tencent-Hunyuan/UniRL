@@ -442,12 +442,16 @@ class RolloutPool:
         )
         replicated = self._is_replicated(root_id, now)
 
+        # Keep siblings on their home worker while it remains within balance, token, and KV bounds.
+        home_eligible = [
+            i for i in eligible if i in known_workers and (kv_usages is None or kv_usages[i] < 0.85)
+        ]
+        if home_eligible:
+            eligible = home_eligible
+
         def score(i: int) -> tuple[float, int, int]:
             if i in known_workers:
                 affinity = 1.0
-            elif replicated:
-                same_node = self._worker_node_ids is not None and self._worker_node_ids[i] in known_nodes
-                affinity = 0.85 if same_node else 0.75
             elif self._worker_node_ids is not None and self._worker_node_ids[i] in known_nodes:
                 affinity = 0.35
             else:
