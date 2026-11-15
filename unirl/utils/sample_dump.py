@@ -89,9 +89,12 @@ def _indexed_media(index: Path) -> set[Path]:
     paths = set()
     for line in lines:
         try:
-            media = json.loads(line).get("media") or {}
+            row = json.loads(line)
         except json.JSONDecodeError as exc:
             logger.warning("Local sample observation could not read %s: %s", index, exc)
+            continue
+        media = row.get("media") if isinstance(row, dict) else None
+        if not isinstance(media, dict):
             continue
         for key, suffix in (("image", ".png"), ("video", ".mp4"), ("audio", ".wav")):
             name = media.get(key)

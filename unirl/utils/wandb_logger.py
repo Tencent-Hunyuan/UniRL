@@ -416,6 +416,7 @@ class UniRLWandBLogger:
         video_key: Optional[str] = None,
         video_fps: int = 8,
         step_key: str = "rollout/step",
+        audio_sample_rates: Optional[List[Optional[int]]] = None,
     ) -> None:
         """Log rollout media preview payload produced by the rollout pipeline."""
         if media_preview is None:
@@ -501,10 +502,11 @@ class UniRLWandBLogger:
                             .numpy()
                         )
                         audio_wf = audios[idx] if idx < len(audios) else None
-                        if audio_sr is not None and torch.is_tensor(audio_wf):
+                        audio_rate = audio_sr if audio_sample_rates is None else audio_sample_rates[idx]
+                        if audio_rate is not None and torch.is_tensor(audio_wf):
                             arr_hwc = arr.transpose(0, 2, 3, 1)  # [T, C, H, W] -> [T, H, W, C]
                             try:
-                                path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_sr))
+                                path = _write_video_with_audio(arr_hwc, int(video_fps), audio_wf, int(audio_rate))
                             except Exception as exc:
                                 module_logger.warning("W&B generated video %s row %d audio failed: %s", key, idx, exc)
                             else:
@@ -561,14 +563,16 @@ class UniRLWandBLogger:
             preview = MediaPreview(
                 prompts=[row.prompt or "" for row in selected],
                 rewards=[row.reward if row.reward is not None else 0.0 for row in selected],
-                audios=[row.media.audio if row.media.audio_sample_rate is not None else None for row in selected],
-                audio_sample_rate=next(
-                    (row.media.audio_sample_rate for row in selected if row.media.audio_sample_rate is not None),
-                    None,
-                ),
+                audios=[row.media.audio for row in selected],
                 **panel,
             )
-            self.log_generated_media(step, preview, key=f"{prefix}/generated_media", step_key=step_key)
+            self.log_generated_media(
+                step,
+                preview,
+                key=f"{prefix}/generated_media",
+                step_key=step_key,
+                audio_sample_rates=[row.media.audio_sample_rate for row in selected],
+            )
         audio_only = [
             row
             for row in rows
