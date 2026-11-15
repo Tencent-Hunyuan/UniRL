@@ -117,7 +117,6 @@ class GSPO(StageAlgorithm):
             temperature=self.sampling_temperature,
             **({"return_entropy": True} if self.monitor_entropy else {}),
         )
-        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         new_logp = replay.log_probs if self.monitor_entropy else replay
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
@@ -136,7 +135,7 @@ class GSPO(StageAlgorithm):
             loss_mask=segment.loss_mask,
         )
         if not bool(valid.any()):
-            return AlgorithmStepResult(loss=0.0, metrics=entropy_metrics, num_steps_or_tokens=0, has_backward=False)
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = grpo_clip_loss(
@@ -154,6 +153,7 @@ class GSPO(StageAlgorithm):
         rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
             dtype=new_logp.dtype, device=new_logp.device
         )
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         metrics: Dict[str, Any] = {
             **entropy_metrics,
             "policy_loss": float(loss.detach().item()),

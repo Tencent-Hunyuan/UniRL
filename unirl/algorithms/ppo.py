@@ -200,7 +200,6 @@ class PPO(StageAlgorithm):
         )
         if not isinstance(replay, ReplayResult):
             raise TypeError("PPO: replay with return_values=True must return ReplayResult")
-        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         new_logp = replay.log_probs
         new_values = _replay_values(replay)
 
@@ -231,7 +230,7 @@ class PPO(StageAlgorithm):
                 )
         active_count = int(active.sum().item())
         if active_count == 0:
-            return AlgorithmStepResult(loss=0.0, metrics=entropy_metrics, num_steps_or_tokens=0, has_backward=False)
+            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
@@ -281,6 +280,7 @@ class PPO(StageAlgorithm):
             else return_var.new_zeros(())
         )
         value_clip_fraction = ((active_values - old_values[active].float()).abs() > self.cliprange_value).float().mean()
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         metrics: Dict[str, Any] = {
             **entropy_metrics,
             "policy_loss": float(policy_loss.detach()),
