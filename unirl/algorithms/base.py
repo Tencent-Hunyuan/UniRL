@@ -343,6 +343,16 @@ class AlgorithmStepResult:
     has_backward: bool
 
 
+def backward_if_fully_masked(
+    loss_mask: Optional[torch.Tensor], new_logp: torch.Tensor
+) -> Optional[AlgorithmStepResult]:
+    """Run a graph-connected zero backward for a fully masked AR micro."""
+    if loss_mask is None or bool((loss_mask > 0).any()):
+        return None
+    new_logp[:0].sum().backward()
+    return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
+
+
 class BaseAlgorithmConfig(ABC):
     """Marker base for all algorithm config dataclasses."""
 
@@ -389,6 +399,7 @@ __all__ = [
     "BaseAlgorithmConfig",
     "StageAlgorithm",
     "aggregate_token_losses",
+    "backward_if_fully_masked",
     "gather_sde_field",
     "gaussian_kl_div",
     "grpo_clip_loss",

@@ -16,6 +16,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     aggregate_token_losses,
+    backward_if_fully_masked,
     prepare_ar_logp_anchor,
     rollout_replay_logp_absdiff,
     select_active_tokens,
@@ -149,6 +150,9 @@ class DRPO(StageAlgorithm):
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
+        masked_result = backward_if_fully_masked(segment.loss_mask, new_logp)
+        if masked_result is not None:
+            return masked_result
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         adv_per_token = GRPO._expand_advantages_to_tokens(

@@ -116,7 +116,6 @@ def patch_sampling_io() -> None:
     import sglang.multimodal_gen.configs.sample.sampling_params as sp_mod
     import sglang.multimodal_gen.runtime.entrypoints.diffusion_generator as dg_mod
     import sglang.multimodal_gen.runtime.entrypoints.utils as utils_mod
-    import sglang.multimodal_gen.runtime.pipelines_core.request_utils as req_utils_mod
     import sglang.multimodal_gen.runtime.pipelines_core.schedule_batch as sb_mod
     import sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation as ivl_mod
     import torch
@@ -241,7 +240,6 @@ def patch_sampling_io() -> None:
             return expanded
 
         setattr(expand_request_outputs, _EXPAND_SENTINEL, True)
-        req_utils_mod.expand_request_outputs = expand_request_outputs
         utils_mod.expand_request_outputs = expand_request_outputs
         dg_mod.expand_request_outputs = expand_request_outputs
         ivl_mod.expand_request_outputs = expand_request_outputs

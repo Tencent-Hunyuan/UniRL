@@ -17,6 +17,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     aggregate_token_losses,
+    backward_if_fully_masked,
     grpo_clip_loss,
     prepare_ar_logp_anchor,
     resolve_clip_range_from_schedule,
@@ -119,6 +120,9 @@ class GRPO(StageAlgorithm):
         new_logp = self.stage.replay(
             typed_conds, segment=segment, temperature=self.sampling_temperature
         )  # [total_tokens]
+        masked_result = backward_if_fully_masked(segment.loss_mask, new_logp)
+        if masked_result is not None:
+            return masked_result
         # old_logp = the frozen π_old anchor established by prepare_segment:
         # the rollout log-prob by default, or a train-side replay under
         # old_logp_source='replay'. Either way it stays frozen across all

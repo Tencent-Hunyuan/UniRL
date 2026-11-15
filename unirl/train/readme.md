@@ -174,10 +174,11 @@ use LoRA adapter mode. Formats and export live in
   still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
   image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
   (a rollout-level mean over updates). Before device alignment and anchor preparation,
-  both stacks insert token 0 with `loss_mask=0` into each zero-length AR row. All ranks
-  therefore run replay and backward, including the final micro under `defer_grad_sync`.
-  The placeholder contributes no loss or normalization units; sample counts stay unchanged.
-  Training-side response lengths include the placeholder, but rollout outputs are unchanged.
+  both stacks insert token 0 with `loss_mask=0` into each zero-length AR row, including
+  before SFT evaluation slices its batch. All ranks therefore run replay and, in training,
+  backward even for the final micro under `defer_grad_sync`. The placeholder contributes
+  no loss, valid tokens, or evaluation weight. Fully masked policy micros omit replay
+  diagnostics. Training-side response lengths include the placeholder.
   An all-empty GSPO update now creates zero gradients and steps the optimizer, including
   AdamW decay, instead of skipping the update.
 - **Advantages are not computed here** — `train` raises if
