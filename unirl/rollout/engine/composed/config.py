@@ -17,6 +17,8 @@ class ComposedRolloutEngineConfig(BaseEngineConfig):
 
     sleep_diffusion_on_start: bool = True
 
+    keep_diffusion_resident: bool = False  # never sleep the diffusion child; for servers that cannot release memory
+
     pe_instruction: Optional[str] = None
 
     pe_marker: Optional[str] = None
