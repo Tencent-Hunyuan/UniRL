@@ -59,7 +59,7 @@ class VideoRewardWrapper:
         self.use_norm = use_norm
         self.resize_height = resize_height
         self.resize_width = resize_width
-        self.micro_batch_size = max(1, int(micro_batch_size))
+        self.micro_batch_size = micro_batch_size
 
         config_path = os.path.join(checkpoint_dir, "model_config.json")
         if not os.path.exists(config_path):
