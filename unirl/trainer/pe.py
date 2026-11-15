@@ -88,8 +88,6 @@ class PETrainer(BaseTrainer):
                     "PETrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
                 )
         else:
-            if freeze_diffusion:
-                raise ValueError("PETrainer: freeze_diffusion requires the trainside rollout engine.")
             if sync_cfg is None or any(sync_cfg.get(track) is None for track in self._train_tracks):
                 raise ValueError(
                     f"PETrainer: dedicated rollout engine requires `sync:` tracks {list(self._train_tracks)}."
@@ -117,11 +115,12 @@ class PETrainer(BaseTrainer):
         self.ar_sync = None
 
         with placement(self.pool, fraction=1.0, shared_workers=True):
-            self.diffusion = (
-                self._wire_rollout_only_side(diffusion_cfg)
-                if self._freeze_diffusion
-                else self._wire_side(diffusion_cfg)
-            )
+            if not self._freeze_diffusion:
+                self.diffusion = self._wire_side(diffusion_cfg)
+            elif takes_pipeline:
+                self.diffusion = self._wire_rollout_only_side(diffusion_cfg)
+            else:
+                self.diffusion = _Side(bundle=None, pipeline=None)  # the dedicated engine renders with its own copy
             self.ar = self._wire_rollout_only_side(ar_cfg) if self._freeze_llm else self._wire_side(ar_cfg)
 
             if takes_pipeline:
@@ -143,9 +142,10 @@ class PETrainer(BaseTrainer):
             )
 
             if sync_cfg is not None:
-                self.diffusion_sync = remote_hydra(
-                    sync_cfg.diffusion, backend=self.diffusion.backend, rollout=self.rollout
-                )
+                if not self._freeze_diffusion:
+                    self.diffusion_sync = remote_hydra(
+                        sync_cfg.diffusion, backend=self.diffusion.backend, rollout=self.rollout
+                    )
                 if not self._freeze_llm:
                     self.ar_sync = remote_hydra(sync_cfg.ar, backend=self.ar.backend, rollout=self.rollout)
 
@@ -209,20 +209,20 @@ class PETrainer(BaseTrainer):
         """One ``rollout → reward → credit-assign → advantage → step`` pass."""
         t0 = time.perf_counter()
         self.rollout.wake_up()
-        if sync_weights and self.diffusion_sync is not None:
-            self.diffusion_sync.sync()
-            if self.ar_sync is not None:
-                self.ar_sync.sync()
+        if sync_weights:
+            for sync in (self.diffusion_sync, self.ar_sync):
+                if sync is not None:
+                    sync.sync()
         if self._enable_fsdp_offload:
-            self.diffusion.backend.offload()
-            if self.ar.backend is not None:
-                self.ar.backend.offload()
+            for side in (self.diffusion, self.ar):
+                if side.backend is not None:
+                    side.backend.offload()
         sample = self.rollout.generate(sample)
         self.rollout.sleep()
         if self._enable_fsdp_offload:
-            self.diffusion.backend.onload()
-            if self.ar.backend is not None:
-                self.ar.backend.onload()
+            for side in (self.diffusion, self.ar):
+                if side.backend is not None:
+                    side.backend.onload()
 
         ar_idx = sample.gen_part_index(ARSamplingParams)
         diff_idx = sample.gen_part_index(DiffusionSamplingParams)
@@ -272,10 +272,9 @@ class PETrainer(BaseTrainer):
         eval_sp = {**self.sampling_params, "diffusion": eval_diffusion}
         self.rollout.wake_up()
         try:
-            if self.diffusion_sync is not None:
-                self.diffusion_sync.sync()
-                if self.ar_sync is not None:
-                    self.ar_sync.sync()
+            for sync in (self.diffusion_sync, self.ar_sync):
+                if sync is not None:
+                    sync.sync()
             scorers = [("reward", self.reward)] + [
                 (s.name, s.reward) for s in self._eval_suites if s.data_source is None
             ]
