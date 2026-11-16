@@ -308,7 +308,7 @@ class BaseTrainer:
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         *,
         save_interval: int,
         save_dir: Optional[str],
@@ -318,12 +318,17 @@ class BaseTrainer:
         if save_interval <= 0:
             return
         step = rollout_id + 1
-        if step % save_interval != 0 and step < num_rollouts:
+        if step % save_interval != 0 and (num_rollouts is None or step < num_rollouts):
             return
         self._prepare_for_save()
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
-        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        logger.info(
+            "Saving checkpoint at rollout %d/%s -> %s",
+            step,
+            num_rollouts if num_rollouts is not None else "unlimited",
+            path,
+        )
         if self._memory_monitor is not None:
             self._memory_monitor.boundary("ckpt_save:begin", self.backend)
         self.backend.save(path, step=step, mode=save_mode)
@@ -334,7 +339,7 @@ class BaseTrainer:
         with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
         os.replace(trainer_state_tmp, trainer_state_path)
-        if step >= num_rollouts:
+        if num_rollouts is not None and step >= num_rollouts:
             self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
