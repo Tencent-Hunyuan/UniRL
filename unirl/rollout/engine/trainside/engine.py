@@ -11,6 +11,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.types.diffusion import DiffusionStage
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.base import BaseRolloutEngine
+from unirl.rollout.engine.trainside.plan import validate_group_chunks
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.sample import Part, Sample
 
@@ -26,6 +27,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
         pipeline: Pipeline,
         stage_attrs: Sequence[str] = ("diffusion",),
         forward_batch_size: Optional[int] = None,
+        validate_group_boundaries: bool = False,
     ) -> None:
         self.pipeline = pipeline
         stages = [getattr(pipeline, a) for a in stage_attrs]
@@ -35,6 +37,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
+        self.validate_group_boundaries = validate_group_boundaries
         if any(isinstance(s, DiffusionStage) for s in stages):
             if hasattr(pipeline, "build_schedule_policy"):
                 self.schedule_policy = pipeline.build_schedule_policy()
@@ -81,6 +84,8 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                     if fbs is None or bs <= fbs:
                         out = self.pipeline.generate(sample)
                     else:
+                        if self.validate_group_boundaries:
+                            validate_group_chunks(gen.group_ids, fbs)
                         input_parts = sample.parts[:-1]
                         gen_chunks: List[Part] = []
                         for start in range(0, bs, fbs):
