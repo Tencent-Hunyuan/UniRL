@@ -126,7 +126,6 @@ class FSDPBackend(BaseFSDP2Backend):
             ac_wrap_order=fsdp_cfg.ac_wrap_order,
             use_torch_compile=fsdp_cfg.use_torch_compile,
             master_dtype=fsdp_cfg.master_dtype,
-            master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
             root_wrap=fsdp_cfg.root_wrap,
             copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
