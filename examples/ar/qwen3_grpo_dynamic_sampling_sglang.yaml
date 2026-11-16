@@ -1,0 +1,15 @@
+# @package _global_
+# DAPO group filtering + bounded refill, using the existing AR GRPO recipe.
+defaults:
+  - qwen3_grpo_4b_base_dapo_sglang
+  - _self_
+
+dynamic_sampling_max_batches: 8
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,qwen3_grpo_dynamic_sampling}
+
+rollout:
+  config:
+    enable_memory_saver: true
+    enable_weights_cpu_backup: true
