@@ -179,3 +179,34 @@ Those decoded modality keys remain the contract for **condition** media
 `build_omni_messages` (`unirl/models/qwen3_omni/media.py`) accepts `MediaRefs`
 prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` are
 rejected for Omni prompts.
+
+## Sample observation records
+
+`build_sample_records` selects at most `max_items` generated rows and takes their
+prompts and ancestor context from `Sample.conditioning()` over the parts up to
+`part_index`. It leaves training
+conditions and segments unchanged. Rewards and selected media move to the driver;
+TensorRef block boundaries can materialize additional rows beyond the record cap.
+
+`dump_sample_records` writes one JSONL index with relative PNG, MP4 and WAV paths
+per phase and step. Repeating a phase and step replaces the index and the media
+files it had written. Video uses 8 frames/s; audio requires a positive
+`primitive_metadata["audio"]["sample_rate"]`.
+`UniRLWandBLogger.log_sample_records` consumes the same records, logging an image and
+a video panel over the rows carrying each, with a row's audio muxed into its video, an
+audio panel for rows that carry only audio, and one lineage table per track.
+Both sinks warn on output failures instead of interrupting training.
+
+### Gotchas
+
+- **A step's index is replaced after its media are written.** A retry uses new filenames, so a failed
+  index write leaves the previous index and its media intact. After publication the sink removes only
+  files named in the previous index. Failed cleanup warns and leaves the new index usable.
+- **Malformed media are isolated.** The local sink skips the affected record and removes its partial
+  files. The remaining rows still reach the index. W&B skips failed media entries and keeps the rest of
+  their panel and the lineage table. If video audio fails to mux, W&B attempts to log the video alone.
+
+`log_sample_records` serializes `context_texts`, `component_rewards` and `metadata`
+into the table as JSON strings, because `wandb.Table` infers one schema from the
+first row and rejects later rows whose keys differ. Audio without a sample rate is
+warned about and dropped from W&B, including audio attached to a video row.
