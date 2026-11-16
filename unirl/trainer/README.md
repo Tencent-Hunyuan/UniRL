@@ -40,7 +40,7 @@ stay swappable by `_target_`.
   disjoint `placement` slabs and runs a one-time cross-slab handshake for weight sync.
 - **The Sample-native loop** (`train_step`) is the conductor sequence, one
   rollout per call: `wake_up` → (sync weights, if due) →
-  `rollout.generate(sample)` → (if configured) `reward.score_and_attach(sample)` →
+  `rollout.generate(sample)` → (if configured) `score_and_attach(reward, sample)` →
   (if required) `part.compute_advantages(...)` → drop reward-only decoded media →
   `stack.train_track(...)`. On synchronous `ARTrainer`, `requires_advantages=False`
   algorithms (supervised / teacher-anchored, e.g. the planned AR OPD) may omit the
