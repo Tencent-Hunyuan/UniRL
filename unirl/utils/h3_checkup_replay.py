@@ -1,5 +1,6 @@
 """同一批Part上运行真实FlashGRPO loss；仅导出梯度，不调用优化器更新。"""
 import json
+import os
 import time
 from pathlib import Path
 
@@ -151,8 +152,9 @@ class ReplayStack(TrainStack):
         self.algorithm._checkup_on_policy = True
         parameter_names = {canonical(n) for n,p in backend.model.named_parameters() if p.requires_grad}
         assert len(parameter_names) == 600
-        for split in ['full','A','B']:
-            directory = Path(output_directory) / variant / split
+        # 可选：另存目录名与只跑部分 split（micro 对比用）
+        for split in os.environ.get('CHECKUP_SPLITS', 'full,A,B').split(','):
+            directory = Path(output_directory) / os.environ.get('CHECKUP_OUT_NAME', variant) / split
             directory.mkdir(parents=True, exist_ok=True)
             assert not (directory / 'DONE').exists(), 'refuse overwriting complete gradients'
             self.algorithm._checkup_split = split
