@@ -4,6 +4,7 @@ import logging
 import sys
 import time
 from contextlib import contextmanager
+from itertools import count
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
@@ -889,7 +890,7 @@ class DiffusionTrainer(BaseTrainer):
         self,
         window_ids: Sequence[int],
         *,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         weight_sync_interval: int = 1,
         force_sync_at: Optional[int] = None,
     ) -> Tuple[TrainStepResult, float]:
@@ -905,7 +906,7 @@ class DiffusionTrainer(BaseTrainer):
             samples.append(sample)
             window_rewards.append(mean_reward)
         final_id = window_ids[-1]
-        training_progress = final_id / max(1, num_rollouts - 1)
+        training_progress = final_id / max(1, num_rollouts - 1) if num_rollouts is not None else 0.0
         parts = tuple(sample.parts[-1] for sample in samples)
         # First point in the window that needs the trainer on the GPU. With
         # accumulate_rollouts > 1 it stayed parked across every rollout and
@@ -1098,16 +1099,16 @@ class DiffusionTrainer(BaseTrainer):
     def train(
         self,
         *,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         weight_sync_interval: int = 1,
         save_interval: int = 0,
         save_dir: Optional[str] = None,
         load_dir: Optional[str] = None,
         save_mode: str = "auto",
     ) -> None:
-        """Minimal training loop: ``num_rollouts`` rollouts in windows of"""
+        """Train rollout windows until the budget ends; None runs until interrupted."""
         # ${oc.env:...} interpolations arrive as strings.
-        num_rollouts = int(num_rollouts)
+        num_rollouts = int(num_rollouts) if num_rollouts is not None else None
         save_interval = int(save_interval)
         interval = max(1, int(weight_sync_interval))
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
@@ -1116,7 +1117,7 @@ class DiffusionTrainer(BaseTrainer):
         # cadences are checked at window ends and must land on them to fire.
         acc = self.accumulate_rollouts
         if acc > 1:
-            if num_rollouts % acc:
+            if num_rollouts is not None and num_rollouts % acc:
                 raise ValueError(
                     f"num_rollouts={num_rollouts} is not a multiple of accumulate_rollouts={acc}: "
                     "the MOPD protocol steps once per FULL task cycle."
@@ -1132,8 +1133,10 @@ class DiffusionTrainer(BaseTrainer):
         try:
             if self.eval_interval > 0:
                 self.evaluate(start_rollout)
-            for window_start in range(start_rollout, num_rollouts, acc):
-                window_ids = range(window_start, min(window_start + acc, num_rollouts))
+            windows = range(start_rollout, num_rollouts, acc) if num_rollouts is not None else count(start_rollout, acc)
+            for window_start in windows:
+                window_end = min(window_start + acc, num_rollouts) if num_rollouts is not None else window_start + acc
+                window_ids = range(window_start, window_end)
                 result, mean_reward = self.train_step(
                     window_ids,
                     num_rollouts=num_rollouts,
