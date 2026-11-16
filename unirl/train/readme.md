@@ -150,6 +150,11 @@ use LoRA adapter mode. Formats and export live in
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
   fp32 master for free; a bf16 load needs `master_dtype: fp32` set explicitly. The
   ctor never warns.
+- **An explicit FSDP `master_dtype` also casts frozen floating parameters** —
+  PyTorch 2.7 requires uniform original parameter dtype within each FSDP2 group.
+  Frozen bf16 backbone weights mixed with fp32 LoRA masters otherwise fail on
+  the first forward. `param_dtype` still controls mixed-precision computation;
+  frozen weights remain frozen, but their persistent storage uses more memory.
 - **The EP fused-expert layout registry is keyed by `config.model_type`, never by
   parameter-name suffix** (`backend/veomni/ep/experts.py`). HunyuanImage3's fused
   params end in `.experts.down_proj` too, but its `gate_and_up` halves are stored
