@@ -1,0 +1,5 @@
+# @package sync
+_target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+verify: true
+param_prefix: "transformer."
+adapter_name: default

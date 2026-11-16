@@ -14,7 +14,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, unwrap_replicated_int
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
@@ -746,10 +746,12 @@ class DiffusionTrainer(BaseTrainer):
         """Load the adapter into an awake rollout, from cache when one was taken."""
         if self.weight_sync is None:
             return
+        train_version = unwrap_replicated_int(self.backend.get_optimizer_step_count(), name="optimizer step count")
         if staged:
             self.weight_sync.push()
         else:
             self.weight_sync.sync()
+        self.rollout.set_version(train_version)
 
     @contextmanager
     def _reward_phase(self, *, preserve_rollout: bool = False) -> Iterator[None]:
