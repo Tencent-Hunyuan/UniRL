@@ -21,7 +21,13 @@ def tensors(obj):
 
 
 def audit_fp32(model):
-    counts = {'forward_tensors': 0, 'backward_tensors': 0}
+    from unirl.models.minimax_h3.vendor.transformer_minimax_h3 import (
+        MiniMaxH3RotaryPosEmbed, MiniMaxH3Transformer3DModel,
+    )
+
+    # Counts are cumulative module-boundary tensor encounters, not unique tensors.
+    counts = {'forward_tensors': 0, 'backward_tensors': 0,
+              'exempt_position_ids_float64': 0, 'exempt_rope_inputs_float64': 0}
     for name, value in list(model.named_parameters()) + list(model.named_buffers()):
         if value.is_floating_point():
             assert value.dtype == torch.float32, (name, value.dtype)
@@ -37,7 +43,29 @@ def audit_fp32(model):
         check(grad, 'backward_tensors')
         return grad
 
+    def coordinate(value, key):
+        # packing.py deliberately builds the shared A/V rotary clock in float64;
+        # MiniMaxH3RotaryPosEmbed.forward converts it to float32 before arithmetic.
+        # Never exempt lower precision, differentiable activations, or other shapes.
+        if isinstance(value, torch.Tensor) and value.dtype == torch.float64:
+            assert value.ndim == 2 and value.shape[-1] == 3 and not value.requires_grad, (
+                key, value.dtype, value.shape, value.requires_grad)
+            counts[key] += 1
+        else:
+            check(value, 'forward_tensors')
+
     def before(module, args, kwargs):
+        if module is model and isinstance(module, MiniMaxH3Transformer3DModel):
+            if 'position_ids' in kwargs:
+                coordinate(kwargs['position_ids'], 'exempt_position_ids_float64')
+                kwargs = {key: value for key, value in kwargs.items() if key != 'position_ids'}
+        elif isinstance(module, MiniMaxH3RotaryPosEmbed):
+            if args:
+                coordinate(args[0], 'exempt_rope_inputs_float64')
+                args = args[1:]
+            if 'position_ids' in kwargs:
+                coordinate(kwargs['position_ids'], 'exempt_rope_inputs_float64')
+                kwargs = {key: value for key, value in kwargs.items() if key != 'position_ids'}
         check((args, kwargs), 'forward_tensors')
 
     def after(module, args, kwargs, output):
