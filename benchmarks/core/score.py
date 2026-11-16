@@ -198,7 +198,7 @@ def check_geneval2_metadata(client: RewardServiceClient) -> None:
 
 
 _BOXED_LETTER = re.compile(r"\\boxed\{\s*\(?([A-Da-d])\)?\s*\}")
-_ANSWER_IS = re.compile(r"(?i)answer\s*(?:is)?\s*:?\s*\(?([A-D])\)?")
+_ANSWER_IS = re.compile(r"(?i)answer\s*(?:is)?\s*:?\s*\(?([A-D])\b\)?")
 
 
 def grade_math(answer: str, responses: List[str]) -> float:
