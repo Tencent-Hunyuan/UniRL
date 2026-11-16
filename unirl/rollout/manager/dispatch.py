@@ -81,9 +81,7 @@ class RolloutPool:
         kv_replicator: Optional[Callable[[int, int, str], Any]] = None,
     ) -> None:
         if affinity_policy not in AFFINITY_POLICIES:
-            raise ValueError(
-                f"RolloutPool affinity_policy must be one of {AFFINITY_POLICIES}; got {affinity_policy!r}"
-            )
+            raise ValueError(f"RolloutPool affinity_policy must be one of {AFFINITY_POLICIES}; got {affinity_policy!r}")
         if kv_replication not in KV_REPLICATION_MODES:
             raise ValueError(
                 f"RolloutPool kv_replication must be one of {KV_REPLICATION_MODES}; got {kv_replication!r}"
@@ -106,7 +104,9 @@ class RolloutPool:
         self._load_weight = float(load_weight)
         self._active_tokens_weight = float(active_tokens_weight)
         self._kv_replication = kv_replication
-        self._enable_work_stealing = (kv_replication != "none") if enable_work_stealing is None else bool(enable_work_stealing)
+        self._enable_work_stealing = (
+            (kv_replication != "none") if enable_work_stealing is None else bool(enable_work_stealing)
+        )
         self._kv_usage_fn = kv_usage_fn
         self._kv_replicator = kv_replicator
         self._launchers = list(launchers)
@@ -235,8 +235,7 @@ class RolloutPool:
                 )
                 extra_tasks = sum(max(0, count - 1) for count in self._root_task_counts.values())
                 co_located_extra = sum(
-                    max(0, count - len(self._root_launchers[root]))
-                    for root, count in self._root_task_counts.items()
+                    max(0, count - len(self._root_launchers[root])) for root, count in self._root_task_counts.items()
                 )
                 co_located_rate = (co_located_extra / extra_tasks) if extra_tasks > 0 else 1.0
                 if self._worker_node_ids is not None:
@@ -443,9 +442,7 @@ class RolloutPool:
         replicated = self._is_replicated(root_id, now)
 
         # Keep siblings on their home worker while it remains within balance, token, and KV bounds.
-        home_eligible = [
-            i for i in eligible if i in known_workers and (kv_usages is None or kv_usages[i] < 0.85)
-        ]
+        home_eligible = [i for i in eligible if i in known_workers and (kv_usages is None or kv_usages[i] < 0.85)]
         if home_eligible:
             eligible = home_eligible
 
@@ -553,10 +550,9 @@ class RolloutPool:
             ):
                 if self._balance_rel_threshold is not None:
                     min_load = min(load)
-                    if (
-                        load[index] - min_load >= self._balance_abs_threshold
-                        and load[index] > self._balance_rel_threshold * max(1, min_load)
-                    ):
+                    if load[index] - min_load >= self._balance_abs_threshold and load[
+                        index
+                    ] > self._balance_rel_threshold * max(1, min_load):
                         break
                 sequence, task = self._queue.popleft()
                 est_tokens = _estimate_task_tokens(task)

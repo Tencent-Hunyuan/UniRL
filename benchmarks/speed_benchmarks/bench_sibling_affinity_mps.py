@@ -262,10 +262,14 @@ def main() -> None:
             pass
 
     def _gpu_mem_mb() -> tuple[float, float]:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
-            text=True,
-        ).strip().splitlines()[0]
+        out = (
+            subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
+                text=True,
+            )
+            .strip()
+            .splitlines()[0]
+        )
         total_s, free_s = out.split(",")
         return float(total_s), float(free_s)
 
@@ -277,7 +281,9 @@ def main() -> None:
     try:
         for i, port in enumerate(ports):
             total_mb, free_mb = _gpu_mem_mb()
-            worker_frac = min(0.85, max(args.mem_fraction_static, (total_mb * args.mem_fraction_static) / max(free_mb, 1.0)))
+            worker_frac = min(
+                0.85, max(args.mem_fraction_static, (total_mb * args.mem_fraction_static) / max(free_mb, 1.0))
+            )
             log_path = run_dir / f"worker_{i}_{port}.log"
             log_paths.append(log_path)
             lf = open(log_path, "w")
