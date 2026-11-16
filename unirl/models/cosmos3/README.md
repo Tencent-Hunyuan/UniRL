@@ -148,8 +148,12 @@ stored in `trajectory_precision` between steps.
   stage's own helpers); it still reuses the generic `_media_uris` / `_require_local_uri`
   from `unirl/train/sft/track_builder.py`, whose builders stay model-agnostic.
 - diffusers>=0.39 is required (first release with `Cosmos3OmniTransformer` /
-  `Cosmos3OmniPipeline`); its `forward` returns the bare `(vision, sound, action)` tuple
-  and has no `return_dict`.
+  `Cosmos3OmniPipeline`). The transformer `forward` return differs by version: 0.39 has
+  no `return_dict` and returns the bare `(vision, sound, action)` tuple; 0.40 added
+  `return_dict=True` and returns a `Cosmos3OmniTransformerOutput` (`sample` / `sound` /
+  `action`) by default. That output is a `BaseOutput`, so tuple-unpacking it yields its
+  non-`None` field names rather than the three lists. `Cosmos3JointStage.predict_velocity`
+  reads both forms; passing `return_dict=False` instead would break 0.39.
 - The H20 workaround patches in `bundle.py` install frozen diffusers-0.39 copies of
   `DomainAwareLinear.forward`, `dispatch_attention_fn`, and the rotary `forward`. Because
   the pin is an open `diffusers>=0.39`, each patch first fingerprints the upstream
