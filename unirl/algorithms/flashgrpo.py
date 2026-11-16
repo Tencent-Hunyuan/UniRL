@@ -17,6 +17,8 @@ from unirl.types.conditions import Condition
 from unirl.types.sample import Part
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.stage_metrics import record, record_means
+from unirl.utils.h3_checkup_data import masked_loss
+from unirl.utils.h3_checkup_ratios import ratio_rows, select_anchor
 
 from .base import (
     AlgorithmStepResult,
@@ -282,6 +284,9 @@ class FlashGRPO(FlowGRPO):
         new_logp = replay_result.log_probs
         # Each sample took its one stochastic step at its own index, so slot 0 holds its logp.
         old_logp = segment.sde_logp[:, :1].to(dtype=new_logp.dtype, device=new_logp.device)
+        rollout_old_logp = old_logp
+        on_policy_diagnostic = getattr(self, "_checkup_on_policy", False)
+        old_logp = select_anchor(new_logp, old_logp, on_policy_diagnostic)
 
         clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         adv_raw = advantages.detach().to(dtype=new_logp.dtype, device=new_logp.device)
@@ -294,6 +299,11 @@ class FlashGRPO(FlowGRPO):
             advantages=adv_b,
             clip_range=clip_range,
         )
+
+        if on_policy_diagnostic:
+            assert ratio_metrics["ratio_min"].item() == 1.0 and ratio_metrics["ratio_max"].item() == 1.0
+            assert ratio_metrics["clip_fraction"].item() == 0.0
+            self._checkup_ratio_rows.append(ratio_rows(new_logp, rollout_old_logp, adv_clipped, old_logp))
 
         if self.batch_normalize_tgr:
             if segment.policy_loss_weights is None:
@@ -318,7 +328,13 @@ class FlashGRPO(FlowGRPO):
             loss = loss + kl_loss
 
         with record("backward"):
-            (loss * loss_scale).backward()
+            backward_loss = loss * loss_scale
+            if hasattr(self, "_checkup_split"):
+                backward_loss = masked_loss(backward_loss, self._checkup_split, torch.distributed.get_rank())
+            if getattr(self, "_checkup_log_backward", False):
+                print(f"CHECKUP_BACKWARD_BEGIN split={self._checkup_split} rank={torch.distributed.get_rank()}", flush=True)
+                self._checkup_log_backward = False
+            backward_loss.backward()
         metric_tensors = {
             "policy_loss": policy_loss.detach(),
             "flash_tgr_mean": tgr.detach().mean(),
