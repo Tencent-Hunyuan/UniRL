@@ -69,6 +69,8 @@ class AgenticTrainer(BaseTrainer):
         stop: Optional[List[str]] = None,
         per_worker_inflight: int = 8,
         mask_overflow_loss: bool = False,
+        affinity_policy: str = "least_loaded",
+        rollout_dispatch_cfg: Optional[DictConfig] = None,
     ) -> None:
         configured_concurrency = cfg.get("worker_max_concurrency")
         worker_max_concurrency = (
@@ -112,11 +114,16 @@ class AgenticTrainer(BaseTrainer):
 
             slots = self.rollout.engine_slots
             launchers = [lambda sample, slot=slot: slot.launch("generate", sample) for slot in slots]
+            dispatch_kwargs = dict(rollout_dispatch_cfg) if rollout_dispatch_cfg is not None else {}
+            if "policy" in dispatch_kwargs and "affinity_policy" not in dispatch_kwargs:
+                dispatch_kwargs["affinity_policy"] = dispatch_kwargs.pop("policy")
             self._rollout_manager = RolloutManager(
                 self.rollout,
                 launchers=launchers,
                 capacities=[self._per_worker_inflight] * len(launchers),
                 group_size=self._group_size,
+                affinity_policy=affinity_policy,
+                dispatch_kwargs=dispatch_kwargs,
             )
             self._train_version = unwrap_replicated_int(
                 self.backend.get_optimizer_step_count(),
@@ -364,6 +371,7 @@ class AgenticTrainer(BaseTrainer):
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
 
+        dispatch_stats = self._rollout_manager.dispatch_stats(reset=True)
         log_sample = self._build_log_sample(trajectories, rewards, advantages, rollout_id)
         self.wandb_logger.log_rollout_step(
             rollout_id,
@@ -376,6 +384,14 @@ class AgenticTrainer(BaseTrainer):
                 "agent/failed_trajectories": int((~finite).sum().item()),
                 "agent/overflow_trajectories": statuses["overflow"],
                 "agent/train_rows": train_rows,
+                "rollout_dispatch/sibling_co_located_rate": dispatch_stats["sibling_co_located_rate"],
+                "rollout_dispatch/mean_workers_per_group": dispatch_stats["mean_workers_per_group"],
+                "rollout_dispatch/group_single_worker_rate": dispatch_stats["group_single_worker_rate"],
+                "rollout_dispatch/cross_node_spill_rate": dispatch_stats["cross_node_spill_rate"],
+                "rollout_dispatch/stagger_holds": dispatch_stats["stagger_holds"],
+                "rollout_dispatch/kv_replication_hits": dispatch_stats["kv_replication_hits"],
+                "rollout_dispatch/work_steals": dispatch_stats["work_steals"],
+                "rollout_dispatch/tasks_dispatched": dispatch_stats["tasks_dispatched"],
             },
         )
         return result, mean_reward
