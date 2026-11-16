@@ -2,6 +2,7 @@
 
 Diagnosis-only files for this PR, which is not meant to be merged. AGENTS.md does not allow verification harnesses in the tree, so this folder would be dropped from anything that goes upstream.
 
+- `REPRODUCE.md`: step-by-step reproduction, what each step needs and the numbers we got.
 - `replay-tools/`: launchers for the fixed-batch replay in `unirl/utils/h3_checkup_*.py`. `capture.py` saves the batch, `replay.py` recomputes gradients for one variant, `runtime.py` builds each variant's config, `chain.py` runs the sequence, `cmp_micro.py` compares two exported gradient sets (overall and per-block cosine, norm ratio, relative L2), `*_cpu.py` are CPU self-checks. `env.sh` needs `TRAIN_ROOT` and `REPLAY_ROOT`.
 - `standalone/`: `standalone_micro.py` needs no UniRL (plain PyTorch, real weights, the 50 blocks placed across 8 GPUs). `capture_hook.py` and `capture_supervisor.py` capture one micro-batch from the replay, `cpu_validate.py` is the CPU check, `diag_g1.py` is the forward-only input-layout diagnosis.
 - `results/`: the figures and the data behind them (`results/README.md` shows the four figures with a short note each).
