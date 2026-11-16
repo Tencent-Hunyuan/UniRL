@@ -179,3 +179,16 @@ Those decoded modality keys remain the contract for **condition** media
 `build_omni_messages` (`unirl/models/qwen3_omni/media.py`) accepts `MediaRefs`
 prompt media only; waveform `Audios` and decoded frame `Videos` / `Images` are
 rejected for Omni prompts.
+
+## Sample observation records
+
+`build_sample_records` selects at most `max_items` generated rows and uses
+`Sample.conditioning_at` to align prompts and ancestor context. It leaves training
+conditions and segments unchanged. Rewards and selected media move to the driver;
+TensorRef block boundaries can materialize additional rows beyond the record cap.
+
+`dump_sample_records` writes one JSONL index with relative PNG, MP4 and WAV paths
+per phase and step. Repeating a phase and step replaces its index. Video uses
+8 frames/s; audio requires `primitive_metadata["audio"]["sample_rate"]`.
+`UniRLWandBLogger.log_sample_records` consumes the same records for media panels
+and sample tables. Both sinks warn on output failures.

@@ -117,6 +117,11 @@ class BaseTrainer:
         logging_cfg: Optional[DictConfig] = None,
         worker_max_concurrency: Optional[int | Sequence[int]] = None,
     ) -> None:
+        if cfg.get("dump_dir") is not None:
+            raise ValueError("dump_dir is retired; use logging.sample_dump_dir and logging.media_max_items.")
+        for name in ("ROLLOUT_DUMP_DIR", "ROLLOUT_DUMP_N"):
+            if name in os.environ:
+                raise ValueError(f"{name} is retired; use logging.sample_dump_dir and logging.media_max_items.")
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")
@@ -214,56 +219,40 @@ class BaseTrainer:
         if self._memory_monitor is not None:
             self._memory_monitor.install(self)
 
-    def _drop_decoded(
-        self,
-        sample: Sample,
-        *,
-        rollout_id: int,
-    ) -> None:
-        """Upload media previews (if due this rollout) then free decoded payloads."""
+    def _observe_samples(self, sample: Sample, *, step: int, phase: str, max_items: Optional[int] = None) -> None:
+        """Send bounded scored rows to both sinks and release rollout decoded payloads."""
         wb = self.wandb_logger
-        if wb is not None and wb.should_log_media(rollout_id):
-            self._upload_media_previews(sample, rollout_id + 1, prefix="rollout", step_key="rollout/step")
+        cfg = self.logging_cfg or {}
+        dump_dir = cfg.get("sample_dump_dir")
+        due = phase != "rollout" or (step - 1) % wb.media_log_interval == 0
+        log_wandb = due and wb.initialized and wb.log_media
+        try:
+            if not due or (not dump_dir and not log_wandb):
+                return
+            from unirl.types.sample_record import build_sample_records
+            from unirl.utils.sample_dump import dump_sample_records
 
-        for part in sample.gen_parts():
-            part.primitives = {}
-            part.primitive_metadata = {}
-            part.media_preview = None
-
-    def _upload_media_previews(self, sample: Sample, step: int, *, prefix: str, step_key: str) -> None:
-        """Upload one preview grid per generated track of ``sample`` under ``prefix``."""
-        from unirl.types.media_preview import build_media_preview_for_part
-        from unirl.types.primitives import Images, Texts
-
-        wb = self.wandb_logger
-        gen_parts = sample.gen_parts()
-        multi = len(gen_parts) > 1
-        cond = sample.conditioning()
-        default_prompts = next((list(c.texts) for c in cond if isinstance(c, Texts)), None)
-        input_image = next((c for c in cond if isinstance(c, Images)), None)
-        for part in gen_parts:
-            name = "ar" if isinstance(part.sampling_params, ARSamplingParams) else "diffusion"
-            preview = part.media_preview
-            if preview is None and part.primitives:
-                preview = build_media_preview_for_part(
-                    part=part,
-                    max_items=wb.media_max_items,
-                    prompts=default_prompts if part is sample.parts[-1] else None,
-                    input_image=input_image,
-                )
-            if preview is None:
-                continue
-            if len(preview) > wb.media_max_items:
-                preview = preview.slice(0, wb.media_max_items)
-            key = f"{prefix}/{name}/generated_media" if multi else f"{prefix}/generated_media"
-            wb.log_generated_media(step, preview, key=key, step_key=step_key)
-
-    def _log_eval_media(self, sample: Sample, step: int, *, prefix: str = "eval") -> None:
-        """Upload the eval preview grid for one scored eval chunk."""
-        wb = self.wandb_logger
-        if wb is None or not wb.should_log_eval_media():
-            return
-        self._upload_media_previews(sample, step, prefix=prefix, step_key="eval/step")
+            limit = wb.media_max_items if max_items is None else min(wb.media_max_items, max_items)
+            records = []
+            for index, part in enumerate(sample.parts):
+                if not part.is_gen:
+                    continue
+                try:
+                    records.extend(
+                        build_sample_records(sample, part_index=index, step=step, phase=phase, max_items=limit)
+                    )
+                except Exception as exc:
+                    logger.warning("Sample observation failed for Part %d: %s", index, exc)
+            if log_wandb:
+                wb.log_sample_records(records, multi_track=len(sample.gen_parts()) > 1)
+            if dump_dir:
+                dump_sample_records(dump_dir, records)
+        finally:
+            if phase == "rollout":
+                for part in sample.gen_parts():
+                    part.primitives = {}
+                    part.primitive_metadata = {}
+                    part.media_preview = None
 
     def _wait_for_checkpoints(self, *, timeout: Optional[float] = None) -> None:
         """Flush a pending backend checkpoint before worker teardown."""
