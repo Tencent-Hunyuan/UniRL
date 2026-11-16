@@ -26,6 +26,8 @@ class LatentSegment(Segment):
     sde_logp: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [N_segs, S], S = len(sde_indices)
     sde_means: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [N_segs, S] + *latent_shape
     sde_indices: Optional[torch.Tensor] = shared_field(default=None)  # [S] long — step per sde_logp slot
+    art_guidance: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, *latent]
+    art_old_predictions: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B, T, *latent]
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     aux_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)

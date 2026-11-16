@@ -24,6 +24,7 @@ def prepare_segment_anchors(
     algorithm: StageAlgorithm, part: Part, plan: Plan, *, order: Optional[torch.Tensor]
 ) -> None:
     """Freeze declared anchors over the plan's micros, before any update, and write them back onto ``part``."""
+    algorithm.validate_part(part)
     if part.segment is None:
         return
     micro_slices = [r for update in plan for r in update]

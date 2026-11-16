@@ -182,3 +182,57 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+
+## DiffusionART
+
+`diffusionart.DiffusionART` uses ODE rollouts (`eta: 0`, `guidance_scale: 1`),
+plain LoRA without EMA, and exactly two disjoint optimizer updates per rollout.
+Set `stack.num_updates_per_batch: 2` and sync weights every rollout. Every
+visited state plus the final endpoint must be present in `LatentSegment`;
+sparse trajectories, packed latents, and joint audio/video predictions raise.
+The stack calls `validate_part` once on the full shard before any anchor
+forward; numeric schedule and dense-index checks belong there. Anchor and
+training micros repeat metadata-only shape checks without device scalar reads.
+Standalone callers must invoke `validate_part(part)` before `prepare_segment`
+and keep the shared schedule/indices unchanged throughout that rollout.
+SD3 and the dense HunyuanVideo/Wan stages share the same prediction interface.
+
+`prepare_part` groups scalar advantages by sample lineage, using the same
+default parent layer as `Part.compute_advantages` (`group_layer` overrides it).
+The group size must match `params.samples_per_prompt`. Train workers exchange
+only sample IDs, group labels, and shapes, then tensor-reduce endpoint sufficient
+statistics one group at a time. A prompt may span DP shards; replicated SP/TP
+rows count once by sample identity. No trajectory or endpoint tensor is gathered
+to the driver. All train ranks participate in identical group order; endpoints
+must share a dense latent shape. The temporary reduction buffer holds two
+latent-sized moments per group, independent of the global number of groups.
+
+Guidance is the per-prompt reward/endpoint covariance divided by its RMS.
+Centered, positively scaled scalar advantages give the same direction as raw
+rewards. Constant advantages and exactly zero covariance produce zero guidance
+and zero loss, including after the first update. A globally zero-guidance rollout
+skips both optimizer steps, including AdamW momentum and weight decay. A locally
+inactive shard still runs backward when any other shard has guidance.
+`art_guidance` is row-aligned;
+`art_old_predictions` is frozen by the stack over the exact planned microbatches
+for both updates before either optimizer step. Anchors are stored on CPU.
+Both prediction passes keep the transformer in training mode, including during
+the stack's eval-mode anchor hook, and temporarily disable only PyTorch dropout
+modules. This preserves training-gated activation checkpointing and prevents
+dropout from introducing artificial drift; every module's previous mode is
+restored after backward. Stateful BatchNorm stages raise, and custom stochastic
+prediction paths are unsupported.
+
+UniRL predicts epsilon minus x0, so the regression target is **old minus
+guidance**. Loss is sigma times the mean squared velocity residual, averaged
+over every original row and timestep; masked rows remain in the denominator.
+The correction mask drops a row when reference Gaussian KL is at least
+`kl_mask_threshold` (default `1e-5`) and drift dotted with the remaining target
+residual is positive. It uses `FlowSDEStrategy` reference noise `reference_nu`
+(default `0.8`), independently of rollout eta. At sigma one the reference
+standard deviation is nu and the velocity coefficient is the step size;
+elsewhere they are `nu * sqrt(sigma / (1-sigma) * h)` and
+`h * (1 + nu**2/2)`. This deliberately differs from the rollout scheduler's
+`sigma_max` fallback. `timestep_chunk_size` (default one) bounds replay graphs
+and never changes anchor microbatch geometry. Metrics report mask fraction,
+zero-signal fraction, prediction drift, and reference KL.
