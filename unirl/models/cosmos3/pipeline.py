@@ -1,7 +1,8 @@
-"""Cosmos3 packed omnimodal stage and SFT pipeline."""
+"""Cosmos3 packed omnimodal stage and the SFT / text-to-image pipeline."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence
@@ -9,9 +10,18 @@ from typing import Any, Optional, Sequence
 import torch
 
 from unirl.models.types.pipeline import Pipeline
+from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
+from unirl.sde.runtime import FlowMatchSchedulePolicy
+from unirl.types.conditions import TextTokenCondition
+from unirl.types.noise_recipe import NoiseRecipe
+from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
+from unirl.types.sampling import DiffusionSamplingParams
+from unirl.types.segments.latent import LatentSegment
 
 from .bundle import Cosmos3Bundle, _import_diffusers_classes
+from .conditions import Cosmos3Conditions
+from .diffusion import Cosmos3DiffusionStage, Cosmos3DiffusionStep
 from .packing import (
     noise_action_latents,
     noise_vision_latents,
@@ -180,8 +190,12 @@ class Cosmos3JointStage:
                 f"{tuple(x_t.shape)} cond_frames={condition_frames}). "
                 "condition_on_first_frame with a single latent frame leaves an empty GEMM."
             )
-        # diffusers-0.39 forward: bare (vision, sound, action) lists, no return_dict (README # Gotchas).
-        preds_vision, _preds_sound, preds_action = self.bundle.transformer(**kwargs)
+        # diffusers 0.39 returns a bare (vision, sound, action) tuple, >=0.40 an output object (README # Gotchas).
+        output = self.bundle.transformer(**kwargs)
+        if isinstance(output, tuple):
+            preds_vision, _preds_sound, preds_action = output
+        else:
+            preds_vision, preds_action = output.sample, output.action
         if not preds_vision:
             raise RuntimeError("Cosmos3JointStage: transformer returned no vision prediction.")
         vision_pred = preds_vision[0]
@@ -222,19 +236,115 @@ class Cosmos3JointStage:
         )
 
 
-class Cosmos3Pipeline(Pipeline):
-    """SFT-only pipeline exposing Cosmos3's packed joint stage."""
+def _token_condition(rows: Sequence[Sequence[int]]) -> TextTokenCondition:
+    """Per-sample token id lists to right-padded ``[B, L]`` ids plus mask."""
+    return TextTokenCondition.concat(
+        [
+            TextTokenCondition(input_ids=torch.tensor([row]), attention_mask=torch.ones(1, len(row), dtype=torch.long))
+            for row in rows
+        ]
+    )
 
-    def __init__(self, *, bundle: Cosmos3Bundle) -> None:
+
+class Cosmos3Pipeline(Pipeline):
+    """Cosmos3 pipeline: packed joint stage for SFT plus single-frame text-to-image generation."""
+
+    def __init__(
+        self,
+        *,
+        bundle: Cosmos3Bundle,
+        strategy: Optional[StepStrategy] = None,
+        shift: Optional[float] = None,
+        trajectory_precision: str = "bf16",
+        logprob_precision: str = "fp32",
+    ) -> None:
         super().__init__()
         self.bundle = bundle
         self.joint = Cosmos3JointStage(bundle)
+        self.diffusion = Cosmos3DiffusionStage(
+            model=bundle,
+            step=Cosmos3DiffusionStep(self.joint.pipe),
+            strategy=strategy if strategy is not None else FlowSDEStrategy(),
+            trajectory_precision=trajectory_precision,
+            logprob_precision=logprob_precision,
+        )
+        self.shift = shift
+
+    @classmethod
+    def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
+        """Per-sample latent shape ``(48, 1, H/16, W/16)`` for driver-side initial noise."""
+        return (48, 1, sampling_spec.height // 16, sampling_spec.width // 16)
+
+    def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
+        """Static flow shift; the checkpoint's UniPC/Karras scheduler config is not used (README # Gotchas)."""
+        if self.shift is None:
+            raise ValueError("Cosmos3Pipeline.build_schedule_policy: generation needs an explicit `shift`.")
+        return FlowMatchSchedulePolicy.static_only(self.shift)
+
+    def build_conditions(self, texts: Texts, *, height: int, width: int) -> Cosmos3Conditions:
+        """Tokenize prompts into cond / uncond ids with the upstream single-frame templates."""
+        cfg = self.bundle.config
+        cond_rows, uncond_rows = [], []
+        for prompt in texts.texts:
+            cond_ids, uncond_ids = self.joint.pipe.tokenize_prompt(
+                prompt,
+                None,
+                num_frames=1,
+                height=height,
+                width=width,
+                fps=cfg.fps,
+                use_system_prompt=cfg.use_system_prompt,
+                add_resolution_template=cfg.add_resolution_template,
+                add_duration_template=cfg.add_duration_template,
+            )
+            cond_rows.append(cond_ids)
+            uncond_rows.append(uncond_ids)
+        return Cosmos3Conditions(text=_token_condition(cond_rows), negative_text=_token_condition(uncond_rows))
+
+    @torch.no_grad()
+    def decode(self, segment: LatentSegment) -> Images:
+        """Decode final latents ``[B, C, 1, H_lat, W_lat]`` to images in ``[0, 1]``."""
+        vae, pipe = self.bundle.vae, self.joint.pipe
+        latents = segment.latents[:, -1].to(device=vae.device, dtype=vae.dtype)
+        mean = pipe._vae_latents_mean.to(latents).view(1, -1, 1, 1, 1)
+        inv_std = pipe._vae_latents_inv_std.to(latents).view(1, -1, 1, 1, 1)
+        decoded = vae.decode(latents / inv_std + mean).sample  # [B, 3, 1, H, W] in [-1, 1]
+        return Images.from_dense(((decoded[:, :, 0].float() + 1.0) / 2.0).clamp(0.0, 1.0))
 
     def generate(self, sample: Sample) -> Sample:
-        raise NotImplementedError(
-            "Cosmos3Pipeline currently supports supervised packed-stage training only. "
-            "SFT eval/loss is velocity MSE, not a sampling-quality metric."
+        """Run single-frame text-to-image, filling the frontier (pre-forked) gen Part."""
+        frontier = sample.parts[-1]
+        params = frontier.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise TypeError(
+                f"Cosmos3Pipeline.generate: frontier gen Part must carry DiffusionSamplingParams, "
+                f"got {type(params).__name__ if params is not None else 'None'}"
+            )
+        if params.sigmas is None:
+            raise ValueError(
+                "Cosmos3Pipeline.generate: gen part sampling_params.sigmas is None; the hosting engine "
+                "must pin sigmas before invoking pipeline.generate."
+            )
+        conditioning = sample.conditioning()
+        texts = conditioning[0] if conditioning else None
+        if not isinstance(texts, Texts):
+            raise TypeError(
+                f"Cosmos3Pipeline.generate: expected a Texts prompt from sample.conditioning()[0], "
+                f"got {type(texts).__name__ if texts is not None else 'None'}"
+            )
+        if params.init_same_noise and not params.noise_group_ids:
+            params = dataclasses.replace(params, noise_group_ids=frontier.group_ids)
+
+        conditions = self.build_conditions(texts, height=params.height, width=params.width)
+        segment = self.diffusion.diffuse(
+            conditions,
+            schedule=params.sigmas.to(self.bundle.device),
+            params=params,
+            initial_latents=NoiseRecipe.from_sample(sample).resolve(),
         )
+        images = self.decode(segment)
+        filled = frontier.fill(segment=segment, primitives={"image": images}, conditions=conditions.to_dict())
+        return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 
 __all__ = ["Cosmos3JointPrediction", "Cosmos3JointStage", "Cosmos3Pipeline"]
