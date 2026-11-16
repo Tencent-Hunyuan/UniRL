@@ -1,0 +1,21 @@
+#!/bin/bash
+# 只引用旧环境；所有新增缓存/日志写入本任务。
+export CHECKUP_OLD_ROOT=${TRAIN_ROOT:?set to the training task root}
+export CHECKUP_ROOT=${REPLAY_ROOT:?set to the replay task root}
+export CHECKUP_SHM=/dev/shm/h3gc12
+R=$CHECKUP_OLD_ROOT; T=$CHECKUP_ROOT
+. "$R/env.sh"
+. "$R/venv/bin/activate"
+export PRETRAINED_MODEL=$H3_ARTIFACT
+export PYTHONPATH=$T/source:$T/tools:$R/adapter:$FRAMECODE_SRC
+export PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 WANDB_MODE=disabled
+export MALLOC_ARENA_MAX=2 NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+export CUDA_VISIBLE_DEVICES=0,1,2,3,6,7,8,9
+export XDG_CACHE_HOME=$T/cache HF_HOME=$T/cache/hf TORCH_HOME=$T/cache/torch
+export TRITON_CACHE_DIR=$T/cache/triton CUDA_CACHE_PATH=$T/cache/cuda MPLCONFIGDIR=$T/cache/mpl
+export WANDB_DIR=$T/logs WANDB_CACHE_DIR=$T/cache/wandb WANDB_CONFIG_DIR=$T/cache/wandb-config
+export RAY_USAGE_STATS_ENABLED=0 RAY_TMPDIR=$CHECKUP_SHM/ray TMPDIR=$CHECKUP_SHM/tmp
+export HYDRA_FULL_ERROR=1 TOKENIZERS_PARALLELISM=false
+unset RAY_ADDRESS H3_DIAG_GRAD_AB H3_DIAG_GRAD_DUMP H3_DIAG_FIX_MEANS H3_DIAG_FP32_OPS H3_DIAG_STATE_SAVE H3_DIAG_STATE_LOAD H3_DIAG_REPLAY_ONLY H3_DIAG_GRAD_AB_ONLY
+mkdir -p "$T/logs" "$T/results" "$T/cache" "$CHECKUP_SHM/tmp"
+cd "$T"
