@@ -18,6 +18,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     grpo_clip_loss,
+    policy_entropy_metrics,
     resolve_clip_range_from_schedule,
     rollout_replay_logp_absdiff,
     typed_conditions,
@@ -26,6 +27,7 @@ from .base import (
 
 @dataclass
 class PPOConfig(BaseAlgorithmConfig):
+    monitor_entropy: bool = False
     stage_attr: str = "ar"
     conditions_cls: str = ""
     clip_range: float = 0.2
@@ -104,6 +106,7 @@ class PPO(StageAlgorithm):
         horizon: int = 8192,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
+        monitor_entropy: bool = False,
     ) -> None:
         super().__init__()
         if stage is None and pipeline is None:
@@ -136,6 +139,7 @@ class PPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.monitor_entropy = monitor_entropy
 
     def prepare_segment(
         self,
@@ -192,6 +196,7 @@ class PPO(StageAlgorithm):
             segment=segment,
             temperature=self.sampling_temperature,
             return_values=True,
+            **({"return_entropy": True} if self.monitor_entropy else {}),
         )
         if not isinstance(replay, ReplayResult):
             raise TypeError("PPO: replay with return_values=True must return ReplayResult")
@@ -275,7 +280,9 @@ class PPO(StageAlgorithm):
             else return_var.new_zeros(())
         )
         value_clip_fraction = ((active_values - old_values[active].float()).abs() > self.cliprange_value).float().mean()
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         metrics: Dict[str, Any] = {
+            **entropy_metrics,
             "policy_loss": float(policy_loss.detach()),
             "value_loss": float(value_loss.detach()),
             "value_mean": float(active_values.detach().mean()),

@@ -6,7 +6,7 @@ import torch
 
 
 def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
-    """Reduce each numeric key across dicts: ``*_max`` by max, ``*_min`` by min, every other key by mean."""
+    """Sum entropy statistics, take extrema for ``*_min``/``*_max``, and average other numeric metrics."""
     aggregated: Dict[str, float] = {}
     if not metrics_list:
         return aggregated
@@ -16,6 +16,12 @@ def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict
         all_keys.update(metrics.keys())
 
     for key in all_keys:
+        if key == "policy_entropy" and "policy_entropy_count" in all_keys:
+            continue
+        if key in ("policy_entropy_sum", "policy_entropy_count"):
+            total = sum(metrics[key] for metrics in metrics_list if key in metrics)
+            aggregated[key] = float(total)
+            continue
         values: List[float] = []
         for metrics in metrics_list:
             if key not in metrics:
@@ -36,4 +42,7 @@ def aggregate_numeric_metrics(metrics_list: Sequence[Mapping[str, Any]]) -> Dict
             else:
                 aggregated[key] = sum(values) / len(values)
 
+    if "policy_entropy_count" in aggregated:
+        count = aggregated["policy_entropy_count"]
+        aggregated["policy_entropy"] = aggregated["policy_entropy_sum"] / count if count else 0.0
     return aggregated

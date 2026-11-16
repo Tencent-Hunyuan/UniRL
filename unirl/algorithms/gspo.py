@@ -15,6 +15,7 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     grpo_clip_loss,
+    policy_entropy_metrics,
     prepare_ar_logp_anchor,
     resolve_clip_range_from_schedule,
     rollout_replay_k3,
@@ -25,6 +26,7 @@ from .base import (
 
 @dataclass
 class GSPOConfig(BaseAlgorithmConfig):
+    monitor_entropy: bool = False
     stage_attr: str = "ar"
     conditions_cls: str = ""
     clip_range: float = 3e-4
@@ -55,6 +57,7 @@ class GSPO(StageAlgorithm):
         clip_range_high: Optional[float] = None,
         conditions_cls: Optional[Type[Any]] = None,
         sampling_temperature: Optional[float] = None,
+        monitor_entropy: bool = False,
         old_logp_source: str = "rollout",
     ) -> None:
         super().__init__()
@@ -72,6 +75,7 @@ class GSPO(StageAlgorithm):
 
             sampling_temperature = ARSamplingParams.__dataclass_fields__["temperature"].default
         self.sampling_temperature = float(sampling_temperature)
+        self.monitor_entropy = monitor_entropy
         self.old_logp_source = str(old_logp_source).strip().lower()
         if self.old_logp_source not in ("rollout", "replay"):
             raise ValueError(f"GSPO: old_logp_source must be 'rollout' or 'replay'; got {old_logp_source!r}")
@@ -107,7 +111,13 @@ class GSPO(StageAlgorithm):
             return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
-        new_logp = self.stage.replay(typed_conds, segment=segment, temperature=self.sampling_temperature)
+        replay = self.stage.replay(
+            typed_conds,
+            segment=segment,
+            temperature=self.sampling_temperature,
+            **({"return_entropy": True} if self.monitor_entropy else {}),
+        )
+        new_logp = replay.log_probs if self.monitor_entropy else replay
         old_logp = segment.log_probs.to(dtype=new_logp.dtype, device=new_logp.device)
 
         clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
@@ -143,7 +153,9 @@ class GSPO(StageAlgorithm):
         rollout_logp = (segment.rollout_log_probs if segment.rollout_log_probs is not None else segment.log_probs).to(
             dtype=new_logp.dtype, device=new_logp.device
         )
+        entropy_metrics = policy_entropy_metrics(replay, segment.loss_mask) if self.monitor_entropy else {}
         metrics: Dict[str, Any] = {
+            **entropy_metrics,
             "policy_loss": float(loss.detach().item()),
             "clip_range": float(clip_range),
             **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
