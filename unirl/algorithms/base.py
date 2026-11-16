@@ -354,6 +354,7 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
+    requires_per_sample_sde_index: bool = False
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 

@@ -6,12 +6,14 @@ import time
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 
+import numpy as np
 import torch
 from hydra.utils import get_class, get_object, instantiate
 from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.sde.index_schedule import AllSDEScheduler
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
@@ -20,7 +22,7 @@ from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
-from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.types.sampling import BaseSamplingParams, DiffusionSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -343,6 +345,7 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError("DiffusionTrainer: dedicated rollout engine requires a `sync:` block.")
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
+        self._flash_per_sample_sde = algo_cls.requires_per_sample_sde_index
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
         self.eval_interval = eval_interval
@@ -414,6 +417,8 @@ class DiffusionTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        if self._flash_per_sample_sde:
+            self._check_flash_rectification_pool(algorithm_cfg)
         # Frozen at init, so overlay contradictions surface at startup rather than an
         # hour in.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
@@ -528,6 +533,13 @@ class DiffusionTrainer(BaseTrainer):
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
+        if self._flash_per_sample_sde:
+            strata = len(self._flash_candidate_pool()) * self.rollout.dp_size
+            if batch_size % strata:
+                raise ValueError(
+                    f"FlashGRPO stratifies prompts across the SDE candidate pool, so batch_size must be a "
+                    f"multiple of pool_size * rollout dp_size = {strata}; got {batch_size}."
+                )
 
     def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
         """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
@@ -690,12 +702,16 @@ class DiffusionTrainer(BaseTrainer):
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+        sde_index_override: Optional[int] = None,
     ) -> Sample:
-        """Turn a data source batch into a request :class:`Sample`."""
+        """Turn a data source batch into a request :class:`Sample`, optionally pinning one SDE step."""
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp["diffusion"]
-        sde_indices = diffusion.get_sde_indices(rollout_id)
+        if sde_index_override is None:
+            sde_indices = diffusion.get_sde_indices(rollout_id)
+        else:
+            sde_indices = [sde_index_override]
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )
@@ -726,6 +742,111 @@ class DiffusionTrainer(BaseTrainer):
             frontier = dataclasses.replace(request.parts[-1], init_noise_group_ids=noise_group_ids)
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
+
+    def _flash_candidate_pool(self) -> List[int]:
+        """SDE steps FlashGRPO's per-prompt draw may pick, from the scheduler's candidate pool."""
+        diffusion = self.sampling_params["diffusion"]
+        scheduler = diffusion.scheduler
+        if not isinstance(scheduler, AllSDEScheduler):
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path requires sampling_params['diffusion'] to carry "
+                f"an AllSDEScheduler; got scheduler={type(scheduler).__name__ if scheduler is not None else None}."
+            )
+        pool = scheduler.sde_candidate_pool()
+        if not pool:
+            raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
+        # The last denoising step stores only {T-1, T} latents while earlier steps
+        # store three, so a group that drew it cannot be concatenated with the rest.
+        num_inference_steps = diffusion.num_inference_steps
+        if max(pool) >= num_inference_steps - 1:
+            raise ValueError(
+                f"FlashGRPO per-sample SDE candidate pool reaches step {max(pool)}, but the last denoising "
+                f"step (num_inference_steps-1 = {num_inference_steps - 1}) stores a different number of "
+                "trajectory latents, so mixed-shape rollout groups cannot be concatenated. Narrow the "
+                "scheduler timestep_fraction so its end maps below the final step."
+            )
+        return pool
+
+    def _check_flash_rectification_pool(self, algorithm_cfg: Any) -> None:
+        """Fail fast when the rectification normalizer disagrees with the SDE candidate pool."""
+        pool = sorted(self._flash_candidate_pool())
+        if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
+            raise ValueError(
+                "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
+                f"candidate pool {pool}; got None."
+            )
+        rectification_sorted = sorted(int(i) for i in algorithm_cfg["rectification_indices"])
+        if rectification_sorted != pool:
+            raise ValueError(
+                f"FlashGRPO rectification_indices {rectification_sorted} must equal the SDE candidate "
+                f"pool {pool}: each sample draws its step from the pool but is normalized over "
+                "rectification_indices, so a mismatch silently mis-scales the loss."
+            )
+
+    def _build_flash_request_samples(self, inputs: Sample, rollout_id: int) -> List[Tuple[int, Sample]]:
+        """Stratify one SDE step per prompt; return ``(step, request Sample)`` per step group."""
+        pool = self._flash_candidate_pool()
+        # ``Sample.select`` indexes this same list, which groups by root id, so a
+        # duplicate or empty root id set would collapse the batch onto one request.
+        n_prompts = len(inputs.split())
+        root_rows = inputs.parts[0].batch_size
+        if n_prompts != root_rows:
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path: Sample.split() yielded "
+                f"{n_prompts} root groups for {root_rows} root rows, so the per-prompt SDE "
+                "draw cannot address the batch."
+            )
+        # One generate call per step group is DP-scattered, and the handle rejects a
+        # call whose root-prompt count is not a multiple of the rollout's dp_size, so
+        # each step must own a whole number of DP shards. Equal counts per step is also
+        # what Flash-GRPO's stratified assignment asks for. See README.md here.
+        dp_size = self.rollout.dp_size
+        pool_size = len(pool)
+        if n_prompts % (pool_size * dp_size):
+            raise ValueError(
+                f"FlashGRPO stratifies {n_prompts} prompts across the {pool_size}-step SDE candidate "
+                f"pool, so batch_size must be a multiple of pool_size * rollout dp_size = "
+                f"{pool_size * dp_size}; got {n_prompts}. Widen or narrow the scheduler's "
+                "timestep_fraction, or resize batch_size."
+            )
+        rng = np.random.default_rng(rollout_id)
+        # Prompt ``i`` joins stratum ``i % pool_size``, so each step owns exactly
+        # n_prompts / pool_size prompts and the whole pool is covered every rollout.
+        order = rng.permutation(pool_size)
+        steps = [pool[int(s)] for s in order]
+
+        positions_by_step: Dict[int, List[int]] = {}
+        for position in range(n_prompts):
+            positions_by_step.setdefault(steps[position % pool_size], []).append(position)
+
+        return [
+            (
+                step,
+                self._build_request_sample(
+                    inputs.select(torch.tensor(positions_by_step[step], dtype=torch.long)),
+                    rollout_id,
+                    sde_index_override=step,
+                ),
+            )
+            for step in sorted(positions_by_step)
+        ]
+
+    def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
+        """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
+        frontier = sample.parts[-1]
+        segment = frontier.segment
+        if segment is None:
+            raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
+        segment.sde_index_per_sample = torch.full((frontier.batch_size,), sde_index, dtype=torch.long)
+        if segment.indices is not None and segment.latents is not None:
+            expected = [sde_index, sde_index + 1, frontier.sampling_params.num_inference_steps]
+            if segment.latents.shape[1] != 3 or hydrate(segment.indices).tolist() != expected:
+                raise ValueError("FlashGRPO requires rollout latent slots [before, after, final].")
+            segment.indices = torch.arange(3, dtype=torch.long)
+        if segment.sde_indices is not None:
+            segment.sde_indices = torch.zeros(1, dtype=torch.long)
+        if isinstance(frontier.sampling_params, DiffusionSamplingParams):
+            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
@@ -770,15 +891,9 @@ class DiffusionTrainer(BaseTrainer):
             )
         return stack
 
-    def _generate_with_residency(
-        self,
-        sample: Sample,
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool = False,
-    ) -> Sample:
-        """Generate with exception-safe EMA and residency cleanup."""
+    @contextmanager
+    def _rollout_window(self, *, sync_weights: bool, sleep_rollout: bool) -> Iterator[None]:
+        """One wake / push / EMA window spanning every generate call made inside it."""
         # No EMA term: _build_residency_planner already rejected the EMA x
         # parked-train x colocated-external combination at startup, fail-fast
         # instead of silently skipping the requested policy.
@@ -800,12 +915,8 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
-            if score_inline:
-                self.reward_stack.collect_garbage()
-                self._log_reward_stack_timing()
+            yield
             generation_succeeded = True
-            return result
         finally:
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
@@ -816,6 +927,41 @@ class DiffusionTrainer(BaseTrainer):
             # step, which is the only point that needs it.
             if sleep_rollout or not generation_succeeded:
                 self._residency.set(Role.ROLLOUT, False)
+
+    def _generate_with_residency(
+        self,
+        sample: Sample,
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool = False,
+    ) -> Sample:
+        """Generate with exception-safe EMA and residency cleanup."""
+        return self._generate_many_with_residency(
+            [sample],
+            sync_weights=sync_weights,
+            sleep_rollout=sleep_rollout,
+            score_inline=score_inline,
+        )[0]
+
+    def _generate_many_with_residency(
+        self,
+        samples: Sequence[Sample],
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool,
+    ) -> List[Sample]:
+        """Generate every sample inside ONE wake/offload window (FlashGRPO's step groups)."""
+        with self._rollout_window(sync_weights=sync_weights, sleep_rollout=sleep_rollout):
+            results = [
+                self.reward_stack.rollout_and_score(item) if score_inline else self.rollout.generate(item)
+                for item in samples
+            ]
+            if score_inline:
+                self.reward_stack.collect_garbage()
+                self._log_reward_stack_timing()
+        return results
 
     def _log_reward_stack_timing(self) -> None:
         """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
@@ -841,23 +987,25 @@ class DiffusionTrainer(BaseTrainer):
             timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
             timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
 
-    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
-        return self._generate_with_residency(
-            sample,
+    def _rollout_and_score(
+        self,
+        samples: Sequence[Sample],
+        *,
+        sync_weights: bool = False,
+        rollout_id: int = 0,
+        group_sde_indices: Optional[Sequence[int]],
+    ) -> Tuple[Sample, float]:
+        """One ``rollout → reward → advantage`` pass over one or more request Samples."""
+        generated = self._generate_many_with_residency(
+            samples,
             sync_weights=sync_weights,
             sleep_rollout=not self._residency.policy.rollout_resident,
             score_inline=self.reward_stack is not None,
         )
-
-    def _rollout_and_score(
-        self,
-        sample: Sample,
-        *,
-        sync_weights: bool = False,
-        rollout_id: int = 0,
-    ) -> Tuple[Sample, float]:
-        """One ``rollout → reward → advantage`` pass; training happens per window."""
-        sample = self._generate_for_training(sample, sync_weights=sync_weights)
+        if group_sde_indices is not None:
+            for item, step in zip(generated, group_sde_indices):
+                self._stamp_sde_index_per_sample(item, step)
+        sample = generated[0] if len(generated) == 1 else Sample.concat(generated)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
@@ -899,9 +1047,23 @@ class DiffusionTrainer(BaseTrainer):
         window_rewards: List[float] = []
         for rollout_id in window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
-            sample = self._build_request_sample(inputs, rollout_id)
+            # FlashGRPO fans the rollout into one generate per SDE-step group so a
+            # single optimizer step averages over a spread of sigmas; every other
+            # algorithm builds one request.
+            if self._flash_per_sample_sde:
+                groups = self._build_flash_request_samples(inputs, rollout_id)
+                request_samples = [item for _, item in groups]
+                group_steps: Optional[List[int]] = [step for step, _ in groups]
+            else:
+                request_samples = [self._build_request_sample(inputs, rollout_id)]
+                group_steps = None
             sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
-            sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
+            sample, mean_reward = self._rollout_and_score(
+                request_samples,
+                sync_weights=sync_weights,
+                rollout_id=rollout_id,
+                group_sde_indices=group_steps,
+            )
             samples.append(sample)
             window_rewards.append(mean_reward)
         final_id = window_ids[-1]
