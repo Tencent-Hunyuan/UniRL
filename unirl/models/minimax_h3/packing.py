@@ -1,4 +1,4 @@
-"""Geometry resolution and packed-row layout for MiniMax-H3 t2va."""
+"""Geometry resolution and packed-row layout for MiniMax-H3 t2va / fl2va."""
 
 from __future__ import annotations
 
@@ -7,6 +7,9 @@ from typing import Tuple
 
 import torch
 
+from unirl.config.require import require
+
+from .conditions import MiniMaxH3Conditions
 from .config import (
     MINIMAX_H3_LATENT_CHANNELS,
     MINIMAX_H3_PATCH_SIZE,
@@ -23,6 +26,7 @@ from .vendor import (
     MINIMAX_H3_MIN_DURATION,
     MINIMAX_H3_SHORT_EDGE,
     MINIMAX_H3_TEXT_TAG,
+    MINIMAX_H3_VIDEO_TAG,
     MiniMaxH3PackedSequence,
     align_num_frames,
     audio_latent_num_frames,
@@ -30,6 +34,8 @@ from .vendor import (
     build_row_timesteps,
     video_latent_num_frames,
 )
+
+MINIMAX_H3_KEYFRAME_ANCHORS: Tuple[Tuple[str, ...], ...] = ((), ("first",), ("last",), ("first", "last"))
 
 
 @dataclass(frozen=True)
@@ -126,9 +132,42 @@ class MiniMaxH3Geometry:
         return cls.resolve(height=params.height, width=params.width, num_frames=params.num_frames)
 
 
-def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> MiniMaxH3PackedSequence:
-    """Build the ``[text | audio | video]`` layout for a t2va request."""
-    text_token_tags = torch.full((int(num_text_tokens),), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+def build_layout(geometry: MiniMaxH3Geometry, conditions: MiniMaxH3Conditions) -> MiniMaxH3PackedSequence:
+    """Build the ``[text | keyframe conditions | audio | video]`` layout of one trimmed batch-1 request."""
+    num_text_tokens = int(conditions.text.embeds.shape[1])
+    keyframes = conditions.keyframes
+    if keyframes is None:
+        text_token_tags = torch.full((num_text_tokens,), MINIMAX_H3_TEXT_TAG, dtype=torch.long)
+        keyframe_anchors: Tuple[str, ...] = ()
+    else:
+        require(
+            keyframes.batch_size == 1,
+            f"build_layout: one packed layout per forward, got {keyframes.batch_size} keyframe samples",
+        )
+        text_token_tags = keyframes.text_token_tags[0].to("cpu")
+        keyframe_anchors = keyframes.anchors[0]
+        require(
+            keyframe_anchors in MINIMAX_H3_KEYFRAME_ANCHORS,
+            f"build_layout: keyframe anchors {keyframe_anchors!r} must be one of {MINIMAX_H3_KEYFRAME_ANCHORS!r}",
+        )
+        require(
+            text_token_tags.dtype == torch.long
+            and tuple(text_token_tags.shape) == (num_text_tokens,)
+            and bool(((text_token_tags == MINIMAX_H3_TEXT_TAG) | (text_token_tags == MINIMAX_H3_VIDEO_TAG)).all()),
+            f"build_layout: text_token_tags must be a [{num_text_tokens}] long tensor of 0/1 tags matching the "
+            f"trimmed text, got {text_token_tags.dtype} {tuple(text_token_tags.shape)}",
+        )
+        require(
+            bool(keyframe_anchors) or bool((text_token_tags == MINIMAX_H3_TEXT_TAG).all()),
+            f"build_layout: a t2va entry (anchors ()) must tag every text token {MINIMAX_H3_TEXT_TAG}",
+        )
+        rows = keyframes.rows[0]
+        expected = (len(keyframe_anchors) * geometry.rows_per_frame, geometry.video_token_dim)
+        require(
+            rows.dtype == torch.float32 and tuple(rows.shape) == expected,
+            f"build_layout: keyframe rows must be fp32 {expected} for {keyframe_anchors!r} at this canvas, got "
+            f"{rows.dtype} {tuple(rows.shape)}",
+        )
     return build_packed_sequence(
         text_token_tags=text_token_tags,
         num_latent_frames=geometry.num_latent_frames,
@@ -136,7 +175,7 @@ def build_t2va_layout(geometry: MiniMaxH3Geometry, num_text_tokens: int) -> Mini
         latent_width=geometry.latent_width,
         num_audio_latents=geometry.num_audio_latents,
         patch_size=MINIMAX_H3_PATCH_SIZE,
-        keyframe_anchors=(),
+        keyframe_anchors=keyframe_anchors,
     )
 
 
@@ -176,6 +215,6 @@ def row_timestep_plan(
 
 __all__ = [
     "MiniMaxH3Geometry",
-    "build_t2va_layout",
+    "build_layout",
     "row_timestep_plan",
 ]
