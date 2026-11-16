@@ -67,6 +67,12 @@ handler in `../../distributed/weight_sync`.
   (`concurrency`, `advertise_host`, `health_timeout_s`) are expected drops.
   Recipe-facing colocate/async knobs live in [`../README.md`](../README.md)
   (SGLang AR knobs).
+- **A synced SGLang LLM adapter outlives `sleep()`.** SGLang 0.5.19 releases the
+  base weights, KV cache and CUDA graphs; the LoRA manager, its GPU pool and the
+  adapter registry are created outside those regions and survive, so
+  `SGLangRolloutEngine` keeps tagging requests with the last synced adapter after
+  `sleep()` / `wake_up()`. The composed PE engine sleeps its AR child inside every
+  `generate` and relies on this. Re-check on a SGLang bump.
 - **SGLang LoRA serialization is topology-sensitive.** TP1 keeps
   `MultiprocessingSerializer` and requires the server to inherit the sender's
   multiprocessing authkey. TP>1 cannot broadcast its one-shot file descriptors, so
