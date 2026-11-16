@@ -1,0 +1,98 @@
+{
+  "variant": "V1",
+  "micro": 1,
+  "wall_seconds": 2324.502863407135,
+  "rank_results": [
+    {
+      "rank": 0,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 1,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 2,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 3,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 4,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 5,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 6,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    },
+    {
+      "rank": 7,
+      "variant": "V1",
+      "optimizer_updates": 0,
+      "lora_unchanged": true
+    }
+  ],
+  "verification": [
+    {
+      "rank": 0,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 1,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 2,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 3,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 4,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 5,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 6,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    },
+    {
+      "rank": 7,
+      "lora_unchanged": true,
+      "optimizer_updates": 0
+    }
+  ],
+  "optimizer_updates": 0
+}

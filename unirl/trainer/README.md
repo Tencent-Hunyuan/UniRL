@@ -91,6 +91,9 @@ stay swappable by `_target_`.
   (`rollout_resident: true`) is not
   slept even when generation raises: the policy says its weights stay put, and the
   caller that set it owns the peak.
+  The trainside engine calls the pipeline's typed `wake_up`/`sleep` methods before/after
+  each rollout window; these default to no-ops and models may override them (see
+  [H3 residency](../models/minimax_h3/README.md#gotchas)).
 
 The current trainer surface is:
 
@@ -375,7 +378,8 @@ The LoRA scaling comes from the `lora_config` recorded in the checkpoint;
 `--lora-alpha` overrides it (needed only for checkpoints predating the record).
 AR models: `--library transformers`, no `--subfolder`. For adapter artifacts,
 use `python -m unirl.tools.export_adapter --checkpoint ... --base ... --output ...`.
-NFT runs can export the EMA shadow adapter with `--adapter old`.
+NFT runs can export the EMA shadow adapter with `--adapter old`. For mirror EMA,
+use `--ema`; see [`train/readme.md`](../train/readme.md#export-only-lora-ema).
 
 For PE, point the exporter at one side's directory, for example
 `checkpoint-1000/diffusion` or `checkpoint-1000/ar`, rather than at the common
@@ -497,3 +501,91 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
+- **By default, FlashGRPO groups requests on the driver.** `requires_per_sample_sde_index`
+  makes the trainer take `FlashGRPO.per_prompt_sde_steps` (prompt `i` in stratum `i % pool_size`
+  of a rollout-seeded pool permutation) and issue one `generate` per step
+  group inside a single residency window. Each request carries its step on the frontier Part;
+  the engine stamps before returning, and the driver concatenates the groups into one track.
+  Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
+  prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
+  whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
+- **Driver-grouped FlashGRPO requires `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
+  group is one DP-scattered `generate`, and the handle rejects a call whose root-prompt count is not
+  a multiple of `dp_size`; equal counts per step (stratification) then forces the product to divide
+  the batch. At `batch_size=48` with `dp_size=8` the candidate pool can hold at most 6 steps, so the
+  scheduler's `timestep_fraction` must be narrowed to match. The trainer checks this at startup, once
+  the rollout is built, rather than letting a group of 1-5 prompts reach the handle.
+- **`algorithm.engine_per_sample_sde: true` moves grouping into trainside.** It defaults to
+  `false` and requires `algorithm.batch_normalize_tgr: true`, a capable engine, and a
+  positive integer `rollout.forward_batch_size`. The driver uses the same rollout-id permutation and
+  `position % pool_size` prompt assignment, but sends one request with CONCAT
+  `Part.sde_index_per_sample`, mapped by root id to the actual frontier row order.
+  With `forward_batch_size=1`, each rank groups locally, generates every row separately,
+  stamps both latent streams with the shared helper, and restores original row order;
+  only `batch_size % rollout.dp_size == 0` remains. Equal row counts and fixed denoising
+  lengths preserve FSDP forward/collective counts even if ranks visit different steps.
+  After stamping, the engine clears the Part's request-only field;
+  `segment.sde_index_per_sample` is the output authority.
+  With `forward_batch_size>1`, startup requires a positive `batch_size` divisible by
+  `rollout.dp_size` before constructing trainside model roles. DP_SCATTER preserves whole
+  prompt subtrees; the engine splits each shard at contiguous root-group boundaries,
+  even when adjacent prompts share a step, then uses the existing single-step chunk path.
+  Each prompt must carry one SDE step. Equal prompt counts give each rank
+  `(batch_size / rollout.dp_size) * ceil(samples_per_prompt / forward_batch_size)` pipeline
+  calls without `reward_stack`. With it, count `ceil(rows / forward_batch_size)` for each
+  prompt fragment in each micro; equal shard sizes and micro boundaries keep ranks in lockstep.
+  Reward/train geometry checks and model-specific batch limits still apply.
+  Both FlashGRPO modes require an engine declaring
+  `supports_per_sample_sde_index`: sglang_diffusion/fastvideo do not support the Flash
+  strategy and pre-return stamp, so the trainer rejects them at startup in either mode.
+- **Engine-mode eval chunks must stay within one prompt.** When `eval_interval>0`,
+  startup requires the resolved eval `samples_per_prompt` (including `eval_sampling`
+  overrides) to be divisible by `rollout.forward_batch_size`. `Part.fork` keeps siblings
+  contiguous, DP_SCATTER preserves whole prompt trees, and trainside chunks the frontier
+  by row. Divisibility keeps each chunk within a prompt even with several prompts per
+  rank; otherwise H3 can reject mixed text lengths midway through eval. Adjust
+  `eval_samples_per_prompt` or `eval_sampling.samples_per_prompt`, or use
+  `forward_batch_size=1`.
+- **Engine grouping requires a stage declaring sample/step-keyed noise.**
+  `supports_order_independent_sde_noise` must be true: regrouping global RNG draws
+  would change trajectories. The algorithm rejects stages without this capability;
+  the engine checks it again for directly supplied per-sample requests.
+- **The FlashGRPO groups merge before advantages.** The concatenation must happen before
+  `compute_advantages`, because advantage normalization is batch-wide over the merged track. Each
+  prompt's own rollouts already share one step, so the merged track still compares like with like.
+- **FlashGRPO needs one root group per root row.** The per-prompt step draw indexes
+  `Sample.split()`, the same list `Sample.select` gathers from. `split()` groups by root id,
+  so duplicate root ids or an empty root part yield fewer groups than rows and would silently
+  collapse the whole batch onto one request and one sigma. The trainer compares the two counts
+  and raises instead.
+- **Both FlashGRPO modes stamp inside trainside `generate`, before `Worker.call` packs proxies.**
+  After any batched prompt splitting, a request whose `Part.sde_index_per_sample` contains
+  only one step pins `sde_indices=[k]` and uses the original generation batch/chunk path,
+  then stamps the output once. A single-prompt request retains its original batching and
+  RNG order. With `forward_batch_size=1`, multiple step values use the existing per-row
+  grouping path and its stricter guards. Both paths clear the output Part's request field;
+  the segment owns the result.
+  There is no stamp RPC or driver-side hydration for normalization. Decoded media and
+  conditions are not re-stored for stamping, and SP non-head ranks do not receive
+  collected trajectories a second time.
+- **A merged FlashGRPO track's shared fields are not per-sample truth.** The worker-side helper
+  `models.types.per_sample_replay.stamp_sde_index_per_sample` packs both
+  `segment.latents` and `segment.aux_latents` into `[before, after, final]` slots, normalizes
+  `segment.indices` / `segment.sde_indices`, and clears `frontier.sampling_params.sde_indices` so
+  `Sample.concat` / `Part.concat` can merge the groups. `sde_index_per_sample` (a `CONCAT` field) is
+  the authoritative per-sample step; `PerSampleStepReplayMixin.replay_per_sample` indexes fixed
+  latent slots `[:, 0]` / `[:, 1]`, not `latents_at()`.
+- **The SDE candidate pool must not reach the final denoising step.** `FlashGRPO.per_sample_sde_pool`
+  rejects such a pool at trainer build time, and the trainside engine rejects a request whose step is outside
+  `[0, num_inference_steps-2]`. Step `T-1` stores two trajectory latents where earlier steps store three, but
+  `stamp_sde_index_per_sample` packs both into `[before, after, final]` before any concat, so merging is not what
+  forbids it: per-sample rollout, replay and TGR have only been validated on steps that store three latents.
+  Keep the scheduler's `timestep_fraction` end below `(num_inference_steps - 1) / num_inference_steps`.
+- **An explicit `rectification_indices` must equal the scheduler's candidate pool.** With
+  `algorithm.batch_normalize_tgr: true` it may be omitted: weights use the actual global
+  batch in `prepare_part`, and each row's step must belong to the scheduler pool. This mode
+  requires `stack.num_updates_per_batch=1` and `accumulate_rollouts=1`.
+  In the default pool-normalized mode, the per-sample rectification
+  weight normalizes each sample's coefficient by the mean over `rectification_indices` while the step
+  itself is drawn from `sde_candidate_pool()`; the two live in different config blocks, and a mismatch
+  silently rescales the loss. `FlashGRPO.per_sample_sde_pool` fails fast at trainer build time instead.

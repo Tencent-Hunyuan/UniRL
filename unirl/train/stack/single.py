@@ -26,7 +26,9 @@ from unirl.train.stack.planner import (
     arranged_slice,
 )
 from unirl.types.sample import Part
+from unirl.utils.h3_diag import FIX_MEANS_DIR, compare_micro_gradients, exchange_first_state, fixed_means_rows
 from unirl.utils.metrics import aggregate_numeric_metrics
+from unirl.utils.stage_metrics import record, record_parameter_sums, take
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +124,8 @@ class TrainStack(BaseTrainStack):
             # Defer gradient reduce-scatter until the stepping rollout's final microbatch.
             self.fsdp_backend.set_grad_sync(do_optimizer_step and i == last_micro)
             micro_part = part if single_micro else arranged_slice(part, order, start, end)
+            if FIX_MEANS_DIR:
+                fixed_means_rows(micro_part.sample_ids)
             result = self.algorithm.compute_loss_and_backward(
                 conditions=micro_part.conditions,
                 segment=micro_part.segment,
@@ -158,7 +162,12 @@ class TrainStack(BaseTrainStack):
             # Accumulation-only part: the window's final part steps.
             grad_norm = 0.0
         elif window_backward:
-            grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
+            with record("optimizer_step"):
+                grad_norm = self.fsdp_backend.optimizer_step(max_grad_norm=self.max_grad_norm)
+                if math.isfinite(grad_norm):
+                    parameter_sums = self.fsdp_backend.parameter_squared_sums()
+            if math.isfinite(grad_norm):
+                record_parameter_sums(parameter_sums)
         else:
             grad_norm = 0.0
             logger.warning(
@@ -187,6 +196,11 @@ class TrainStack(BaseTrainStack):
             metrics=aggregated_metrics,
             optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
         )
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def collect_stage_metrics(self) -> Dict[str, Dict[str, float]]:
+        """Drain process-local rollout, score and training counters in one driver collection."""
+        return take()
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""
@@ -229,6 +243,8 @@ class TrainStack(BaseTrainStack):
         return {"loss": global_loss / global_weight, "weight": global_weight}
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @exchange_first_state
+    @compare_micro_gradients
     def train_track(
         self,
         parts: Union[Part, Tuple[Part, ...]],

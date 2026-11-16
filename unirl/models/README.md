@@ -89,6 +89,20 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
 
 ## Gotchas
 
+- **Per-sample A/V replay reads fixed slots, not the shared step map.**
+  `stamp_sde_index_per_sample` packs video and audio into `[before, after, final]`
+  before replacing `indices`. After group concat, only `sde_index_per_sample`
+  identifies each row's transition. `replay_joint_av_steps` indexes each stream's
+  own schedule at that step and the next; `sigma_max` is that schedule's second
+  point, matching single-stream replay and Flash's upstream coefficient. Callers
+  initialize both strategies with their schedules before joint replay so each
+  terminal sigma is preserved; H3 does this in `MiniMaxH3DiffusionStage.replay`.
+  For reference KL, the per-sample branch returns video means in `prev_sample_means`,
+  plus `audio_prev_sample_means`, `video_transition_stds`, and `audio_transition_stds`.
+  `ReplayResult.audio_in_policy` carries the joint helper's policy flag, independently
+  of whether statistics are present; KL must reject missing audio statistics when it
+  is true. Single-stream replay defaults it to false. Audio statistics are unset for
+  video-only policy; the shared-step path leaves the three optional stream statistics unset.
 - **`trainable_module()` is on the stage, not the bundle.** The backend reaches the
   model via `getattr(bundle, trainable_attr)`; engines via
   `getattr(pipeline, stage_attr).trainable_module()`. Keep both pointing at the same
@@ -214,7 +228,7 @@ external engines with a UniRL adapter (see
 | [`hunyuan_video15/`](hunyuan_video15/) | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text → Video | `train_diffusion` | trainside, vllm_omni | [`hunyuan_video15_t2v_dancegrpo_trainside`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_dancegrpo_trainside.yaml), [`hunyuan_video15_t2v_vllmomni_colocate`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_colocate.yaml) | engine-specific (no sglang_diffusion adapter) | ✅ |
 | [`ltx2/`](ltx2/) | `Lightricks/LTX-2` | Text → Video | `train_diffusion` | trainside, sglang_diffusion | [`ltx2_t2v_trainside`](../../examples/diffusion/ltx2/ltx2_t2v_trainside.yaml), [`ltx2_t2v_sglang_loramerge`](../../examples/diffusion/ltx2/ltx2_t2v_sglang_loramerge.yaml) | engine-specific; I2V is in the config but has no recipe (not claimed) | ✅ |
 | [`ltx2/`](ltx2/) | `dg845/LTX-2.3-Diffusers` | Text → Audio + Video | `train_diffusion` | trainside | [`ltx2_3_t2av_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_trainside.yaml), [`ltx2_3_t2av_audioreward_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_audioreward_trainside.yaml) | engine-specific (trainside only); `*_audioreward*`: `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
-| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml) | engine-specific (trainside only — no vllm_omni adapter on `main`); checkpoint-path-required; canvas axes multiples of 32 within 1:4–4:1 and a 768×1344 area cap, 124 frames minimum (`17n + 5`), 1 node × 8 GPUs minimum; reward is `t2av_composite` (`imagebind` mode `all` + `clap`; ImageBind is CC-BY-NC-SA, scorer-dependent) | ✅ |
+| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml), [`minimax_h3_t2va_flashgrpo`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_flashgrpo.yaml) | engine-specific (trainside only — no vllm_omni adapter on `main`); checkpoint-path-required; canvas axes multiples of 32 within 1:4–4:1 and a 768×1344 area cap, 124 frames minimum (`17n + 5`), 1 node × 8 GPUs minimum; reward is `t2av_composite` (`imagebind` mode `all` + `clap`; ImageBind is CC-BY-NC-SA, scorer-dependent) | ✅ |
 
 ### Unified and multimodal generators
 

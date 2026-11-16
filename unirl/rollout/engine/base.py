@@ -25,6 +25,7 @@ class BaseRolloutEngine(Remote, ABC):
 
     _component_name = "base"
     packs_groups: bool = False  # Whether requests need whole samples_per_prompt groups.
+    supports_per_sample_sde_index: bool = False  # Whether generate honours Part.sde_index_per_sample.
 
     @classmethod
     def component_name(cls) -> str:

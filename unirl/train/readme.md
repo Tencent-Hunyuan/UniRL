@@ -65,6 +65,31 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Export-only LoRA EMA
+
+- **Enable:** `backend.ema_cfg` defaults to off. On a LoRA recipe, keep
+  `backend.lora_cfg` and add:
+  ```bash
+  +backend.ema_cfg._target_=unirl.train.configs.EmaFullConfig \
+  +backend.ema_cfg.target_decay=0.9 +backend.ema_cfg.update_interval=8
+  ```
+  Only LoRA A/B are mirrored; training, rollout and online evaluation use live
+  weights. Each rank holds a 1/N shadow shard and FSDP all-gathers it during
+  forward.
+- **Count and resume:** After committed updates 8, 16, …, decay is
+  `min((1+s)/(10+s), 0.9)`, `s=optimizer_step_count-1` (first: `8/17`).
+  Skipped non-finite steps do not count. Torch `checkpoint.pt` and DCP
+  `metadata.pt` store `ema_config` and `optimizer_step_count`; both formats
+  retain `<module>.lora_{A,B}.default.shadow_weight` alongside live weights.
+  Resume with the same `ema_cfg` (see Gotchas); EMA updates then equal `optimizer_step_count // 8`.
+- **Export:** Run `python -m unirl.tools.export_adapter --checkpoint "$CHECKPOINT"
+  --base "$BASE_MODEL" --output exports/ema --ema` (omit `--ema` for live).
+  Both produce `adapter_model.safetensors` and `adapter_config.json`, with keys
+  `base_model.model.<module>.lora_{A,B}.weight` for the same conversion tool.
+  `--ema` reads `shadow_prefix` from the checkpoint's `ema_config` and exits with
+  an error when that record is missing; resume a checkpoint written without it
+  and save once before exporting its shadow.
+
 ## Choosing HSDP (hybrid sharding)
 
 `fsdp_mode: hybrid` on `FSDPBackend` builds a
@@ -125,6 +150,17 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
+- **Mirror EMA resume rejects a changed `ema_cfg`.** A checkpoint whose recorded
+  `ema_config` differs from the backend's, including one loaded with EMA now off,
+  raises before loading weights. An absent or empty `ema_config` imposes no
+  schedule: a checkpoint that holds shadow weights without it (written before the
+  schedule was recorded) is accepted, and its shadows continue under the current
+  `ema_cfg`. Independently, when `ema_cfg` is set the checkpoint must hold every
+  shadow parameter of the model, matched by full parameter name rather than by
+  `shadow_prefix` (a prefix such as `weight` also matches live names); otherwise
+  loading raises, because an adapter-mode load would silently leave the shadows
+  at their injection-time copy. With EMA off, no shadow or EMA metadata is added
+  and the optimizer/rollout arithmetic is unchanged.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.

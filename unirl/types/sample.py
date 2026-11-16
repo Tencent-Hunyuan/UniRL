@@ -75,6 +75,7 @@ class Part(Batch):
     output_version: Optional[int] = shared_field(default=None)
     harness_status: Optional[str] = shared_field(default=None)
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
+    sde_index_per_sample: Optional[torch.Tensor] = concat_field(default=None)  # [B], long, rollout request steps
 
     def __post_init__(self) -> None:
         expected_batch = len(self.sample_ids)
@@ -110,6 +111,11 @@ class Part(Batch):
                 "Part.init_noise_group_ids must be empty or aligned with sample_ids; "
                 f"got {len(self.init_noise_group_ids)} keys for {expected_batch} samples."
             )
+
+        if self.sde_index_per_sample is not None:
+            steps = self.sde_index_per_sample
+            if steps.shape != (expected_batch,) or steps.dtype not in (torch.int32, torch.int64):
+                raise ValueError("Part.sde_index_per_sample must be a 1-D integer tensor aligned with sample_ids.")
 
     @classmethod
     def input(

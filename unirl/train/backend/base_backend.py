@@ -6,14 +6,18 @@ import logging
 import math
 import os
 from concurrent.futures import Future
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional
+from dataclasses import asdict
+from typing import TYPE_CHECKING, Dict, Iterable, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.distributed.local import local_view
+from unirl.models.types.post_materialize import canonical_param_name
 from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -31,6 +35,7 @@ from unirl.train.ema import EMA, Shadow, inject_mirror, inject_nft, make_decay_f
 from unirl.train.lora import FrozenAdapters, inject_lora, resolve_target_modules_pattern
 from unirl.train.optim import build_lr_scheduler, build_optimizer
 from unirl.utils.distributed_utils import find_dtensor_mesh, init_gloo_group
+from unirl.utils.h3_diag import dump_first_gradients
 
 if TYPE_CHECKING:
     from torch.distributed.device_mesh import DeviceMesh
@@ -61,6 +66,7 @@ class BaseFSDP2Backend(Remote):
     _device: torch.device
     model: nn.Module
     ema: Optional[EMA]
+    _ema_config: Optional[Dict[str, object]]
     optimizer: torch.optim.Optimizer
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
     fsdp_cfg: FSDPConfig
@@ -93,6 +99,8 @@ class BaseFSDP2Backend(Remote):
         ema_cfg: Optional[EmaFullConfig],
     ) -> Optional[Shadow]:
         """Structural injection on the (possibly meta) trainable module."""
+        if ema_lora_cfg is not None and ema_cfg is not None:
+            raise ValueError("ema_lora_cfg and ema_cfg are mutually exclusive.")
         self._frozen_adapters = FrozenAdapters()
         shadow: Optional[Shadow] = None
         if ema_lora_cfg is not None:
@@ -149,12 +157,14 @@ class BaseFSDP2Backend(Remote):
         self._loss_reduction_mesh = find_dtensor_mesh(model)
 
         self.ema = None
+        self._ema_config = asdict(ema_cfg) if ema_cfg is not None else None
         if shadow is not None:
             active_cfg = ema_lora_cfg or ema_cfg
             self.ema = EMA(
                 shadow=shadow,
                 decay_fn=make_decay_fn(active_cfg),
                 timing=active_cfg.timing,
+                update_interval=ema_cfg.update_interval if ema_cfg is not None else EmaFullConfig.update_interval,
             )
 
         self.optimizer = build_optimizer(
@@ -212,6 +222,7 @@ class BaseFSDP2Backend(Remote):
                 m.set_is_last_backward(enable)
         self._grad_sync_enabled = enable
 
+    @dump_first_gradients
     def optimizer_step(self, *, max_grad_norm: float) -> float:
         """Clip (via the engine hook), optimizer step, scheduler step, EMA step."""
         grad_norm = float(self._clip_grad_norm(max_grad_norm).item())
@@ -248,6 +259,24 @@ class BaseFSDP2Backend(Remote):
         # Release consumed grads before train-state offload.
         self.optimizer.zero_grad(set_to_none=True)
         return grad_norm
+
+    @torch.no_grad()
+    def parameter_squared_sums(self) -> torch.Tensor:
+        """Queue CPU fp64 [1 or 2] local sums; caller must synchronize before reading (see utils/README.md)."""
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        sums = torch.zeros(1 if self.ema is None else 2, dtype=torch.float64, device=self._device)
+        for parameter in self.model.parameters():
+            if parameter.requires_grad and (isinstance(parameter, DTensor) or rank == 0):
+                sums[0].add_(local_view(parameter).detach().float().square().sum())
+        if self.ema is not None:
+            for live, shadow in self.ema.shadow.iter_pairs():
+                if isinstance(live, DTensor) or rank == 0:
+                    delta = local_view(live).detach().float() - local_view(shadow).detach().float()
+                    sums[1].add_(delta.square_().sum())
+                    del delta
+        host = torch.empty(sums.shape, dtype=torch.float64, device="cpu", pin_memory=self._device.type == "cuda")
+        host.copy_(sums, non_blocking=True)
+        return host
 
     def on_rollout_end(self) -> None:
         if self.ema is not None:
@@ -311,6 +340,8 @@ class BaseFSDP2Backend(Remote):
                 "save_mode": mode,
                 "lora_config": self.lora_meta,
             }
+            if self._ema_config is not None:
+                meta["ema_config"] = self._ema_config
             if self.scheduler is not None:
                 meta["scheduler_state_dict"] = self.scheduler.state_dict()
 
@@ -372,6 +403,8 @@ class BaseFSDP2Backend(Remote):
             "save_mode": mode,
             "lora_config": self.lora_meta,
         }
+        if self._ema_config is not None:
+            state["ema_config"] = self._ema_config
         state.update(self._torch_checkpoint_metadata())
         if self.scheduler is not None:
             state["scheduler_state_dict"] = self.scheduler.state_dict()
@@ -443,6 +476,8 @@ class BaseFSDP2Backend(Remote):
             )
 
             meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
+            dcp_keys = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
+            self._check_ema_resume(meta, [key.removeprefix("model.") for key in dcp_keys if key.startswith("model.")])
             mode = meta["save_mode"]
             self._reject_meta(operation="load", checkpoint_format="dcp", mode=mode)
             has_meta_params = any(p.is_meta for p in self.model.parameters())
@@ -487,6 +522,7 @@ class BaseFSDP2Backend(Remote):
                 "(save_dir/load_dir must live on storage mounted on every node)"
             )
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        self._check_ema_resume(checkpoint, checkpoint["policy_state_dict"])
 
         mode = checkpoint["save_mode"]
         strict = mode == "full"
@@ -501,6 +537,19 @@ class BaseFSDP2Backend(Remote):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         self._optimizer_step_count = checkpoint["optimizer_step_count"]
         return checkpoint["step"]
+
+    def _check_ema_resume(self, metadata: Dict[str, object], model_keys: Iterable[str]) -> None:
+        """Refuse a changed mirror EMA schedule, or enabled EMA without checkpointed shadows; see train/readme.md."""
+        recorded = metadata.get("ema_config")
+        if recorded and recorded != self._ema_config:
+            raise ValueError("EMA configuration differs from checkpoint; resume with the same ema_cfg.")
+        if self._ema_config is not None:
+            shadows = {id(shadow) for _, shadow in self.ema.shadow.iter_pairs()}
+            names = {canonical_param_name(n) for n, param in self.model.named_parameters() if id(param) in shadows}
+            if not names.issubset(model_keys):
+                raise ValueError(
+                    "Checkpoint is missing EMA shadow weights; resume without ema_cfg or from an EMA checkpoint."
+                )
 
     def _reject_meta(
         self,

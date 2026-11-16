@@ -31,6 +31,9 @@ class MiniMaxH3VideoDecodeStage:
 
     @torch.no_grad()
     def decode(self, rows: torch.Tensor, geometry: MiniMaxH3Geometry) -> Videos:
+        """Decode one video at a time to CPU; see README.md."""
+        if rows.shape[0] > 1:
+            return Videos.concat([self.decode(row, geometry) for row in rows.split(1)])
         device = self.vae.device
         dtype = next(self.vae.parameters()).dtype
         latents = unpatchify_video_tokens(
@@ -62,6 +65,9 @@ class MiniMaxH3AudioDecodeStage:
 
     @torch.no_grad()
     def decode(self, rows: torch.Tensor, geometry: MiniMaxH3Geometry) -> Audios:
+        """Decode one stereo pair at a time to CPU; see README.md."""
+        if rows.shape[0] > 1:
+            return Audios.concat([self.decode(row, geometry) for row in rows.split(1)])
         device = self.audio_vae.device
         dtype = next(self.audio_vae.parameters()).dtype
         latents = unpack_audio_tokens(rows.to(device=device, dtype=dtype), num_audio_latents=geometry.num_audio_latents)

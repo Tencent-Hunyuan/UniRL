@@ -371,6 +371,32 @@ class DanceSDEStrategy(SDEStrategy):
         return prev_sample, prev_sample_mean, std_var
 
 
+class FlashSDEStrategy(DanceSDEStrategy):
+    """Flash-GRPO SDE: Dance drift with ``std_dev_t = sigma_min + (sigma_max - sigma_min) * sigma``."""
+
+    canonical_name: ClassVar[str] = "flash"
+
+    def __init__(self) -> None:
+        self._sigma_min: Optional[torch.Tensor] = None
+
+    def init_schedule(self, sigmas: torch.Tensor) -> None:
+        self._sigma_min = sigmas[-1].detach()
+
+    def _std_dev_t(
+        self,
+        *,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        eta: float,
+        sigma_max: Union[float, torch.Tensor] = 0.99,
+    ) -> torch.Tensor:
+        del sigma_next
+        if self._sigma_min is None:
+            raise RuntimeError("FlashSDEStrategy requires init_schedule() before stepping.")
+        sigma_min = self._sigma_min.to(device=sigma.device, dtype=sigma.dtype)
+        return (sigma_min + (sigma_max - sigma_min) * sigma) * float(eta)
+
+
 @dataclass
 class _DPMState:
     order: int
@@ -573,6 +599,7 @@ __all__ = [
     "FlowSDEStrategy",
     "CPSSDEStrategy",
     "DanceSDEStrategy",
+    "FlashSDEStrategy",
     "DPM2Strategy",
     "FlowSpec",
     "CPSSpec",

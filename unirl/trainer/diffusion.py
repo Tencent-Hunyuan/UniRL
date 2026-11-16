@@ -21,6 +21,9 @@ from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, 
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
+from unirl.utils.h3_diag import REPLAY_ONLY, dump_rewards, replayed_first_part
+from unirl.utils.stage_metrics import aggregate as aggregate_stage_metrics
+from unirl.utils.stage_metrics import aggregate_training
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -342,7 +345,30 @@ class DiffusionTrainer(BaseTrainer):
         elif sync_cfg is None:
             raise ValueError("DiffusionTrainer: dedicated rollout engine requires a `sync:` block.")
         algo_cls = get_class(algorithm_cfg["_target_"])
+        self._algo_cls = algo_cls
         self._uses_ema = algo_cls.requires_ema_rollout
+        num_updates_per_batch = stack_cfg.get("num_updates_per_batch", 1)
+        # Per-sample SDE algorithms own their pool and draw policy; see trainer/README.md.
+        self._per_sample_sde = algo_cls.requires_per_sample_sde_index
+        self._engine_per_sample_sde = False
+        if self._per_sample_sde:
+            if not rollout_parsed["role_cls"].supports_per_sample_sde_index:
+                raise ValueError(
+                    f"{algo_cls.__name__} requires a rollout engine that declares supports_per_sample_sde_index; "
+                    f"{rollout_parsed['role_cls'].__name__} does not honour per-sample SDE steps or stamp them "
+                    "before returning. Use an engine that does, or another algorithm."
+                )
+            self._engine_per_sample_sde = algo_cls.engine_groups_sde_steps(
+                algorithm_cfg,
+                num_updates_per_batch=num_updates_per_batch,
+                accumulate_rollouts=accumulate_rollouts,
+            )
+            if self._engine_per_sample_sde:
+                forward_batch_size = rollout_cfg["forward_batch_size"]
+                if type(forward_batch_size) is not int or forward_batch_size < 1:
+                    raise ValueError(
+                        "engine_per_sample_sde requires rollout.forward_batch_size to be a positive integer."
+                    )
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
         self.eval_interval = eval_interval
@@ -414,6 +440,8 @@ class DiffusionTrainer(BaseTrainer):
         self.data_source = instantiate(data_source_cfg)
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
+        if self._per_sample_sde:
+            self._sde_candidate_pool = algo_cls.per_sample_sde_pool(algorithm_cfg, self.sampling_params["diffusion"])
         # Frozen at init, so overlay contradictions surface at startup rather than an
         # hour in.
         self._eval_sampling_params: Dict[str, BaseSamplingParams] = build_eval_sampling(
@@ -422,6 +450,13 @@ class DiffusionTrainer(BaseTrainer):
             samples_per_prompt=self.eval_samples_per_prompt,
             overrides=eval_sampling_cfg,
         )
+        if self._engine_per_sample_sde and self.eval_interval > 0:
+            if total_samples_per_prompt(self._eval_sampling_params) % rollout_cfg["forward_batch_size"]:
+                raise ValueError(
+                    f"{algo_cls.__name__} engine_per_sample_sde requires resolved eval samples_per_prompt to be "
+                    "divisible by rollout.forward_batch_size so pipeline chunks cannot cross prompt boundaries. "
+                    "Adjust eval_samples_per_prompt (or eval_sampling.samples_per_prompt), or use forward_batch_size=1."
+                )
 
         self._noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
             pipeline_cfg=pipeline_cfg,
@@ -464,7 +499,7 @@ class DiffusionTrainer(BaseTrainer):
                 reward_fraction=reward_fraction,
                 batch_size=batch_size,
                 samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-                num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+                num_updates_per_batch=num_updates_per_batch,
                 prompt_local_rollout=self._prompt_local_rollout,
                 has_reward=reward_cfg is not None,
                 backend_cfg=backend_cfg,
@@ -522,12 +557,19 @@ class DiffusionTrainer(BaseTrainer):
         _validate_dp_geometry(
             batch_size=batch_size,
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-            num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+            num_updates_per_batch=num_updates_per_batch,
             rollout_dp_size=self.rollout.dp_size,
             reward_dp_size=self.reward.dp_size if self.reward is not None else 1,
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
+        if self._per_sample_sde and not self._engine_per_sample_sde:
+            strata = len(self._sde_candidate_pool) * self.rollout.dp_size
+            if batch_size % strata:
+                raise ValueError(
+                    f"{algo_cls.__name__} stratifies prompts across the SDE candidate pool, so batch_size must be a "
+                    f"multiple of pool_size * rollout dp_size = {strata}; got {batch_size}."
+                )
 
     def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
         """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
@@ -690,12 +732,16 @@ class DiffusionTrainer(BaseTrainer):
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+        sde_index_override: Optional[int] = None,
     ) -> Sample:
-        """Turn a data source batch into a request :class:`Sample`."""
+        """Turn a data source batch into a request :class:`Sample`, optionally pinning one SDE step."""
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
         diffusion = sp["diffusion"]
-        sde_indices = diffusion.get_sde_indices(rollout_id)
+        if sde_index_override is None:
+            sde_indices = diffusion.get_sde_indices(rollout_id)
+        else:
+            sde_indices = [sde_index_override]
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
         )
@@ -726,6 +772,49 @@ class DiffusionTrainer(BaseTrainer):
             frontier = dataclasses.replace(request.parts[-1], init_noise_group_ids=noise_group_ids)
             request = request.with_parts([*request.parts[:-1], frontier])
         return request
+
+    def _prompt_sde_steps(self, inputs: Sample, rollout_id: int) -> List[int]:
+        """Draw one stratified step per root prompt; see README.md for the two dispatch geometries."""
+        # Sample.select indexes these root groups; duplicate or empty root ids would collapse the batch.
+        n_prompts = len(inputs.split())
+        root_rows = inputs.parts[0].batch_size
+        if n_prompts != root_rows:
+            raise ValueError(
+                f"{self._algo_cls.__name__} per-sample SDE-index path: Sample.split() yielded "
+                f"{n_prompts} root groups for {root_rows} root rows, so the per-prompt SDE "
+                "draw cannot address the batch."
+            )
+        return self._algo_cls.per_prompt_sde_steps(
+            self._sde_candidate_pool, num_prompts=n_prompts, rollout_id=rollout_id
+        )
+
+    def _build_per_sample_engine_request(self, inputs: Sample, rollout_id: int) -> Sample:
+        """Keep prompt order and carry the stratified draw as a CONCAT request field."""
+        steps = self._prompt_sde_steps(inputs, rollout_id)
+        request = self._build_request_sample(inputs, rollout_id, sde_index_override=steps[0])
+        steps_by_root = dict(zip(request.parts[0].sample_ids, steps))
+        request.parts[-1].sde_index_per_sample = torch.tensor(
+            [steps_by_root[root_id] for root_id in request.root_group_ids(-1)], dtype=torch.long
+        )
+        return request
+
+    def _build_per_sample_request_groups(self, inputs: Sample, rollout_id: int) -> List[Sample]:
+        """Stratify one SDE step per prompt; return one request Sample per step group."""
+        positions_by_step: Dict[int, List[int]] = {}
+        for position, step in enumerate(self._prompt_sde_steps(inputs, rollout_id)):
+            positions_by_step.setdefault(step, []).append(position)
+
+        groups: List[Sample] = []
+        for step in sorted(positions_by_step):
+            request = self._build_request_sample(
+                inputs.select(torch.tensor(positions_by_step[step], dtype=torch.long)),
+                rollout_id,
+                sde_index_override=step,
+            )
+            frontier = request.parts[-1]
+            frontier.sde_index_per_sample = torch.full((frontier.batch_size,), step, dtype=torch.long)
+            groups.append(request)
+        return groups
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
@@ -770,15 +859,9 @@ class DiffusionTrainer(BaseTrainer):
             )
         return stack
 
-    def _generate_with_residency(
-        self,
-        sample: Sample,
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool = False,
-    ) -> Sample:
-        """Generate with exception-safe EMA and residency cleanup."""
+    @contextmanager
+    def _rollout_window(self, *, sync_weights: bool, sleep_rollout: bool) -> Iterator[None]:
+        """One wake / push / EMA window spanning every generate call made inside it."""
         # No EMA term: _build_residency_planner already rejected the EMA x
         # parked-train x colocated-external combination at startup, fail-fast
         # instead of silently skipping the requested policy.
@@ -800,12 +883,8 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            result = self.reward_stack.rollout_and_score(sample) if score_inline else self.rollout.generate(sample)
-            if score_inline:
-                self.reward_stack.collect_garbage()
-                self._log_reward_stack_timing()
+            yield
             generation_succeeded = True
-            return result
         finally:
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
@@ -816,6 +895,41 @@ class DiffusionTrainer(BaseTrainer):
             # step, which is the only point that needs it.
             if sleep_rollout or not generation_succeeded:
                 self._residency.set(Role.ROLLOUT, False)
+
+    def _generate_with_residency(
+        self,
+        sample: Sample,
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool = False,
+    ) -> Sample:
+        """Generate with exception-safe EMA and residency cleanup."""
+        return self._generate_many_with_residency(
+            [sample],
+            sync_weights=sync_weights,
+            sleep_rollout=sleep_rollout,
+            score_inline=score_inline,
+        )[0]
+
+    def _generate_many_with_residency(
+        self,
+        samples: Sequence[Sample],
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool,
+    ) -> List[Sample]:
+        """Generate every sample inside ONE wake/offload window (per-sample SDE step groups)."""
+        with self._rollout_window(sync_weights=sync_weights, sleep_rollout=sleep_rollout):
+            results = [
+                self.reward_stack.rollout_and_score(item) if score_inline else self.rollout.generate(item)
+                for item in samples
+            ]
+            if score_inline:
+                self.reward_stack.collect_garbage()
+                self._log_reward_stack_timing()
+        return results
 
     def _log_reward_stack_timing(self) -> None:
         """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
@@ -841,23 +955,22 @@ class DiffusionTrainer(BaseTrainer):
             timer.phases["stack_generate"] = timer.phases.get("stack_generate", 0.0) + peak["generate_s"]
             timer.phases["stack_score"] = timer.phases.get("stack_score", 0.0) + peak["score_s"]
 
-    def _generate_for_training(self, sample: Sample, *, sync_weights: bool) -> Sample:
-        return self._generate_with_residency(
-            sample,
-            sync_weights=sync_weights,
-            sleep_rollout=not self._residency.policy.rollout_resident,
-            score_inline=self.reward_stack is not None,
-        )
-
+    @dump_rewards
     def _rollout_and_score(
         self,
-        sample: Sample,
+        samples: Sequence[Sample],
         *,
         sync_weights: bool = False,
         rollout_id: int = 0,
     ) -> Tuple[Sample, float]:
-        """One ``rollout → reward → advantage`` pass; training happens per window."""
-        sample = self._generate_for_training(sample, sync_weights=sync_weights)
+        """One ``rollout → reward → advantage`` pass over one or more request Samples."""
+        generated = self._generate_many_with_residency(
+            samples,
+            sync_weights=sync_weights,
+            sleep_rollout=not self._residency.policy.rollout_resident,
+            score_inline=self.reward_stack is not None,
+        )
+        sample = generated[0] if len(generated) == 1 else Sample.concat(generated)
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
@@ -897,16 +1010,29 @@ class DiffusionTrainer(BaseTrainer):
         t0 = time.perf_counter()
         samples: List[Sample] = []
         window_rewards: List[float] = []
-        for rollout_id in window_ids:
+        for rollout_id in () if REPLAY_ONLY else window_ids:
             inputs = self.data_source.get_samples(self.batch_size)
-            sample = self._build_request_sample(inputs, rollout_id)
+            # Per-sample SDE: one engine-grouped request, or one request per SDE-step group.
+            if self._engine_per_sample_sde:
+                request_samples = [self._build_per_sample_engine_request(inputs, rollout_id)]
+            elif self._per_sample_sde:
+                request_samples = self._build_per_sample_request_groups(inputs, rollout_id)
+            else:
+                request_samples = [self._build_request_sample(inputs, rollout_id)]
             sync_weights = (rollout_id > 0 and rollout_id % weight_sync_interval == 0) or (rollout_id == force_sync_at)
-            sample, mean_reward = self._rollout_and_score(sample, sync_weights=sync_weights, rollout_id=rollout_id)
+            sample, mean_reward = self._rollout_and_score(
+                request_samples,
+                sync_weights=sync_weights,
+                rollout_id=rollout_id,
+            )
             samples.append(sample)
             window_rewards.append(mean_reward)
         final_id = window_ids[-1]
         training_progress = final_id / max(1, num_rollouts - 1)
         parts = tuple(sample.parts[-1] for sample in samples)
+        if REPLAY_ONLY:
+            parts = (replayed_first_part(self.stack.dp_size),)
+            samples, window_rewards = [None], [float("nan")]
         # First point in the window that needs the trainer on the GPU. With
         # accumulate_rollouts > 1 it stayed parked across every rollout and
         # reward above, so this is one onload per optimizer step rather than one
@@ -926,9 +1052,13 @@ class DiffusionTrainer(BaseTrainer):
         # leave every other domain's curve empty. The pooled keys override the
         # final sample's partial ones inside log_rollout_step.
         extra = pooled_window_reward_metrics(list(parts)) if len(parts) > 1 else None
+        readings = self.stack.collect_stage_metrics()
+        stage_metrics = aggregate_stage_metrics(readings)
+        result = dataclasses.replace(result, metrics={**result.metrics, **aggregate_training(readings)})
         self.wandb_logger.log_rollout_step(
             final_id, result, samples[-1], step_time_s=time.perf_counter() - t0, extra_metrics=extra
         )
+        self.wandb_logger.log_perf(final_id + 1, stage_metrics)
         return result, sum(window_rewards) / len(window_rewards)
 
     def evaluate(
@@ -1009,6 +1139,7 @@ class DiffusionTrainer(BaseTrainer):
             eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
+        self.stack.collect_stage_metrics()
         self.wandb_logger.log_eval(step, metrics)
         return metrics["reward"]
 

@@ -14,6 +14,12 @@ class Pipeline(Remote):
     def generate(self, sample: Sample) -> Sample:
         raise NotImplementedError
 
+    def sleep(self) -> None:
+        """Release rollout-only resources; the default keeps them resident."""
+
+    def wake_up(self) -> None:
+        """Restore resources released by sleep; resident pipelines need no work."""
+
 
 class LatentShapeProvider(Protocol):
     """Optional Pipeline mixin: per-sample latent shape ``(C, *spatial)`` or ``(C, T, *spatial)`` for the x_T recipe."""

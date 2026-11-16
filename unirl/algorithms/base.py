@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import torch
 
@@ -215,8 +215,9 @@ def grpo_clip_loss(
 
 
 def gaussian_kl_div(p: torch.Tensor, q: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
-    """Per-element Gaussian KL ``(p-q)^2 / (2 sigma^2)``; ``sigma`` ``[S']`` broadcasts over ``[B, S', *latent]``."""
-    sigma = sigma.reshape(1, -1, *([1] * (p.ndim - 2)))
+    """Elementwise Gaussian KL over ``[B, S', *latent]`` with std ``[S']`` or ``[B, S']``."""
+    shape = (1, -1) if sigma.ndim == 1 else sigma.shape
+    sigma = sigma.reshape(*shape, *([1] * (p.ndim - 2)))
     return (p - q) ** 2 / (2 * sigma**2)
 
 
@@ -224,7 +225,7 @@ def transition_sigma(
     stage: Any,
     *,
     segment: "Segment",
-    target_steps: List[int],
+    target_steps: Union[List[int], torch.Tensor],
     eta: float,
     device: torch.device,
     add_coefficient: bool = True,
@@ -235,7 +236,7 @@ def transition_sigma(
     if segment.sigmas is None:
         raise ValueError("transition_sigma requires segment.sigmas (add_coefficient=True).")
     sigmas = segment.sigmas.to(device=device, dtype=torch.float32)
-    idx = torch.tensor(target_steps, dtype=torch.long, device=device)
+    idx = torch.as_tensor(target_steps, dtype=torch.long, device=device)
     s = sigmas[idx]
     s_next = sigmas[idx + 1]
     sigma_max = sigmas[1] if int(sigmas.shape[0]) > 1 else torch.tensor(0.99, device=device, dtype=sigmas.dtype)
@@ -258,6 +259,11 @@ def reference_kl_loss(
         raise RuntimeError(
             f"{algo}: beta>0 requires stage.replay() to return prev_sample_means, "
             "but got None. Ensure the stage's replay method produces means."
+        )
+    if segment.sde_index_per_sample is not None:
+        raise ValueError(
+            f"{algo}: reference_kl_loss uses one shared sigma per target step; a per-sample SDE-index "
+            "segment needs its algorithm's own reference KL."
         )
     from unirl.train.lora import adapters_disabled
 
@@ -354,8 +360,26 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
+    requires_per_sample_sde_index: bool = False  # True: implement the three per-sample SDE hooks below.
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
+
+    @staticmethod
+    def engine_groups_sde_steps(
+        algorithm_cfg: Mapping[str, Any], *, num_updates_per_batch: int, accumulate_rollouts: int
+    ) -> bool:
+        """Per-sample SDE hook: validate rollout config before model loading; True groups steps in the engine."""
+        raise NotImplementedError
+
+    @staticmethod
+    def per_sample_sde_pool(algorithm_cfg: Mapping[str, Any], diffusion: Any) -> List[int]:
+        """Per-sample SDE hook: validate and return the run's candidate SDE steps from the sampling params."""
+        raise NotImplementedError
+
+    @staticmethod
+    def per_prompt_sde_steps(pool: Sequence[int], *, num_prompts: int, rollout_id: int) -> List[int]:
+        """Per-sample SDE hook: one SDE step per prompt for this rollout, drawn from ``pool``."""
+        raise NotImplementedError
 
     def prepare_segment(
         self,

@@ -159,16 +159,36 @@ class BatchedStepReplayMixin:
     ) -> ReplayResult:
         """Replay joint A/V steps (batched when ``batch_replay_steps and len(target) > 1`` on an ``SDEStrategy``)."""
         owner = type(self).__name__
-        target, slot_map = self.resolve_replay_steps(segment, step_indices)
+        per_sample = segment.sde_index_per_sample is not None
+        if per_sample:
+            if segment.latents is None or segment.aux_latents is None:
+                raise ValueError(f"{owner}.replay: per-sample A/V replay requires latents and aux_latents.")
+            idx = segment.sde_index_per_sample
+            if idx.ndim != 1 or idx.dtype not in (torch.int32, torch.int64):
+                raise ValueError(f"{owner}.replay: sde_index_per_sample must be a 1-D integer tensor.")
+            if idx.numel() != segment.latents.shape[0]:
+                raise ValueError(f"{owner}.replay: sde_index_per_sample must have one entry per sample.")
+            if segment.latents.shape[1] < 2 or segment.aux_latents.shape[:2] != segment.latents.shape[:2]:
+                raise ValueError(f"{owner}.replay: both streams require aligned [before, after, ...] slots.")
+            if not isinstance(self.strategy, SDEStrategy):
+                raise ValueError(f"{owner}.replay: per-sample replay requires a stateless SDE strategy.")
+            target, slot_map = [0], {0: 0, 1: 1}
+            sigmas = sigmas.to(device=device, dtype=torch.float32)
+            idx = idx.to(device=device, dtype=torch.long)
+        else:
+            target, slot_map = self.resolve_replay_steps(segment, step_indices)
         if not target:
             return ReplayResult(
                 log_probs=torch.empty(segment.latents.shape[0], 0, device=device, dtype=self.logprob_dtype),
                 prev_sample_means=None,
+                audio_in_policy=audio_in_policy,
             )
         sigma_max = sigmas[1].float()
         a_strat = self.strategy if audio_strategy is None else audio_strategy
         a_sigmas = sigmas if audio_sigmas is None else audio_sigmas
         a_sigma_max = sigma_max if audio_sigmas is None else a_sigmas[1].float()
+        if per_sample:
+            a_sigmas = a_sigmas.to(device=device, dtype=torch.float32)
         groups = (
             [target]
             if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy)
@@ -186,7 +206,16 @@ class BatchedStepReplayMixin:
 
         for group in groups:
             S = len(group)
-            if S == 1:
+            if per_sample:
+                video_all = latents[:, 0].to(**to_kwargs)
+                prev_video_all = latents[:, 1].to(**to_kwargs)
+                audio_all = aux_latents[:, 0].to(**to_kwargs)
+                video_sigma_all = sigmas.index_select(0, idx)
+                video_sigma_next_all = sigmas.index_select(0, idx + 1)
+                audio_sigma_all = a_sigmas.index_select(0, idx)
+                audio_sigma_next_all = a_sigmas.index_select(0, idx + 1)
+                tiled = conditions
+            elif S == 1:
                 step_idx = group[0]
                 s_cur, s_next = slot_map[step_idx], slot_map[step_idx + 1]
                 video_all = latents[:, s_cur].to(**to_kwargs)
@@ -252,8 +281,33 @@ class BatchedStepReplayMixin:
                     n_video=video_all[0].numel(),
                     n_audio=audio_all[0].numel(),
                 )
-                if concat_audio_mean and prev_mean_all is not None and audio_prev_mean_all is not None:
+                if (
+                    concat_audio_mean
+                    and not per_sample
+                    and prev_mean_all is not None
+                    and audio_prev_mean_all is not None
+                ):
                     prev_mean_all = torch.cat([prev_mean_all, audio_prev_mean_all], dim=1)
+
+            if per_sample:
+                video_std = self.strategy.transition_std(
+                    sigma=video_sigma_all, sigma_next=video_sigma_next_all, eta=params.eta, sigma_max=sigma_max
+                ).reshape(B, 1)
+                audio_std = (
+                    a_strat.transition_std(
+                        sigma=audio_sigma_all, sigma_next=audio_sigma_next_all, eta=params.eta, sigma_max=a_sigma_max
+                    ).reshape(B, 1)
+                    if audio_in_policy
+                    else None
+                )
+                return ReplayResult(
+                    log_probs=log_prob_all.reshape(B, 1).to(dtype=self.logprob_dtype),
+                    prev_sample_means=prev_mean_all.unsqueeze(1),
+                    audio_in_policy=audio_in_policy,
+                    audio_prev_sample_means=audio_prev_mean_all.unsqueeze(1) if audio_in_policy else None,
+                    video_transition_stds=video_std,
+                    audio_transition_stds=audio_std,
+                )
 
             log_prob_parts.append(log_prob_all.view(S, B).transpose(0, 1).contiguous().to(dtype=self.logprob_dtype))
             if prev_mean_all is not None:
@@ -262,7 +316,7 @@ class BatchedStepReplayMixin:
 
         log_probs_t = log_prob_parts[0] if len(log_prob_parts) == 1 else torch.cat(log_prob_parts, dim=1)
         means_t = (mean_parts[0] if len(mean_parts) == 1 else torch.cat(mean_parts, dim=1)) if mean_parts else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t, audio_in_policy=audio_in_policy)
 
 
 __all__ = ["BatchedStepReplayMixin"]

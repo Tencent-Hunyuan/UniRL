@@ -120,6 +120,15 @@ def fsdp_wrap(
             p.data = p.data.to(dst)
             casts += 1
 
+    shard_children = getattr(model, "_fsdp_shard_frozen_children", None)
+    if shard_children is not None:
+        require(not forward_prefetch, "Cached FSDP children require forward_prefetch=false.")
+        require(not use_torch_compile, "Cached FSDP children require use_torch_compile=false.")
+        children, finish_child_wrap = shard_children()
+        for child in children:
+            fully_shard(child, **fsdp_kwargs)
+            child.set_unshard_in_backward(False)
+
     if activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
             CheckpointImpl,
@@ -178,6 +187,9 @@ def fsdp_wrap(
                 f"every fully_shard group (e.g. {stray[:3]}); their grads would never be "
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
+
+    if shard_children is not None:
+        finish_child_wrap()
 
     if copy_engine_all_gather:
         import torch.distributed as dist

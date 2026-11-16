@@ -18,7 +18,8 @@
 a `StageAlgorithm` that takes a rollout track with advantages already attached,
 replays the stage at the current weights, computes a policy-gradient loss, and
 calls `backward()`. It owns the loss math and nothing else — no optimizer, no
-model, no data.
+model, no data — except that a per-sample-SDE algorithm also owns its rollout
+step policy (see **Extending it**).
 
 ## Why it exists
 
@@ -61,7 +62,10 @@ not just three-tensor arithmetic.
   the *exact same* mini/micro slices it will train on. No hardcoded field names.
 - **Variants are recipes, not classes.** DanceGRPO and MixGRPO are `FlowGRPO`
   with a different SDE strategy or a windowed index scheduler. Add a class only when
-  the loss math itself changes.
+  the loss math itself changes. `FlashGRPO` clears that bar: it changes the loss by
+  multiplying the clipped ratio by a temporal-gradient-rectification coefficient, and
+  declares `requires_per_sample_sde_index` so the trainer gives each prompt its own
+  stratified SDE step instead of one shared step per rollout.
 
 **Extending it:** a new diffusion loss subclasses `StageAlgorithm`, calls
 `stage.replay(...)`, computes a per-element loss, and `(loss * loss_scale).backward()`;
@@ -69,6 +73,16 @@ if it needs multi-update, set `anchor_fields` and `supports_multi_update = True`
 declare `recomputes_anchor` when `prepare_segment` must follow the planned micro
 geometry (see `FlowGRPO`). A new AR loss mirrors `GRPO` (early-return on an empty
 segment, expand advantages per token), keeping `supports_multi_update = False`.
+An algorithm that sets `requires_per_sample_sde_index = True` also owns the rollout
+policy the trainer calls on its class, through three static hooks that
+`StageAlgorithm` declares and that raise `NotImplementedError` until overridden: at
+trainer init, before model loading, `engine_groups_sde_steps` (config checks, returns
+`engine_per_sample_sde`) and `per_sample_sde_pool` (validated candidate pool, fixed for
+the run); at each rollout request, `per_prompt_sde_steps` (the stratified per-prompt
+draw); see `FlashGRPO`.
+Building the algorithm directly skips these trainer-side checks. The shared
+`reference_kl_loss` rejects per-sample SDE-index segments; such an algorithm needs its
+own reference KL.
 
 ## Gotchas
 
@@ -182,3 +196,70 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+- **By default, `FlashGRPO.rectification_indices` is a required pool normalizer, not a target list.**
+  Each sample's coefficient is divided by the candidate-pool mean, which equals the actual
+  batch mean only with equal step counts.
+- **`batch_normalize_tgr: true` normalizes the complete arranged batch in `prepare_part`, before micro slicing.**
+  Detached `part.segment.policy_loss_weights` travels with concat/select/slice; loss never
+  renormalizes a micro. No persistent algorithm state is added: prepare recomputes weights
+  after resume. This mode requires `num_updates_per_batch=1` and `accumulate_rollouts=1`.
+  Omit `rectification_indices` to use the scheduler pool, or supply that exact pool.
+- **Batch-normalized TGR makes one unconditional `backend.all_reduce_loss_sums` call per rollout.**
+  It reduces fp64 sum/count, invalid-rank flags, and step counts over the gradient mesh, with one
+  `all_reduce` per mesh group. An exception a rank raises while preparing its shard is held until
+  that rank has made the call; every rank then raises `ValueError`, chained to the original on the
+  failing rank. A rank that cannot reach the call (lost process, broken CUDA context) still relies
+  on job teardown. `prepare_part` reads device values back three times per rollout: two before the
+  call (input checks with step counts, then coefficient check with the fp64 sum) and one after it.
+  Counts also select the global weight extrema for `flash_tgr_global_mean/min/max` metrics, without
+  a second call.
+- **Equal global step counts reuse the pool-normalized default's normalizer bit for bit.**
+  They retain the explicit pool order, fp32 mean, and epsilon clamp; unequal counts use the
+  global sum/count. The clamp can leave the actual mean below one, which the metrics report
+  without adjustment.
+- **H3's TGR coefficient intentionally approximates the joint A/V objective with video sigma only.**
+  `FlashGRPO` uses `segment.sigmas` and the stage's video strategy for TGR, while
+  the policy ratio uses the element-weighted joint video/audio log-probability.
+  The H3 recipe's schedules differ (`video_shift: 12.0`, `audio_shift: 3.0`);
+  TGR does not compute a separate audio coefficient.
+- **`FlashGRPO` runs only the per-sample path.** It raises at construction on a
+  non-`FlashSDEStrategy` stage, and at the first step on a segment without
+  `sde_index_per_sample`, which means the trainer never stratified the rollout
+  (the async trainer refuses FlashGRPO for that reason).
+- **`FlashGRPO.beta > 0` adds reference KL without TGR scaling.** The reference is the
+  same backend model with LoRA adapters disabled under `torch.no_grad`, not an EMA
+  model or another loaded checkpoint; a LoRA backend is required. Replay uses each
+  row's `sde_index_per_sample`, stored before/after latents, and conditions.
+  `FlashGRPO._reference_kl` computes `(new_mean - ref_mean)^2 / (2 * transition_std^2)`.
+  Gradients flow only through current-policy means; reference means and supplied stds
+  are detached.
+- **Joint A/V reference KL weights each stream by its latent element count, not equally.**
+  H3's `audio_joint_sde: true` includes both streams using their own transition
+  standard deviations; `false` includes video only. Per-row A/V stages declare audio
+  participation through `ReplayResult.audio_in_policy` and must return audio means and
+  stds when it is true; KL does not infer policy membership from stage internals or
+  missing statistics.
+- **Reference KL adds one batched no-gradient replay forward per micro.** It also adds
+  another FSDP parameter all-gather, and the reference forward runs while the policy graph
+  remains resident in GPU memory. It adds no backward or reference weight copy.
+  The default `beta: 0` resolves no reference, performs no reference forward,
+  emits no new KL metrics, and preserves the existing loss/gradient path bit-for-bit.
+- **FlashGRPO loss metrics are micro means before the trainer's `loss_scale`.**
+  `policy_loss` is the TGR-weighted clipped objective, `kl_ref_mean` the raw KL,
+  `kl_loss` is `beta * kl_ref_mean`, and `total_loss` is their sum, matching UniRL's
+  metric aggregation.
+  With `beta>0`, `train/kl_video` and `train/kl_audio` report each policy stream's
+  KL before element-count weighting; audio is omitted for a video-only policy.
+  `train/kl_mean_shift_video` and `train/kl_mean_shift_audio` are fp32 L2 norms of
+  detached policy-minus-reference means over all latent elements per row, averaged
+  over rows. The driver reports these four keys as row-weighted means across all
+  micros and ranks. `train/kl_ref_mean_global` likewise averages the combined KL.
+  Their sums/counts use the existing stage-metrics collection, not the loss
+  all-reduce. They reuse the same replays and add no forward or backward calls.
+  Other `train/*` algorithm metrics, including `kl_ref_mean`, `kl_loss` and
+  `ratio_*`, remain rank 0's local values; the separate `loss` field is globally
+  reduced. Their reduction paths are unchanged for bitwise run comparisons.
+- **`adv_clip_max` defaults to `5.0`, copying upstream.** Advantages are clamped before the ratio
+  because a collapsed reward spread drives `|adv|` arbitrarily high through the global-std
+  denominator. `adv_clip_fraction` in the metrics is the fraction of samples that hit the clamp:
+  a run that regresses while that climbs is being driven by reward outliers.

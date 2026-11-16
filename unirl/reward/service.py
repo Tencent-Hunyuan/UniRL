@@ -14,6 +14,7 @@ from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 from unirl.types.reward import RewardRequest
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams
+from unirl.utils.stage_metrics import record
 
 from .base import DifferentiableReward, PromptVideoReward, RewardBackend
 
@@ -81,6 +82,7 @@ class RewardService(Remote):
         return self.backend.compute_rewards_differentiable(media_tensor, prompts, records=records)
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
+    @record("score")
     def score_and_attach(self, sample: Sample) -> Sample:
         """Score the frontier (last) Part's generated media and return the updated Sample."""
         frontier = sample.parts[-1]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from copy import deepcopy
 from typing import ClassVar, List, Optional, Tuple
 
@@ -22,6 +24,8 @@ from .bundle import MiniMaxH3Bundle
 from .conditions import MiniMaxH3Conditions
 from .config import MINIMAX_H3_AUDIO_LATENT_CHANNELS
 from .packing import MiniMaxH3Geometry, build_t2va_layout, row_timestep_plan
+
+logger = logging.getLogger(__name__)
 
 
 def pack_dual_streams(video_rows: torch.Tensor, audio_rows: torch.Tensor) -> torch.Tensor:
@@ -91,6 +95,8 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
     """Rollout-level MiniMax-H3 stage: conditions -> ``LatentSegment``."""
 
     _no_split_modules: ClassVar[List[str]] = ["MiniMaxH3TransformerBlock"]
+    supports_per_sample_sde_index: ClassVar[bool] = True
+    supports_order_independent_sde_noise: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -102,6 +108,7 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         batch_replay_steps: bool,
+        rollout_keep_unsharded_layers: int = 0,
     ) -> None:
         self.bundle = bundle
         self.step = MiniMaxH3DiffusionStep(bundle)
@@ -114,6 +121,75 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
         self.batch_replay_steps = batch_replay_steps
+        self.rollout_keep_unsharded_layers = rollout_keep_unsharded_layers
+        if rollout_keep_unsharded_layers:
+            if not 0 < rollout_keep_unsharded_layers <= len(bundle.transformer.transformer_blocks):
+                raise ValueError("rollout_keep_unsharded_layers exceeds the loaded H3 transformer's layer count.")
+            self._keep_unsharded_logged = False
+            self.generate = self._keep_fsdp_params_unsharded()(self.generate)
+        if hasattr(bundle.transformer, "_h3_adaln_cache"):
+            self.generate = self._log_adaln_cache()(self.generate)
+
+    @contextmanager
+    def _log_adaln_cache(self):
+        """Log complete cache statistics at generate boundaries, including preceding training."""
+        try:
+            yield
+        finally:
+            self.bundle.transformer._h3_adaln_cache.log()
+
+    @contextmanager
+    def _keep_fsdp_params_unsharded(self):
+        """Retain the first N FSDP blocks for one no-grad generate; see README.md Gotchas."""
+        from torch.distributed.fsdp import FSDPModule
+
+        model = self.bundle.transformer
+        previous = getattr(model, "_unirl_fsdp_reshard_after_forward", None)
+        require(not torch.is_grad_enabled(), "H3 retained rollout parameters require torch.no_grad().")
+        require(previous is True, "H3 retained rollout parameters require FSDP reshard_after_forward=true.")
+        blocks = list(model.transformer_blocks[: self.rollout_keep_unsharded_layers])
+        modules = []
+        for block in blocks:
+            wrapped = [
+                module
+                for module in block.modules()
+                if isinstance(module, FSDPModule) and not getattr(module, "_h3_adaln_group", False)
+            ]
+            require(len(wrapped) == 1, "H3 retained rollout parameters require one FSDP module per selected block.")
+            modules.extend(wrapped)
+        changed = []
+        try:
+            for module in modules:
+                module.set_reshard_after_forward(False, recurse=False)
+                changed.append(module)
+            yield
+            if not self._keep_unsharded_logged:
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    excluded = {
+                        id(p)
+                        for block in blocks
+                        for module in block.modules()
+                        if getattr(module, "_h3_adaln_group", False)
+                        for p in module.parameters()
+                    }
+                    sizes = [
+                        sum(p.numel() * p.element_size() for p in block.parameters() if id(p) not in excluded)
+                        for block in blocks
+                    ]
+                    logger.info(
+                        "H3 rollout keeps %d layers unsharded: bytes_per_layer=%s, total_gb=%.6f (GiB)",
+                        len(blocks),
+                        sizes,
+                        sum(sizes) / 2**30,
+                    )
+                self._keep_unsharded_logged = True
+        finally:
+            try:
+                for module in reversed(changed):
+                    module.reshard()
+            finally:
+                for module in changed:
+                    module.set_reshard_after_forward(previous, recurse=False)
 
     def trainable_module(self) -> torch.nn.Module:
         return self.bundle.transformer
@@ -139,14 +215,20 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         denoise_seed_keys: Optional[List[str]] = None,
         denoise_base_seed: int = 0,
     ) -> LatentSegment:
-        """Run the joint video+audio denoising loop and build the segment."""
-        require(
-            conditions.batch_size == 1,
-            f"MiniMaxH3DiffusionStage: batch-1 only (got {conditions.batch_size}). The packed sequence carries "
-            f"unbatched per-row metadata, so callers chunk instead: set rollout.forward_batch_size=1 and "
-            f"stack.micro_batch_size=1. Mirrors the bagel navit recipe.",
-        )
+        """Denoise rows sharing geometry, text length and SDE steps; see README.md."""
         conditions = conditions.trim_text_padding()
+        batch = conditions.batch_size
+        require(
+            initial_latents.shape == (batch, geometry.num_video_rows, geometry.video_token_dim)
+            and initial_audio_latents.shape == (batch, geometry.num_audio_rows, MINIMAX_H3_AUDIO_LATENT_CHANNELS),
+            "MiniMaxH3DiffusionStage.generate: all rows must share the same geometry and text batch size; "
+            f"got video={tuple(initial_latents.shape)}, audio={tuple(initial_audio_latents.shape)}, "
+            f"text batch={batch}, geometry={geometry}.",
+        )
+        require(
+            denoise_seed_keys is None or len(denoise_seed_keys) == batch,
+            "MiniMaxH3DiffusionStage.generate: provide one denoise seed key per row.",
+        )
         num_text_tokens = int(conditions.text.embeds.shape[1])
         layout = build_t2va_layout(geometry, num_text_tokens)
         audio_sigmas = self.audio_schedule(sigmas)
@@ -337,9 +419,8 @@ class MiniMaxH3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[MiniMaxH3Co
         """One packed forward at an arbitrary ``(xt, sigma)`` -- no SDE iteration."""
         require(
             int(sample.shape[0]) == 1,
-            f"MiniMaxH3DiffusionStage.predict_noise_at_step: batch-1 only (got {int(sample.shape[0])}). The packed "
-            f"sequence carries unbatched per-row metadata, so callers chunk instead: set stack.micro_batch_size=1 "
-            f"and rollout.forward_batch_size=1. Same discipline as generate().",
+            f"MiniMaxH3DiffusionStage.predict_noise_at_step: batch-1 only (got {int(sample.shape[0])}); "
+            f"keep stack.micro_batch_size=1 for training.",
         )
         conditions = conditions.trim_text_padding()
         geometry = MiniMaxH3Geometry.from_params(params)

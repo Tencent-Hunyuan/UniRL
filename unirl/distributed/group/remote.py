@@ -146,7 +146,9 @@ class Remote:
         if empty_cache:
             aggressive_empty_cache()
         if reset_peak:
-            torch.cuda.reset_peak_memory_stats()
+            from unirl.utils.stage_metrics import memory_peaks
+
+            memory_peaks(torch.cuda.current_device(), reset=True)
         out = {**info, "rank": float(self.rank_info.rank)}
         if dump_snapshot_tag:
             sampler = get_process_snapshot_sampler()

@@ -1,0 +1,168 @@
+# @package _global_
+# MiniMax-H3 t2va Flash-GRPO, trainside FSDP, joint video/audio SDE.
+# Geometry, optimizer, LoRA, and reward match minimax_h3_t2va_trainside.yaml.
+
+num_devices: 8
+batch_size: 8
+adv_use_global_std: true
+num_rollouts: 1000
+
+logging:
+  report_to_wandb: true
+  project_name: ${oc.env:WANDB_PROJECT,unirl-minimax-h3-t2va}
+  run_name: ${oc.env:WANDB_RUN_NAME,minimax_h3_t2va_flashgrpo}
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [minimax-h3, t2va, flashgrpo, trainside, audio, stereo]
+  log_media: true
+  media_max_items: 2
+  media_log_interval: 100
+
+bundle:
+  _target_: unirl.models.minimax_h3.bundle.MiniMaxH3Bundle.from_config
+  config:
+    _target_: unirl.models.minimax_h3.config.MiniMaxH3PipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL}
+    model_precision: bf16
+    vae_dtype: fp32
+    audio_vae_dtype: fp32
+    trajectory_precision: fp16
+    logprob_precision: fp32
+    video_shift: 12.0
+    audio_shift: 3.0
+    audio_joint_sde: true
+    aux_components_on_cpu: true
+    vae_components_on_cpu: false
+    meta_init_transformer: true
+
+pipeline:
+  _target_: unirl.models.minimax_h3.pipeline.MiniMaxH3Pipeline.from_bundle
+  config: ${bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlashSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["MiniMaxH3TransformerBlock"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    # bf16 masters can round small Adam updates to zero.
+    master_dtype: fp32
+    expandable_segments: true
+    cpu_offload: false
+    mixed_precision: true
+    # Timestep embeddings remain fp32 until each block's bf16 AdaLN projection.
+    cast_forward_inputs: false
+    fsdp_mode: full
+    reshard_after_forward: true
+    activation_checkpointing: true
+    use_torch_compile: false
+    # Patch projections, timestep MLP, output heads, and rope stay outside FSDP groups at checkpoint precision.
+    root_wrap: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-12
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 32
+    alpha: 64
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # These LoRA suffixes also occur in token_refiner, outside the DP-synchronized transformer blocks.
+    module_prefix: transformer_blocks
+    target_modules:
+      - attn.to_q
+      - attn.to_k
+      - attn.to_v
+      - attn.to_out.0
+      - ff.net.0.proj
+      - ff.net.2
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    config:
+      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      # ImageBind is CC-BY-NC-SA; this recipe is NonCommercial.
+      weights:
+        imagebind: 1.0
+        clap: 1.0
+      # ImageBind mode=all scores text-video, text-audio, and audio-video; CLAP scores text-audio.
+      scorers:
+        imagebind:
+          _target_: unirl.reward.local.imagebind.ImageBindRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.imagebind.ImageBindSpec
+            batch_size: 2
+            # audio_video alone has no prompt-video alignment term.
+            mode: all
+        clap:
+          _target_: unirl.reward.local.clap.CLAPRewardScorer
+          base_device: cuda
+          config:
+            _target_: unirl.reward.local.clap.CLAPSpec
+            batch_size: 2
+
+algorithm:
+  _target_: unirl.algorithms.flashgrpo.FlashGRPO
+  stage_attr: diffusion
+  engine_per_sample_sde: true
+  batch_normalize_tgr: true
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.minimax_h3.conditions.MiniMaxH3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 10
+  guidance_scale: 1.0
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${sampling.num_inference_steps}
+    timestep_fraction: [0.0, 0.5]
+    # Training draws per prompt from the pool; this count controls eval_eta > 0 evaluation.
+    num_sde_steps: 1
+  height: 256
+  width: 384
+  # H3's 17n+5 frame geometry and 5 s minimum make 124 the smallest legal frame count.
+  num_frames: 124
+  eta: 1.0
+  samples_per_prompt: 16
+  seed: 42
+  autocast_precision: bf16
+  trajectory_precision: fp16
+  logprob_precision: fp32

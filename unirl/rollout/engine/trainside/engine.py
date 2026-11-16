@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import threading
-from typing import List, Optional, Sequence
+from dataclasses import replace
+from typing import ClassVar, Dict, List, Optional, Sequence
 
 import torch
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.models.types.diffusion import DiffusionStage
+from unirl.models.types.per_sample_replay import stamp_sde_index_per_sample
 from unirl.models.types.pipeline import Pipeline
 from unirl.rollout.engine.base import BaseRolloutEngine
 from unirl.sde.runtime import FlowMatchSchedulePolicy, ensure_sample_sigmas
 from unirl.types.sample import Part, Sample
+from unirl.types.sampling import DiffusionSamplingParams
 
 
 class TrainsideRolloutEngine(BaseRolloutEngine):
     """In-process rollout engine: the train actor's Pipeline IS the sampler."""
 
     _component_name = "trainside"
+    supports_per_sample_sde_index: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -29,6 +33,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
     ) -> None:
         self.pipeline = pipeline
         stages = [getattr(pipeline, a) for a in stage_attrs]
+        self.stages = stages
         self.models = [s.trainable_module() for s in stages]
         if forward_batch_size is not None and forward_batch_size < 1:
             raise ValueError(
@@ -46,7 +51,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
         else:
             self.schedule_policy = None
 
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.closed = False
 
     @distributed(dispatch_mode=Dispatch.DP_SCATTER)
@@ -78,7 +83,31 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                     fbs = self.forward_batch_size
                     gen = sample.parts[-1]
                     bs = gen.batch_size
-                    if fbs is None or bs <= fbs:
+                    if fbs is not None and fbs > 1 and gen.sde_index_per_sample is not None:
+                        roots = sample.root_group_ids(-1)
+                        bounds = [0, *[i for i in range(1, bs) if roots[i] != roots[i - 1]], bs]
+                        if len(bounds) > 2:
+                            outputs = [
+                                self.generate(sample.replace_frontier(gen.slice(start, end))).parts[-1]
+                                for start, end in zip(bounds[:-1], bounds[1:])
+                            ]
+                            return self._stamp_output_version(sample.replace_frontier(Part.concat(outputs)))
+                    single_sde_index = None
+                    if gen.sde_index_per_sample is not None:
+                        steps = gen.sde_index_per_sample.unique().tolist()
+                        if len(steps) == 1:
+                            single_sde_index = steps[0]
+                            if not isinstance(gen.sampling_params, DiffusionSamplingParams):
+                                raise ValueError("Per-sample SDE requests require DiffusionSamplingParams.")
+                            if not 0 <= single_sde_index < gen.sampling_params.num_inference_steps - 1:
+                                raise ValueError(
+                                    "Per-sample SDE steps must be in [0, num_inference_steps-2]; "
+                                    "narrow the scheduler candidate pool."
+                                )
+                            gen.sampling_params = replace(gen.sampling_params, sde_indices=[single_sde_index])
+                    if gen.sde_index_per_sample is not None and single_sde_index is None:
+                        out = self._generate_per_sample_sde(sample)
+                    elif fbs is None or bs <= fbs:
                         out = self.pipeline.generate(sample)
                     else:
                         input_parts = sample.parts[:-1]
@@ -88,10 +117,57 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                             chunk = self.pipeline.generate(Sample(parts=[*input_parts, gen.slice(start, end)]))
                             gen_chunks.append(chunk.parts[-1])
                         out = Sample(parts=[*input_parts, Part.concat(gen_chunks)])
+                    if single_sde_index is not None:
+                        stamp_sde_index_per_sample(out.parts[-1], single_sde_index)
+                        out.parts[-1].sde_index_per_sample = None
             finally:
                 for m, mode in zip(self.models, prev_modes):
                     m.train(mode)
             return self._stamp_output_version(out)
+
+    def _generate_per_sample_sde(self, sample: Sample) -> Sample:
+        """Group by SDE step, generate one row at a time, then restore request order; see trainer/README.md."""
+        if self.forward_batch_size != 1:
+            raise ValueError("Per-sample SDE requests require forward_batch_size=1 for FSDP forward lockstep.")
+        if len(self.stages) != 1 or not getattr(self.stages[0], "supports_order_independent_sde_noise", False):
+            raise ValueError(
+                "Per-sample SDE requests require one stage with sample/step-keyed noise; use driver grouping."
+            )
+        gen = sample.parts[-1]
+        params = gen.sampling_params
+        if not isinstance(params, DiffusionSamplingParams):
+            raise ValueError("Per-sample SDE requests require DiffusionSamplingParams.")
+        positions_by_step: Dict[int, List[int]] = {}
+        for position, step in enumerate(gen.sde_index_per_sample.tolist()):
+            if not 0 <= step < params.num_inference_steps - 1:
+                raise ValueError(
+                    "Per-sample SDE steps must be in [0, num_inference_steps-2]; narrow the scheduler candidate pool."
+                )
+            positions_by_step.setdefault(step, []).append(position)
+        rows: List[Optional[Part]] = [None] * gen.batch_size
+        input_parts = sample.parts[:-1]
+        for step in sorted(positions_by_step):
+            for position in positions_by_step[step]:
+                row = gen.slice(position, position + 1)
+                row.sampling_params = replace(params, sde_indices=[step])
+                chunk = self.pipeline.generate(Sample(parts=[*input_parts, row]))
+                output = chunk.parts[-1]
+                stamp_sde_index_per_sample(output, step)
+                output.sde_index_per_sample = None
+                rows[position] = output
+        return Sample(parts=[*input_parts, Part.concat(rows)])
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def sleep(self) -> None:
+        """Release pipeline-owned rollout resources outside generation."""
+        with self.lock:
+            self.pipeline.sleep()
+
+    @distributed(dispatch_mode=Dispatch.BROADCAST)
+    def wake_up(self) -> None:
+        """Restore pipeline-owned rollout resources before generation."""
+        with self.lock:
+            self.pipeline.wake_up()
 
     def shutdown(self) -> None:
         with self.lock:
