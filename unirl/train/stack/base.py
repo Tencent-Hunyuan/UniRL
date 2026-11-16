@@ -86,6 +86,13 @@ class BaseTrainStack(Remote):
                 raise ValueError(f"{owner}.{name} must be an int >= 1; got {value!r}.")
         if isinstance(max_grad_norm, bool) or not isinstance(max_grad_norm, (int, float)) or not max_grad_norm > 0.0:
             raise ValueError(f"{owner}.max_grad_norm must be a number > 0; got {max_grad_norm!r}.")
+        for algorithm in algorithms:
+            required = algorithm.required_num_updates
+            if required is not None and num_updates_per_batch != required:
+                raise ValueError(
+                    f"{type(algorithm).__name__} requires num_updates_per_batch={required} "
+                    f"disjoint updates; got {num_updates_per_batch}."
+                )
         if num_updates_per_batch > 1:
             for algorithm in algorithms:
                 if not algorithm.supports_multi_update:

@@ -352,10 +352,15 @@ class StageAlgorithm(Remote, ABC):
 
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
+    required_num_updates: Optional[int] = None
     requires_backend: bool = False
     requires_advantages: bool = True
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
+
+    def validate_part(self, part: "Part") -> None:
+        """Optional full-shard preflight before anchor slicing or model execution."""
+        return None
 
     def prepare_segment(
         self,
