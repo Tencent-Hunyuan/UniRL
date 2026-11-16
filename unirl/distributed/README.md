@@ -5,11 +5,27 @@
 > to them, and moves rollout data between them without routing the heavy tensors
 > through the driver. Full map: [`../README.md`](../README.md).
 
-<div align="center">
-  <img src="../../assets/distributed-topology-new.png" alt="UniRL distributed data plane: each produced tensor is dehydrated to a TensorMeta handle (bytes stay in the worker store), the driver merges handles and hydrates only rewards/advantages, and localize resolves each handle on its consumer — a local read when the home worker is the consumer (colocate/trainside), or one worker-to-worker NCCL hop when they are disjoint (separate), never through the driver" width="100%">
-</div>
+```mermaid
+flowchart LR
+  D["Trainer (driver)<br/>holds TensorRef proxies<br/>hydrates rewards and advantages"]
+  subgraph RW["Rollout workers"]
+    E["Rollout engine"]
+  end
+  subgraph TW["Train workers"]
+    T["TrainStack"]
+    S["Weight-sync handler"]
+  end
+  D -- "control: generate" --> E
+  E -- "control: TensorRef proxies" --> D
+  D -- "control: train_track" --> T
+  E == "data plane: rollout outputs, per transport_kind" ==> T
+  S -. "weight sync: trained weights, per sync block" .-> E
+```
 
-*The data plane is a handle proxy: a produced tensor is **dehydrated** into a `TensorMeta` (the bytes stay on the worker); the driver shuffles handles and **hydrates** only the small rewards/advantages; **`localize`** then resolves each handle on its consumer — a local read if the home worker is the consumer, or one worker→worker NCCL hop if not.*
+In colocate and direct modes the rollout and train workers are the same Workers; in
+separate mode they are disjoint slabs.
+
+*The data plane is a handle proxy: a produced tensor is **dehydrated** into a `TensorRef` (the bytes stay on the worker); the driver shuffles handles and **hydrates** only the small rewards/advantages; **`localize`** then resolves each handle on its consumer — a local read if the home worker is the consumer, or one worker→worker NCCL hop if not.*
 
 ## What it is
 
@@ -21,7 +37,7 @@ multi-GPU, multi-node program. Three parts:
   call fan out across workers by a declared *dispatch mode*. `DevicePool` /
   `placement` carve the GPUs into slabs.
 - **`tensor/`** — the data plane. How tensors move (or stay put) between workers,
-  via a `TensorMeta` proxy layer over a pluggable transport.
+  via a `TensorRef` proxy layer over a pluggable transport.
 - **`weight_sync/`** — the trainer→rollout back-edge ([its own README](weight_sync/README.md)).
 
 ## Why it exists
@@ -38,7 +54,7 @@ unmaintainable. This layer hides it behind two ideas:
 - **The driver never holds the heavy bytes.** A rollout can be hundreds of GB of
   latents. Gathering it to the driver to hand to the trainer would OOM. So a produced
   tensor stays resident on its worker; the driver passes around only lightweight
-  `TensorMeta` handles.
+  `TensorRef` handles.
 
 ## How it works
 
@@ -59,27 +75,29 @@ unmaintainable. This layer hides it behind two ideas:
 - **Placement** (`group/device_pool.py`, `group/placement.py`). A `DevicePool`
   reserves one Ray placement group per node (one GPU per "bundle"). A `placement(…)`
   scope claims a slab of devices and builds the workers in it — pure data-parallel by
-  default (`rank == dp_rank`); any TP/FSDP sharding is set up inside each role's
-  `initialize()`.
+  default (`rank == dp_rank`); `Handle` derives any SP/TP/PP rank layout from each role's
+  init hints.
 - **The data plane — how rollout data reaches train** (`tensor/`). The subtle part,
   and the one most worth understanding:
   1. `generate` runs `DP_SCATTER` on the rollout workers. As each worker returns,
      every tensor in the returned `Sample` is **dehydrated** into that worker's store and
-     replaced by a `TensorMeta` (a ref + shape).
+     replaced by a `TensorRef` (spans + shape).
   2. The driver's merge concatenates **handles**, so the heavy bytes never leave the
      workers; the driver hydrates only the small `rewards`/`advantages` vectors it
      needs to score and compute advantages.
   3. `train_track` runs `DP_SCATTER` again, re-partitioning those refs across the
-     **train** workers. Each train worker resolves its `TensorMeta`s to real tensors
+     **train** workers. Each train worker resolves its `TensorRef`s to real tensors
      through the **transport** — and that resolve is where the layout shows up.
 - **Transport** (`tensor/backend/`, picked cluster-wide by `transport_kind`):
   `colocate_store` (default — tensors live in the producing worker's process,
   cross-GPU resolves over NCCL), `gpu_store` (per-GPU CUDA-IPC, for multi-slot
   colocate), or `transfer_queue` (a global bus — `simple` in-memory for zero-infra,
-  `mooncake` RDMA for production).
+  `mooncake` RDMA for production). It carries rollout outputs only, never weights.
+  `transfer_queue` needs a `transfer_queue:` block; see
+  [`sd3_trainside_tq_mooncake`](../../examples/diffusion/sd3/sd3_trainside_tq_mooncake.yaml).
 - **Layouts** decide whether rollout and train share GPUs, and therefore what a
-  resolve costs:
-  - **trainside / colocate** — rollout reuses the train model on the **same**
+  resolve costs, independently of `transport_kind`:
+  - **trainside / colocate** — rollout runs on the **same**
     workers, so a train worker's ref already points at its own store → a local read,
     nothing crosses.
   - **separate** — rollout on a disjoint GPU slab; resolving a foreign ref fires a
@@ -95,7 +113,7 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
 ## Gotchas
 
 - **The driver holds proxies, not tensors.** Driver-side arithmetic on a
-  `Sample` / `Part` field must `_hydrate_tensor_meta` first (the trainer does this
+  `Sample` / `Part` field must `hydrate` first (the trainer does this
   for `rewards`); don't assume a field on the driver is a real tensor.
 - **`DP_SCATTER` splits by the *first* batch-axis size it finds** (`infer_batch_size`),
   and `pytree_chunk` **replicates** — never errors on — anything whose leading dim
@@ -112,7 +130,6 @@ layout is a `placement(…)` wiring in the trainer (`trainer/diffusion.py`).
 - **`transport_kind` is a cluster-wide choice.** `colocate_store` assumes one worker
   per GPU; multi-slot colocate needs `gpu_store`; cross-node production wants
   `transfer_queue: mooncake` (RDMA).
-- **`layout` only branches on `"separate"`.** `"colocate"` and `"colocated"` are the
-  same thing (the entrypoint and trainer defaults disagree textually, but the only
-  test is `!= "separate"`); the multi-process-same-GPU "real colocate"
+- **`layout` accepts only `"colocate"` or `"separate"`.** `DiffusionTrainer` raises on
+  anything else, including `"colocated"`; the multi-process-same-GPU "real colocate"
   (`shared_workers=False`) path exists but no trainer uses it.

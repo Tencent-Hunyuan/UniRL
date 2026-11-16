@@ -5,18 +5,14 @@
 > backend. Out: weights pushed into the rollout engine.
 > Full map: [`../../README.md`](../../README.md).
 
-<div align="center">
-  <img src="../../../assets/weight-sync-new.png" alt="UniRL weight sync: every train rank all-gathers the FSDP shards into full tensors, then one of five handlers — a cell of the LoRA/full by colocate/separate grid — pushes them into the rollout engine" width="100%">
-</div>
-
-*Every `sync()` is the same two phases — **gather** the weights (an all-gather, so it runs on **every train rank**) then **push** into the engine — and the five handlers fill a **[ what × where ]** grid: LoRA vs full × colocate vs separate.*
+*Every `sync()` is the same two phases — **gather** the weights (an all-gather, so it runs on **every train rank**) then **push** into the engine — and the seven handlers fill a **[ what × where ]** grid: LoRA vs full × colocate vs separate.*
 
 ## What it is
 
 `unirl.distributed.weight_sync` delivers freshly-trained weights from the train
 slab into the dedicated rollout engine(s). It is the dashed back-edge of the
 training loop, and it exists **only** when rollout runs on a dedicated engine
-(SGLang / vLLM-Omni, in `separate` or `colocate` layouts); direct sampling (the
+(SGLang / vLLM / vLLM-Omni / FastVideo, in `separate` or `colocate` layouts); direct sampling (the
 trainside engine) needs no sync because it samples the live training weights
 in-process.
 
@@ -46,11 +42,16 @@ materialization.
 - **Transports.** LoRA: `LocalLoraWeightSync` (colocate, in-process sibling) and
   `RemoteLoraWeightSync` (cross-slab rank-0 Ray push). Full: `NCCLWeightSync`
   (separate slabs, cross-node capable), `TensorWeightSync` (colocate serialized
-  handoff), `IPCWeightSync` (colocate CUDA-IPC over ZMQ). Colocate handlers take the
+  handoff), `IPCWeightSync` (colocate CUDA-IPC over ZMQ, or vLLM's native engine for `vllm`),
+  `CkptEngineIPCWeightSync` (colocate SGLang checkpoint-engine IPC),
+  `CheckpointWeightSync` (colocate `torch.save` path handoff for FastVideo). Colocate handlers take the
   engine as a same-Worker sibling; separate/NCCL need a one-time driver handshake.
 - **Routing.** `param_prefix` prepends the model's canonical key prefix;
   `track_prefix` further prefixes so a `ComposedRolloutEngine` can demux the update
   to one child (PE registers one handler per track).
+- **Async publication.** `RolloutManager.sync_weights` raises on queued or in-flight
+  work, runs `sync()`, then publishes the version
+  ([rollout gotchas](../../rollout/README.md#gotchas)).
 
 The one bit-equality safety net is the LoRA `verify` checksum read-back — but it is
 vLLM-Omni-only, so SGLang LoRA runs have none.
@@ -77,8 +78,9 @@ matching receiver on the engine side (`../../rollout/engine/`).
   the `collective_rpc` broadcast to ranks 2..N gets a dead handle (HI3). Set
   `copy=True` for any TP>1 stage; `copy=False` is only safe for a TP=1 separate slab (SD3).
 - **`CheckpointWeightSync.version` is a filename sequence**, not a receiver
-  idempotency key. Other transports carry no independent version ledger.
-- **Direct vLLM IPC deliberately delegates transfer mechanics to vLLM 0.27.**
+  idempotency key. Apart from direct vLLM's `model_version`, other transports carry
+  no independent version ledger.
+- **Direct vLLM IPC deliberately delegates transfer mechanics to vLLM 0.28.**
   UniRL supplies lazy canonical FSDP export, rank consensus, manifests, and
   fail-stop publication; vLLM owns CUDA IPC handle routing, TP slicing,
   model-specific fusion, and layerwise `load_weights`. Its packed producer reads
