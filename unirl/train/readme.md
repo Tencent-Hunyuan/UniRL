@@ -162,12 +162,17 @@ use LoRA adapter mode. Formats and export live in
   Consumers outside `train/` take the transform from
   `backend.expert_weight_export_transform()` — `distributed/weight_sync/` must not
   import the layout (the core-dependency guard rejects it).
-- **`token-mean` loss scales come from DP-global valid tokens** (`stack/loss_scale.py`) —
-  a micro's `loss_scale` is its valid tokens × the gradient-averaging world / the valid
-  tokens all-reduced over one `TrainStack._run_update` or one unified `_train_one_step`
-  track. A `TrainStack` accumulation window resolves each part on its own and scales it
-  by 1/M, so its step averages the per-part token means. Other modes and the unified
-  image track use sample share. Both stacks report the DP-global loss and, under
+- **`token-mean` loss scales come from DP-global valid tokens** (`stack/loss_scale.py`,
+  per-row units from `StageAlgorithm.loss_units`) — a micro's `loss_scale` is its valid
+  tokens × the gradient-averaging world / the valid tokens all-reduced over one
+  `TrainStack._run_update` or one unified `_train_one_step` track. A `TrainStack`
+  accumulation window resolves each part on its own and scales it by 1/M, so its step
+  averages the per-part token means. The base `loss_units` returns valid tokens when the
+  algorithm's `loss_agg_mode` is `token-mean` and `None` otherwise (other modes, algorithms
+  without `loss_agg_mode`, the unified image track): `None` is sample share, with no
+  all-reduce and no `sp_size` guard, so an override returns `None` on every DP rank or on
+  none. The all-reduced units and the gradient-averaging world form the update's
+  `LossNorm(denominator, grad_world)`. Both stacks report the DP-global loss and, under
   `token-mean`, `global_loss_weight`; zero valid tokens across DP raises in `TrainStack`.
 - **A zero-valid-token AR track in `UnifiedModelTrainStack` still backwards** —
   masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW

@@ -11,12 +11,12 @@ import torch
 
 from unirl.distributed.group.remote import Remote
 from unirl.types.loss_agg import LossAggMode, parse_loss_agg_mode
+from unirl.types.segments.text import TextSegment
 
 if TYPE_CHECKING:
     from unirl.types.conditions import Condition
     from unirl.types.sample import Part
     from unirl.types.segments.base import Segment
-    from unirl.types.segments.text import TextSegment
 
 
 def typed_conditions(
@@ -334,6 +334,14 @@ def require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *
 
 
 @dataclass(frozen=True)
+class LossNorm:
+    """One update's loss denominator for one track; see ``train/readme.md`` Gotchas."""
+
+    denominator: float  # DP-global loss units over the update
+    grad_world: int  # ranks FSDP averages gradients over
+
+
+@dataclass(frozen=True)
 class AlgorithmStepResult:
     """Result of one micro-step under the stage-driven contract."""
 
@@ -356,6 +364,7 @@ class StageAlgorithm(Remote, ABC):
     requires_advantages: bool = True
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
+    loss_agg_mode: Optional[str] = None  # LossAggMode value; None = no AR token reduction
 
     def prepare_segment(
         self,
@@ -369,6 +378,28 @@ class StageAlgorithm(Remote, ABC):
     def prepare_part(self, part: "Part") -> "Part":
         """Optional post-anchor hook over the complete arranged worker shard."""
         return part
+
+    def loss_units(self, part: "Part") -> Optional[torch.Tensor]:
+        """Per-row loss units ``[rows]`` (valid tokens under ``token-mean``); ``None`` = one per row (sample share)."""
+        if self.loss_agg_mode != LossAggMode.TOKEN_MEAN:
+            return None
+        owner = type(self).__name__
+        segment = part.segment
+        if not isinstance(segment, TextSegment):
+            raise ValueError(
+                f"{owner}: loss_agg_mode='token-mean' requires a TextSegment; got {type(segment).__name__}."
+            )
+        cu = segment.cu_seqlens
+        loss_mask = segment.loss_mask
+        if loss_mask is not None and cu is not None:
+            csum = torch.nn.functional.pad(loss_mask.cumsum(0, dtype=torch.float64), (1, 0))
+            return csum[cu[1:]] - csum[cu[:-1]]
+        if segment.lengths is not None:
+            return segment.lengths
+        raise ValueError(
+            f"{owner}: loss_agg_mode='token-mean' requires a packed segment "
+            "(cu_seqlens/lengths) — build it via TextSegment.pack(...)."
+        )
 
     @abstractmethod
     def compute_loss_and_backward(
@@ -387,6 +418,7 @@ class StageAlgorithm(Remote, ABC):
 __all__ = [
     "AlgorithmStepResult",
     "BaseAlgorithmConfig",
+    "LossNorm",
     "StageAlgorithm",
     "aggregate_token_losses",
     "gather_sde_field",
