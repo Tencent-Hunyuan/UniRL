@@ -248,8 +248,8 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
     ) -> ReplayResult:
         """Recompute SDE log-probs ``[B, S]`` and means ``[B, S, C, 1, H_lat, W_lat]`` with gradients."""
         require(
-            segment.sde_indices is not None and segment.latents is not None and segment.sigmas is not None,
-            "Cosmos3DiffusionStage.replay requires segment sde_indices, latents and sigmas",
+            all(x is not None for x in (segment.sde_indices, segment.indices, segment.latents, segment.sigmas)),
+            "Cosmos3DiffusionStage.replay requires segment sde_indices, indices, latents and sigmas",
         )
         sde_steps = segment.sde_indices.tolist()
         target = step_indices if step_indices is not None else sde_steps
@@ -260,6 +260,7 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         device = torch.device(self.model.device)
         schedule = segment.sigmas.to(device)
         sigma_max = schedule[1].float()
+        slots = {step: slot for slot, step in enumerate(segment.indices.tolist())}
         log_probs: List[torch.Tensor] = []
         means: List[torch.Tensor] = []
         for sample_idx in range(conditions.batch_size):
@@ -269,8 +270,8 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
                     self.model,
                     single,
                     strategy=self.strategy,
-                    sample=segment.latents_at(step_index)[sample_idx : sample_idx + 1].to(device),
-                    prev_sample=segment.latents_at(step_index + 1)[sample_idx : sample_idx + 1].to(device),
+                    sample=segment.latents[sample_idx : sample_idx + 1, slots[step_index]].to(device),
+                    prev_sample=segment.latents[sample_idx : sample_idx + 1, slots[step_index + 1]].to(device),
                     sigma=schedule[step_index],
                     sigma_next=schedule[step_index + 1],
                     guidance_scale=params.guidance_scale,
