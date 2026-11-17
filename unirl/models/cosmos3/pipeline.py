@@ -1,20 +1,20 @@
-"""Cosmos3 packed omnimodal stage and the SFT / text-to-image pipeline."""
+"""Cosmos3 packed omnimodal stage and the SFT / text-to-image / image-to-video pipeline."""
 
 from __future__ import annotations
 
 import dataclasses
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
 
 import torch
 
 from unirl.models.types.pipeline import Pipeline
 from unirl.sde.kernels import FlowSDEStrategy, StepStrategy
 from unirl.sde.runtime import FlowMatchSchedulePolicy
-from unirl.types.conditions import TextTokenCondition
+from unirl.types.conditions import ImageLatentCondition, TextTokenCondition
 from unirl.types.noise_recipe import NoiseRecipe
-from unirl.types.primitives import Images, Texts
+from unirl.types.primitives import Images, Texts, Video, Videos
 from unirl.types.sample import Sample
 from unirl.types.sampling import DiffusionSamplingParams
 from unirl.types.segments.latent import LatentSegment
@@ -247,7 +247,7 @@ def _token_condition(rows: Sequence[Sequence[int]]) -> TextTokenCondition:
 
 
 class Cosmos3Pipeline(Pipeline):
-    """Cosmos3 pipeline: packed joint stage for SFT plus single-frame text-to-image generation."""
+    """Cosmos3 pipeline: packed joint stage for SFT plus text-to-image and image-to-video generation."""
 
     def __init__(
         self,
@@ -272,8 +272,9 @@ class Cosmos3Pipeline(Pipeline):
 
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
-        """Per-sample latent shape ``(48, 1, H/16, W/16)`` for driver-side initial noise."""
-        return (48, 1, sampling_spec.height // 16, sampling_spec.width // 16)
+        """Per-sample generated-frame latent shape ``(48, T_gen, H/16, W/16)`` for driver-side initial noise."""
+        generated_frames = max((sampling_spec.num_frames - 1) // 4, 1)  # the clean first frame is not part of it
+        return (48, generated_frames, sampling_spec.height // 16, sampling_spec.width // 16)
 
     def build_schedule_policy(self) -> FlowMatchSchedulePolicy:
         """Static flow shift; the checkpoint's UniPC/Karras scheduler config is not used (README # Gotchas)."""
@@ -281,15 +282,17 @@ class Cosmos3Pipeline(Pipeline):
             raise ValueError("Cosmos3Pipeline.build_schedule_policy: generation needs an explicit `shift`.")
         return FlowMatchSchedulePolicy.static_only(self.shift)
 
-    def build_conditions(self, texts: Texts, *, height: int, width: int) -> Cosmos3Conditions:
-        """Tokenize prompts into cond / uncond ids with the upstream single-frame templates."""
+    def build_conditions(
+        self, texts: Texts, *, height: int, width: int, num_frames: int, images: Optional[Images] = None
+    ) -> Cosmos3Conditions:
+        """Tokenize prompts with the upstream image / video templates and encode source images to clean frame 0."""
         cfg = self.bundle.config
         cond_rows, uncond_rows = [], []
         for prompt in texts.texts:
             cond_ids, uncond_ids = self.joint.pipe.tokenize_prompt(
                 prompt,
                 None,
-                num_frames=1,
+                num_frames=num_frames,
                 height=height,
                 width=width,
                 fps=cfg.fps,
@@ -299,20 +302,40 @@ class Cosmos3Pipeline(Pipeline):
             )
             cond_rows.append(cond_ids)
             uncond_rows.append(uncond_ids)
-        return Cosmos3Conditions(text=_token_condition(cond_rows), negative_text=_token_condition(uncond_rows))
+        image_latent = None
+        if images is not None:
+            from diffusers.pipelines.cosmos.pipeline_cosmos3_omni import _preprocess_conditioning_image
+
+            vae = self.bundle.vae
+            frames = [_preprocess_conditioning_image(image.pixels, height, width) for image in images.to_list()]
+            pixels = torch.cat(frames).unsqueeze(2).to(device=vae.device, dtype=vae.dtype)  # [B, 3, 1, H, W] in [-1, 1]
+            with torch.no_grad():
+                latents = self.joint.pipe._encode_video(pixels)  # [B, 48, 1, H/16, W/16] fp32
+            image_latent = ImageLatentCondition(latents=latents)
+        return Cosmos3Conditions(
+            text=_token_condition(cond_rows), negative_text=_token_condition(uncond_rows), image_latent=image_latent
+        )
 
     @torch.no_grad()
-    def decode(self, segment: LatentSegment) -> Images:
-        """Decode final latents ``[B, C, 1, H_lat, W_lat]`` to images in ``[0, 1]``."""
+    def decode(
+        self, segment: LatentSegment, image_latent: Optional[ImageLatentCondition] = None
+    ) -> Union[Images, Videos]:
+        """Decode final latents to images, or with clean frame 0 prepended to videos ``[T, 3, H, W]``, in ``[0, 1]``."""
         vae, pipe = self.bundle.vae, self.joint.pipe
-        latents = segment.latents[:, -1].to(device=vae.device, dtype=vae.dtype)
+        latents = segment.latents[:, -1]
+        if image_latent is not None:
+            latents = torch.cat([image_latent.latents.to(latents.device), latents], dim=2)
+        latents = latents.to(device=vae.device, dtype=vae.dtype)
         mean = pipe._vae_latents_mean.to(latents).view(1, -1, 1, 1, 1)
         inv_std = pipe._vae_latents_inv_std.to(latents).view(1, -1, 1, 1, 1)
-        decoded = vae.decode(latents / inv_std + mean).sample  # [B, 3, 1, H, W] in [-1, 1]
-        return Images.from_dense(((decoded[:, :, 0].float() + 1.0) / 2.0).clamp(0.0, 1.0))
+        decoded = vae.decode(latents / inv_std + mean).sample  # [B, 3, T, H, W] in [-1, 1]
+        pixels = ((decoded.float() + 1.0) / 2.0).clamp(0.0, 1.0)
+        if image_latent is None:
+            return Images.from_dense(pixels[:, :, 0])
+        return Videos.from_list([Video(frames=video.permute(1, 0, 2, 3)) for video in pixels])
 
     def generate(self, sample: Sample) -> Sample:
-        """Run single-frame text-to-image, filling the frontier (pre-forked) gen Part."""
+        """Run text-to-image, or image-to-video when an ``Images`` turn is present, filling the frontier gen Part."""
         frontier = sample.parts[-1]
         params = frontier.sampling_params
         if not isinstance(params, DiffusionSamplingParams):
@@ -335,15 +358,22 @@ class Cosmos3Pipeline(Pipeline):
         if params.init_same_noise and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=frontier.group_ids)
 
-        conditions = self.build_conditions(texts, height=params.height, width=params.width)
+        images = next((c for c in conditioning[1:] if isinstance(c, Images)), None)
+        if images is not None and len(images) != len(texts.texts):
+            raise ValueError(f"Cosmos3Pipeline.generate: image count {len(images)} != text count {len(texts.texts)}")
+
+        conditions = self.build_conditions(
+            texts, height=params.height, width=params.width, num_frames=params.num_frames, images=images
+        )
         segment = self.diffusion.diffuse(
             conditions,
             schedule=params.sigmas.to(self.bundle.device),
             params=params,
             initial_latents=NoiseRecipe.from_sample(sample).resolve(),
         )
-        images = self.decode(segment)
-        filled = frontier.fill(segment=segment, primitives={"image": images}, conditions=conditions.to_dict())
+        decoded = self.decode(segment, conditions.image_latent)
+        key = "image" if conditions.image_latent is None else "video"
+        filled = frontier.fill(segment=segment, primitives={key: decoded}, conditions=conditions.to_dict())
         return Sample(parts=[*sample.parts[:-1], filled], reward_compute_s=sample.reward_compute_s)
 
 

@@ -1,4 +1,4 @@
-"""Cosmos3 text-to-image diffusion: per-step packed forward with CFG and the rollout stage (README.md)."""
+"""Cosmos3 text-to-image and image-to-video diffusion: per-step packed forward with CFG and the rollout stage."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from unirl.config.require import require
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
-from unirl.types.conditions import TextTokenCondition
+from unirl.types.conditions import ImageLatentCondition, TextTokenCondition
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -27,21 +27,29 @@ class Cosmos3DiffusionStep(DiffusionStep[Cosmos3Bundle, Cosmos3Conditions]):
         self.pipe = pipe
 
     def _velocity(
-        self, model: Cosmos3Bundle, text: TextTokenCondition, sample: torch.Tensor, timestep: torch.Tensor
+        self,
+        model: Cosmos3Bundle,
+        text: TextTokenCondition,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        image_latent: Optional[ImageLatentCondition] = None,
     ) -> torch.Tensor:
-        """One packed forward for one prompt; ``timestep`` is a 0-d fp32 ``sigma * 1000``."""
+        """One packed forward on the generated frames ``sample``; ``timestep`` is a 0-d fp32 ``sigma * 1000``."""
+        tokens, clean_frames = sample, 0
+        if image_latent is not None:  # frame 0 is never noised
+            tokens, clean_frames = torch.cat([image_latent.latents.to(sample.device), sample], dim=2), 1
         kwargs, meta = pack_joint_sequence(
             self.pipe,
             input_ids=text.input_ids[0][text.attention_mask[0].bool()].tolist(),
-            vision_tokens=sample,
-            condition_frame_indexes=(),
+            vision_tokens=tokens,
+            condition_frame_indexes=range(clean_frames),
             vision_fps=model.config.fps,
             device=sample.device,
             compute_dtype=model.dtype,
         )
         kwargs["vision_timesteps"] = timestep.expand(meta["num_noisy_vision_tokens"])
         preds_vision = model.transformer(**kwargs)[0]  # [0] is vision on the 0.39 tuple and the 0.40 output object
-        return preds_vision[0].reshape(sample.shape)
+        return preds_vision[0].reshape(tokens.shape)[:, :, clean_frames:]
 
     def predict_noise(
         self,
@@ -52,22 +60,22 @@ class Cosmos3DiffusionStep(DiffusionStep[Cosmos3Bundle, Cosmos3Conditions]):
         *,
         guidance_scale: float,
     ) -> torch.Tensor:
-        """Guided velocity ``[1, C, 1, H, W]`` for one sample at fp32 scalar ``sigma``."""
+        """Guided velocity ``[1, C, T_gen, H, W]`` for one sample's generated frames at fp32 scalar ``sigma``."""
         require(conditions.text is not None, "Cosmos3DiffusionStep.predict_noise: conditions.text is None")
         require(
-            sample.ndim == 5 and sample.shape[0] == 1 and sample.shape[2] == 1,
-            f"Cosmos3DiffusionStep.predict_noise: expected sample [1, C, 1, H, W], got {tuple(sample.shape)}",
+            sample.ndim == 5 and sample.shape[0] == 1,
+            f"Cosmos3DiffusionStep.predict_noise: expected sample [1, C, T_gen, H, W], got {tuple(sample.shape)}",
         )
         timestep = sigma.to(device=sample.device, dtype=torch.float32).reshape(())
         timestep = timestep * self.pipe.scheduler.config.num_train_timesteps
-        cond = self._velocity(model, conditions.text, sample, timestep)
+        cond = self._velocity(model, conditions.text, sample, timestep, conditions.image_latent)
         if guidance_scale == 1.0:
             return cond
         require(
             conditions.negative_text is not None,
             "Cosmos3DiffusionStep.predict_noise: guidance_scale != 1 requires conditions.negative_text",
         )
-        uncond = self._velocity(model, conditions.negative_text, sample, timestep)
+        uncond = self._velocity(model, conditions.negative_text, sample, timestep, conditions.image_latent)
         return uncond + guidance_scale * (cond - uncond)
 
     def forward(
@@ -128,7 +136,7 @@ class Cosmos3DiffusionStep(DiffusionStep[Cosmos3Bundle, Cosmos3Conditions]):
 
 
 class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
-    """Cosmos3 single-frame rollout stage; samples run one at a time (packed single-sample interface)."""
+    """Cosmos3 rollout stage over the generated latent frames; samples run one at a time (README # Generation)."""
 
     def __init__(
         self,
@@ -153,11 +161,21 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
-        """Sample ``B`` single-frame latents; ``LatentSegment.latents`` is ``[B, K, C, 1, H_lat, W_lat]``."""
+        """Sample ``B`` generated-frame latents; ``LatentSegment.latents`` is ``[B, K, C, T_gen, H_lat, W_lat]``."""
         from unirl.sde.noise import generate_latents
 
+        vae_config = self.model.vae.config
+        generated_frames, remainder = divmod(params.num_frames - 1, vae_config.scale_factor_temporal)
         require(
-            params.num_frames == 1, f"Cosmos3DiffusionStage: only num_frames=1 is supported, got {params.num_frames}"
+            params.num_frames >= 1 and remainder == 0,
+            f"Cosmos3DiffusionStage.diffuse: num_frames must be 1 + a multiple of "
+            f"{vae_config.scale_factor_temporal}, got {params.num_frames}",
+        )
+        require(
+            (params.num_frames == 1) == (conditions.image_latent is None),
+            f"Cosmos3DiffusionStage.diffuse: num_frames={params.num_frames} with image_latent "
+            f"{'absent' if conditions.image_latent is None else 'present'}; video needs a source image and a "
+            "single frame takes none (README # Generation)",
         )
         time_embedder_dtype = next(self.model.transformer.time_embedder.parameters()).dtype
         require(
@@ -173,9 +191,8 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
             f"Cosmos3DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={total_steps + 1}",
         )
         schedule = schedule.to(device)
-        vae_config = self.model.vae.config
         scale = vae_config.scale_factor_spatial
-        expected = (vae_config.z_dim, 1, params.height // scale, params.width // scale)
+        expected = (vae_config.z_dim, max(generated_frames, 1), params.height // scale, params.width // scale)
         if initial_latents is None:
             initial_latents = generate_latents(
                 batch_size=batch_size,
@@ -246,7 +263,7 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        """Recompute SDE log-probs ``[B, S]`` and means ``[B, S, C, 1, H_lat, W_lat]`` with gradients."""
+        """Recompute SDE log-probs ``[B, S]`` and means ``[B, S, C, T_gen, H_lat, W_lat]`` with gradients."""
         require(
             all(x is not None for x in (segment.sde_indices, segment.indices, segment.latents, segment.sigmas)),
             "Cosmos3DiffusionStage.replay requires segment sde_indices, indices, latents and sigmas",
@@ -295,7 +312,7 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        """Guided velocity for ``sample`` ``[B, C, 1, H_lat, W_lat]`` at scalar or per-sample ``sigma``."""
+        """Guided velocity for ``sample`` ``[B, C, T_gen, H_lat, W_lat]`` at scalar or per-sample ``sigma``."""
         sigma = sigma.reshape(-1).expand(sample.shape[0])
         return torch.cat(
             [
