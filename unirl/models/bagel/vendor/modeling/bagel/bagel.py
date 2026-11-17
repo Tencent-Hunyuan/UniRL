@@ -17,7 +17,7 @@ from unirl.models.bagel.vendor.data.data_utils import (
     get_flattened_position_ids_interpolate,
     patchify, 
 )
-from .qwen2_navit import NaiveCache
+from .qwen2_navit import NaiveCache, apply_by_sequence
 from .modeling_utils import MLPconnector, TimestepEmbedder, PositionEmbedding
 from unirl.models.bagel.vendor.modeling.cache_utils.taylorseer import cache_init
 
@@ -792,15 +792,29 @@ class Bagel(PreTrainedModel):
         model_pred_text_current: Optional[int] = None,
         model_pred_img_cache_dic: Optional[Dict[str, Any]] = None,
         model_pred_img_current: Optional[int] = None,
+        split_sequences: bool = False,
     ):
         packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
-        assert timestep.unique().shape[0] == 1
+        if timestep.ndim != 1 or timestep.shape[0] != x_t.shape[0]:
+            raise ValueError(
+                f"timestep must contain one value per latent token, got {tuple(timestep.shape)} for {x_t.shape[0]}"
+            )
+        sequence_lengths = packed_seqlens.tolist() if split_sequences else None
+        latent_lengths = (packed_seqlens - 2).tolist() if split_sequences else None
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
-        packed_timestep_embeds = self.time_embedder(timestep)
-        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        packed_timestep_embeds = apply_by_sequence(
+            self.time_embedder,
+            timestep,
+            latent_lengths,
+        )
+        x_t = (
+            apply_by_sequence(self.vae2llm, x_t, latent_lengths)
+            + packed_timestep_embeds
+            + packed_pos_embed
+        )
         if x_t.dtype != packed_sequence.dtype:
             x_t = x_t.to(packed_sequence.dtype)
         packed_sequence[packed_vae_token_indexes] = x_t
@@ -810,9 +824,10 @@ class Bagel(PreTrainedModel):
             extra_inputs = {
                 "mode": "gen",
                 "packed_vae_token_indexes": packed_vae_token_indexes,
-                "packed_text_indexes": packed_text_indexes
+                "packed_text_indexes": packed_text_indexes,
+                "sequence_lengths": sequence_lengths,
             }
-        
+
         if self.language_model.model.enable_taylorseer:
             self.language_model.model.cache_dic = model_pred_cache_dic
             self.language_model.model.current = model_pred_current
@@ -829,7 +844,11 @@ class Bagel(PreTrainedModel):
             is_causal=False,
             **extra_inputs,
         )
-        v_t = self.llm2vae(output.packed_query_sequence)
+        v_t = apply_by_sequence(
+            self.llm2vae,
+            output.packed_query_sequence,
+            sequence_lengths,
+        )
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
@@ -848,7 +867,11 @@ class Bagel(PreTrainedModel):
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
+            cfg_text_v_t = apply_by_sequence(
+                self.llm2vae,
+                cfg_text_output.packed_query_sequence,
+                sequence_lengths,
+            )
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
@@ -867,7 +890,11 @@ class Bagel(PreTrainedModel):
                 is_causal=False,
                 **extra_inputs,
             )
-            cfg_img_v_t = self.llm2vae(cfg_img_output.packed_query_sequence)
+            cfg_img_v_t = apply_by_sequence(
+                self.llm2vae,
+                cfg_img_output.packed_query_sequence,
+                sequence_lengths,
+            )
             cfg_img_v_t = cfg_img_v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:

@@ -20,9 +20,9 @@ class LTX2Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        vae: Optional[nn.Module],
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         connectors: Optional[nn.Module],
         scheduler: Any,
         dtype: torch.dtype,
@@ -76,28 +76,36 @@ class LTX2Bundle(Bundle):
         transformer = LTX2VideoTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
         transformer = transformer.to(device, dtype=dtype)
 
-        vae = (
-            AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-            .to(aux_device)
-            .eval()
-        )
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(aux_device)
+                .eval()
+            )
+            vae.requires_grad_(False)
 
-        text_encoder = (
-            Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(aux_device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        connectors: Optional[nn.Module] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(aux_device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+            tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+            from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
-        connectors = (
-            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(aux_device).eval()
-        )
-        connectors.requires_grad_(False)
+            connectors = (
+                LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype)
+                .to(aux_device)
+                .eval()
+            )
+            connectors.requires_grad_(False)
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 

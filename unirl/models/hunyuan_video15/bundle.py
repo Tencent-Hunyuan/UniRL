@@ -22,10 +22,10 @@ class HunyuanVideo15Bundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        tokenizer: Any,
-        text_encoder_2: nn.Module,
-        tokenizer_2: Any,
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
+        text_encoder_2: Optional[nn.Module],
+        tokenizer_2: Optional[Any],
         vision_encoder: Optional[nn.Module],
         image_processor: Optional[Any],
         scheduler: Any,
@@ -104,19 +104,26 @@ class HunyuanVideo15Bundle(Bundle):
             )
             vae.requires_grad_(False)
 
-        text_encoder = (
-            Qwen2_5_VLTextModel.from_pretrained(te1_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
-        tokenizer = Qwen2Tokenizer.from_pretrained(te1_path, subfolder="tokenizer")
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        text_encoder_2: Optional[nn.Module] = None
+        tokenizer_2: Optional[Any] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                Qwen2_5_VLTextModel.from_pretrained(te1_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
+            tokenizer = Qwen2Tokenizer.from_pretrained(te1_path, subfolder="tokenizer")
 
-        text_encoder_2 = (
-            T5EncoderModel.from_pretrained(te2_path, subfolder="text_encoder_2", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder_2.requires_grad_(False)
-        tokenizer_2 = ByT5Tokenizer.from_pretrained(te2_path, subfolder="tokenizer_2")
+            text_encoder_2 = (
+                T5EncoderModel.from_pretrained(te2_path, subfolder="text_encoder_2", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder_2.requires_grad_(False)
+            tokenizer_2 = ByT5Tokenizer.from_pretrained(te2_path, subfolder="tokenizer_2")
 
         vision_encoder: Optional[nn.Module] = None
         image_processor: Optional[Any] = None

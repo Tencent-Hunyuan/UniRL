@@ -50,7 +50,9 @@ not just three-tensor arithmetic.
   DiffusionOPD is the teacher-anchored family — a per-step Gaussian KL against frozen
   teacher LoRA adapters (backend-owned `frozen_adapters`), distillation rather than RL:
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
-  (`diffusionopd.py`).
+  (`diffusionopd.py`). AROPD is its AR sibling — a gap-weighted stop-gradient policy
+  gradient over the student's own sampled tokens against one frozen-LoRA same-backbone
+  teacher (`aropd.py`).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare
@@ -73,6 +75,16 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **`old_logp_source: rollout` with a replay-only engine** — a separate-worker
   SGLang rollout emits no per-step `sde_logp`, so the `rollout` source raises in
   `prepare_segment`. Use `replay` (the cost is one extra `torch.no_grad` replay).
+- **`timestep_chunk_size` bounds replay graph residency** — set it and
+  `FlowGRPO` / `FlowDPPO` replay and backward SDE steps in slices of that size,
+  each scaled by `len(chunk)/S` so the summed gradient matches the default
+  single backward (DiffusionNFT's `iter_scale` pattern; the optimizer boundary
+  stays with `TrainStack`). `prepare_segment` slices replay anchors with the
+  same chunks so `batch_replay_steps: true` plus `timestep_chunk_size: k`
+  evaluates `[k * B]` batches identically in anchor and training passes. `None`
+  (default) keeps the current behavior, whose resident graph grows with S even
+  at `micro_batch_size: 1`. Each extra backward adds a reduce-scatter, and bf16
+  autocast accumulation differs from the single backward (matches in fp32).
 - **`num_updates_per_batch > 1` on DiffusionNFT** raises in `TrainStack.__init__` — DiffusionNFT keeps
   the default `supports_multi_update = False`. Multi-update algorithms freeze their
   declared anchors: `FlowGRPO`/`FlowDPPO` prepare `sde_logp`; `GRPO` always reuses
@@ -101,6 +113,21 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
   *not* the request Sample's actual temperature, biasing every ratio with no raise. Watch
   `rollout_replay_logp_absdiff_mean` — it should be ~0 on an on-policy step.
+- **AROPD is a policy gradient, not token KD** — the OPD objective is
+  `max_θ E_{a~π_θ}[log π_T(a)]` over the *student's own* sampled tokens.
+  `loss = −Σ sg(teacher_logp − new_logp)·new_logp / Σmask` implements its
+  score-function estimator plus the entropy term `∇H(π_θ)`, i.e. per-token
+  reverse-KL descent (a per-token factorization, not the exact gradient of
+  sequence-level `KL(π_θ‖π_T)`, which weights each token by the reward-to-go).
+  Backpropping `mean(new_logp − teacher_logp)` instead has gradient
+  `mean(∇log π_θ)` — zero in expectation, and the gap's sign never enters. The
+  gap's student side is `new_logp.detach()` — current weights at the teacher
+  anchor's micro geometry — so the advantage carries no rollout↔replay drift;
+  `segment.log_probs` only feeds the `rollout_replay_*` gauges. `gap_clamp`
+  (default 10) is an elementwise, grouping-invariant bound that biases the
+  estimator when it clips (`gap_clipped_tokens` / `gap_active_tokens` — the ratio
+  of the two aggregated counters is the true token fraction); the gap
+  metrics report raw unclamped nats, so `teacher_gap_abs_mean` may exceed it.
 - **DiffusionNFT's `ref_deviation_coef > 0` anchors to the LoRA-disabled base, not the EMA shadow** — the
   shadow tracks the policy by construction, so anchoring to it would bound no drift. The reference
   is a third `predict_noise_at_step` per trained timestep, on top of the trainable and shadow ones;
@@ -116,12 +143,12 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   with the anchor swapped from the EMA shadow to the LoRA-disabled base, so the two share a scale
   and can be read side by side as drift-from-shadow against drift-from-base. DiffusionNFT trains on
   a freshly noised `xt` rather than the rollout trajectory, so it has no `stage.replay` step indices
-  to hand `_transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
+  to hand `transition_sigma`. `segment.sigmas` is present (`train_timestep_mode: all` requires it)
   and so is `t_batch`, so a time weight is available if one is ever wanted; what is absent is the SDE
   transition std itself, because every NFT recipe runs `eta: 0.0` and that std vanishes with `eta` —
   the same trap the DiffusionOPD bullet above raises on. That leaves the `add_kl_coefficient=false`
   variant minus the `/2`, so the number is **not** comparable to FlowGRPO/FlowDPPO's `kl_ref_mean`, which carries
-  `_gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
+  `gaussian_kl_div`'s `/(2σ²)`. Measuring on the prediction rather than the reconstructed `x0`
   drops the `t²` Jacobian of `xt - t*pred`, spreading pressure uniformly over trained timesteps
   instead of `t²`-weighting it — the magnitude still moves with `t` (training lower timesteps raises
   it several-fold).

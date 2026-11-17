@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import List, Tuple
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage, dedup_prompts
+from unirl.models.types.embedding import EmbedStage, embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -32,9 +33,12 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         self.bundle = bundle
         self.max_sequence_length = int(max_sequence_length)
         self.extraction_layers = tuple(extraction_layers)
+        self._cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed(self, p: Texts) -> TextEmbedCondition:
-        prompts, inverse = dedup_prompts(p.texts)
+        return embed_with_cpu_cache(p.texts, self._cache, self._encode, device=self.bundle.device)
+
+    def _encode(self, prompts: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -112,11 +116,10 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 index=seq_lens.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
             ).squeeze(1)
             pooled = eos_hidden[..., :POOLED_DIM].to(dtype=dtype)
-        cond = TextEmbedCondition(
+        return TextEmbedCondition(
             embeds=prompt_embeds,
             pooled=pooled,
         )
-        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["Flux2KleinTextEmbedStage"]

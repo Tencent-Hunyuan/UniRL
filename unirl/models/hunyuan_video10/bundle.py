@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -21,11 +21,11 @@ class HunyuanVideo10Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
-        text_encoder: nn.Module,
-        tokenizer: Any,
-        text_encoder_2: nn.Module,
-        tokenizer_2: Any,
+        vae: Optional[nn.Module],
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
+        text_encoder_2: Optional[nn.Module],
+        tokenizer_2: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -81,26 +81,35 @@ class HunyuanVideo10Bundle(Bundle):
             )
             transformer = transformer.to(device=device, dtype=dtype)
 
-        vae = (
-            AutoencoderKLHunyuanVideo.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-            .to(device)
-            .eval()
-        )
-        if config.vae_use_tiling:
-            vae.enable_tiling()
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLHunyuanVideo.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(device)
+                .eval()
+            )
+            if config.vae_use_tiling:
+                vae.enable_tiling()
+            vae.requires_grad_(False)
 
-        text_encoder = (
-            LlamaModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder.requires_grad_(False)
-        tokenizer = LlamaTokenizerFast.from_pretrained(te_path, subfolder="tokenizer")
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        text_encoder_2: Optional[nn.Module] = None
+        tokenizer_2: Optional[Any] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                LlamaModel.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype).to(device).eval()
+            )
+            text_encoder.requires_grad_(False)
+            tokenizer = LlamaTokenizerFast.from_pretrained(te_path, subfolder="tokenizer")
 
-        text_encoder_2 = (
-            CLIPTextModel.from_pretrained(te_path, subfolder="text_encoder_2", torch_dtype=te_dtype).to(device).eval()
-        )
-        text_encoder_2.requires_grad_(False)
-        tokenizer_2 = CLIPTokenizer.from_pretrained(te_path, subfolder="tokenizer_2")
+            text_encoder_2 = (
+                CLIPTextModel.from_pretrained(te_path, subfolder="text_encoder_2", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder_2.requires_grad_(False)
+            tokenizer_2 = CLIPTokenizer.from_pretrained(te_path, subfolder="tokenizer_2")
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 

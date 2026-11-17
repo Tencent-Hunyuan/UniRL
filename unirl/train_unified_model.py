@@ -32,6 +32,7 @@ def main(cfg: DictConfig) -> None:
         logging_cfg=cfg.get("logging"),
         enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
         rollout_pipeline_chunks=cfg.get("rollout_pipeline_chunks", 1),
+        ar_num_replicas=cfg.get("ar_num_replicas"),
         eval_interval=cfg.get("eval_interval", 0),
         eval_num_prompts=cfg.get("eval_num_prompts", cfg.batch_size),
         eval_cfg_text_scale=cfg.get("eval_cfg_text_scale", 4.0),

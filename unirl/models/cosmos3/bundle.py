@@ -262,7 +262,9 @@ class Cosmos3Bundle(Bundle):
             transformer_weights_path = resolve_meta_init_weights(path, component="transformer")
             transformer_config = Cosmos3OmniTransformer.load_config(path, subfolder="transformer")
             transformer, meta_init_state = build_meta_init_transformer(
-                lambda: Cosmos3OmniTransformer.from_config(transformer_config), dtype=master_dtype
+                lambda: Cosmos3OmniTransformer.from_config(transformer_config),
+                dtype=master_dtype,
+                keep_in_fp32=Cosmos3OmniTransformer._keep_in_fp32_modules,
             )
         else:
             transformer = Cosmos3OmniTransformer.from_pretrained(
@@ -270,7 +272,7 @@ class Cosmos3Bundle(Bundle):
                 subfolder="transformer",
                 torch_dtype=master_dtype,
             )
-            transformer = transformer.to(device=device, dtype=master_dtype)
+            transformer = transformer.to(device)  # no dtype: from_pretrained kept time_embedder fp32 (README # Gotchas)
         if _needs_h20_cu128_workaround():
             logger.warning(
                 "Cosmos3Bundle: enabling H20 torch-2.10/cu128 cuBLAS workarounds; "

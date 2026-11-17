@@ -181,14 +181,6 @@ class QwenImageEditPlusDiffusionStep(QwenImageDiffusionStep):
 class QwenImageEditPlusDiffusionStage(QwenImageDiffusionStage):
     """Edit-Plus rollout-level diffusion stage — inherits the loop unchanged."""
 
-    @staticmethod
-    def _tile_conditions(
-        conditions: QwenImageEditPlusConditions,
-        repeats: int,
-    ) -> QwenImageEditPlusConditions:
-        """Tile text and ragged image conditions in step-major order."""
-        return QwenImageEditPlusConditions.concat([conditions] * repeats)
-
 
 __all__ = [
     "QwenImageEditPlusDiffusionStage",

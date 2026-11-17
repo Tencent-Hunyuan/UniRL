@@ -73,6 +73,7 @@ class MiniMaxH3Pipeline(Pipeline):
                 audio_joint_sde=config.audio_joint_sde,
                 trajectory_precision=config.trajectory_precision,
                 logprob_precision=config.logprob_precision,
+                batch_replay_steps=config.batch_replay_steps,
             ),
             video_decode=MiniMaxH3VideoDecodeStage(bundle),
             audio_decode=MiniMaxH3AudioDecodeStage(bundle),

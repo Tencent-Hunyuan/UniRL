@@ -26,6 +26,7 @@ class HunyuanVideo15PipelineConfig:
     autocast_precision: str = "bf16"
     trajectory_precision: str = "fp16"
     logprob_precision: str = "fp32"
+    batch_replay_steps: bool = False
 
     shift: float = 5.0
 
@@ -45,6 +46,7 @@ class HunyuanVideo15PipelineConfig:
     load_vision_encoder: bool = False
 
     load_vae: bool = True
+    load_text_encoder: bool = True
 
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None

@@ -18,7 +18,7 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _resolve_reference_model,
+    resolve_reference_model,
     typed_conditions,
 )
 
@@ -102,7 +102,7 @@ class DiffusionNFT(StageAlgorithm):
         # The reference is the LoRA-disabled base policy, not the EMA shadow: the
         # shadow tracks the policy, so it cannot anchor drift away from it. Resolved
         # after the scalar checks — it walks `named_parameters()` to find the adapter.
-        self._ref_model = _resolve_reference_model(
+        self._ref_model = resolve_reference_model(
             backend, beta=float(ref_deviation_coef), algo="DiffusionNFT", coef_name="ref_deviation_coef"
         )
         self.config = DiffusionNFTConfig(
@@ -199,7 +199,7 @@ class DiffusionNFT(StageAlgorithm):
             )
 
         return AlgorithmStepResult(
-            loss=float(total_loss),
+            loss=float(total_loss / K),
             metrics=agg,
             num_steps_or_tokens=K,
             has_backward=has_backward,

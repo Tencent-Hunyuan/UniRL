@@ -11,9 +11,9 @@ import torch
 from unirl.algorithms.base import (
     AlgorithmStepResult,
     StageAlgorithm,
-    _gaussian_kl_div,
-    _transition_sigma,
     gather_sde_field,
+    gaussian_kl_div,
+    transition_sigma,
     typed_conditions,
 )
 from unirl.train.lora import adapter_active, adapter_names
@@ -192,7 +192,7 @@ class DiffusionOPD(StageAlgorithm):
         # Replay means are fp32 by contract; align the stored teacher anchor before squaring.
         teacher_f32 = teacher_means.to(device=student_means.device, dtype=torch.float32)
 
-        sigma_t = _transition_sigma(
+        sigma_t = transition_sigma(
             self.stage,
             segment=segment,
             target_steps=target_steps,
@@ -200,7 +200,7 @@ class DiffusionOPD(StageAlgorithm):
             device=student_means.device,
             add_coefficient=self.add_kl_coefficient,
         )
-        kl_per_elem = _gaussian_kl_div(student_means, teacher_f32, sigma_t)
+        kl_per_elem = gaussian_kl_div(student_means, teacher_f32, sigma_t)
         kl_per_sample_step = kl_per_elem.mean(dim=tuple(range(2, kl_per_elem.ndim)))  # [B, S']
         loss = kl_per_sample_step.mean()
 

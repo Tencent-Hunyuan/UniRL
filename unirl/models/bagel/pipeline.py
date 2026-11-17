@@ -63,6 +63,7 @@ class BagelPipeline(Pipeline):
         max_prompt_length: int = 8192,
         cache_t2i_contexts: Optional[bool] = None,
         context_cache_size: Optional[int] = None,
+        batch_replay_steps: bool = False,
         forward_batch_size: Optional[int] = 1,
     ) -> None:
         super().__init__()
@@ -78,6 +79,7 @@ class BagelPipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else BagelVAEDecodeStage(bundle)
@@ -129,6 +131,7 @@ class BagelPipeline(Pipeline):
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
             shift=config.shift,
+            batch_replay_steps=config.batch_replay_steps,
         )
 
     def _autocast_ctx(self):

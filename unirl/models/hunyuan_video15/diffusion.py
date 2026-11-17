@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import ClassVar, Dict, List, Optional, Set, Tuple
+from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
+from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import GeneratorLike, StepStrategy
@@ -24,6 +25,15 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
 
     TIMESTEP_SCALE: ClassVar[float] = 1000.0
 
+    def __init__(
+        self,
+        *,
+        vision_num_semantic_tokens: int,
+        vision_states_dim: int,
+    ) -> None:
+        self.vision_num_semantic_tokens = vision_num_semantic_tokens
+        self.vision_states_dim = vision_states_dim
+
     def predict_noise(
         self,
         model: HunyuanVideo15Bundle,
@@ -32,8 +42,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         conditions: HunyuanVideo15Conditions,
         *,
         guidance_scale: float,
-        vision_num_semantic_tokens: int,
-        vision_states_dim: int,
     ) -> torch.Tensor:
         """Pack the latent stream ``[B, C, T_lat, H_lat, W_lat]``, run the transformer, optionally apply CFG."""
         text_mllm = conditions.text_mllm
@@ -67,8 +75,8 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
 
         image_embeds = torch.zeros(
             batch_size,
-            int(vision_num_semantic_tokens),
-            int(vision_states_dim),
+            self.vision_num_semantic_tokens,
+            self.vision_states_dim,
             device=device,
             dtype=dtype,
         )
@@ -174,8 +182,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
-        vision_num_semantic_tokens: int = 729,
-        vision_states_dim: int = 1152,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(
@@ -184,8 +190,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             sigma,
             conditions,
             guidance_scale=guidance_scale,
-            vision_num_semantic_tokens=vision_num_semantic_tokens,
-            vision_states_dim=vision_states_dim,
         )
         return self.forward(
             strategy=strategy,
@@ -215,8 +219,6 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
-        vision_num_semantic_tokens: int = 729,
-        vision_states_dim: int = 1152,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition."""
         return self.step(
@@ -232,12 +234,10 @@ class HunyuanVideo15DiffusionStep(DiffusionStep[HunyuanVideo15Bundle, HunyuanVid
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
-            vision_num_semantic_tokens=vision_num_semantic_tokens,
-            vision_states_dim=vision_states_dim,
         )
 
 
-class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
+class HunyuanVideo15DiffusionStage(BatchedStepReplayMixin, DiffusionStage[HunyuanVideo15Conditions]):
     """HunyuanVideo-1.5 rollout-level diffusion stage."""
 
     _no_split_modules: ClassVar[Tuple[str, ...]] = (
@@ -260,11 +260,10 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         autocast_precision: str = "bf16",
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
-        vision_num_semantic_tokens: int = 729,
-        vision_states_dim: int = 1152,
         spatial_compression_ratio: Optional[int] = None,
         temporal_compression_ratio: Optional[int] = None,
         latent_channels: Optional[int] = None,
+        batch_replay_steps: bool,
     ) -> None:
         self.model = model
         self.step = step
@@ -272,8 +271,7 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="autocast_precision")
         self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
-        self.vision_num_semantic_tokens = int(vision_num_semantic_tokens)
-        self.vision_states_dim = int(vision_states_dim)
+        self.batch_replay_steps = batch_replay_steps
 
         vae = model.vae
         if vae is not None:
@@ -379,11 +377,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         )
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
-        step_kwargs: Dict = {
-            "vision_num_semantic_tokens": self.vision_num_semantic_tokens,
-            "vision_states_dim": self.vision_states_dim,
-        }
-
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
@@ -411,7 +404,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
                     generator=step_generators,
                     sigma_max=sigma_max,
                     step_index=i,
-                    **step_kwargs,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 
@@ -446,74 +438,21 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Segment-based log-prob replay over the rollout's SDE transitions."""
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("HunyuanVideo15DiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("HunyuanVideo15DiffusionStage.replay: segment.sigmas missing")
-        if segment.latents.ndim != 6:
-            raise ValueError(
-                f"HunyuanVideo15DiffusionStage.replay: expected latents "
-                f"[B, K, C, T_lat, H_lat, W_lat], got {tuple(segment.latents.shape)}"
-            )
-
-        sde_set = set(segment.sde_indices.tolist())
-        target = list(step_indices) if step_indices is not None else segment.sde_indices.tolist()
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"HunyuanVideo15DiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = float(sigmas[1].item()) if int(sigmas.shape[0]) > 1 else 0.99
-
+        device = segment.latents.device if segment.latents is not None else torch.device("cpu")
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-
-        step_kwargs: Dict = {
-            "vision_num_semantic_tokens": self.vision_num_semantic_tokens,
-            "vision_states_dim": self.vision_states_dim,
-        }
-
-        log_probs: List[torch.Tensor] = []
-        prev_sample_means: List[torch.Tensor] = []
         with autocast_ctx:
-            for step_idx in target:
-                sigma = sigmas[step_idx].to(dtype=torch.float32)
-                sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                sample = segment.latents_at(step_idx)
-                prev_sample = segment.latents_at(step_idx + 1)
-                _, log_prob, prev_mean = self.step.step_with_logp(
-                    self.model,
-                    conditions,
-                    strategy=self.strategy,
-                    sample=sample,
-                    prev_sample=prev_sample,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
-                    guidance_scale=params.guidance_scale,
-                    eta=params.eta,
-                    sigma_max=sigma_max,
-                    step_index=step_idx,
-                    **step_kwargs,
-                )
-                if log_prob is None:
-                    raise RuntimeError(
-                        f"HunyuanVideo15DiffusionStage.replay: strategy returned "
-                        f"None log-prob at step_index={step_idx} (deterministic mode); "
-                        f"replay requires a stochastic SDE strategy."
-                    )
-                log_probs.append(log_prob)
-                if prev_mean is not None:
-                    prev_sample_means.append(prev_mean)
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
+            return self.replay_steps(
+                conditions,
+                segment=segment,
+                params=params,
+                step_indices=step_indices,
+                expected_ndim=6,
+                ndim_hint="[B, K, C, T_lat, H_lat, W_lat]",
+            )
 
     def predict_noise_at_step(
         self,
@@ -530,8 +469,6 @@ class HunyuanVideo15DiffusionStage(DiffusionStage[HunyuanVideo15Conditions]):
             sigma,
             conditions,
             guidance_scale=params.guidance_scale,
-            vision_num_semantic_tokens=self.vision_num_semantic_tokens,
-            vision_states_dim=self.vision_states_dim,
         )
 
     def trainable_module(self) -> "torch.nn.Module":

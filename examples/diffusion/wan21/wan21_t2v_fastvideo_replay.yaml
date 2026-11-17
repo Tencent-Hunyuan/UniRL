@@ -27,6 +27,8 @@ model_config:
   model_precision: bf16
   shift: 5.0
   max_sequence_length: 512
+  load_text_encoder: false
+  load_vae: false
 
 strategy:
   _target_: unirl.sde.kernels.FlowSDEStrategy
@@ -42,6 +44,7 @@ pipeline:
   trajectory_precision: fp16
   logprob_precision: fp32
   max_sequence_length: 512
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:

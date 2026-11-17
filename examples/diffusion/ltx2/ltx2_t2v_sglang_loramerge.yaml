@@ -46,11 +46,10 @@ model_config:
   default_num_frames: 9
   default_frame_rate: 24.0
   use_lora: false             # sglang serves a plain (merged full) transformer
-  # Park the frozen aux components (VAE, Gemma3, connectors) on CPU on the
-  # trainside: with sglang doing all generation/encode/decode, the trainside only
-  # replays the DiT, so these non-FSDP modules are dead weight that would otherwise
-  # stay GPU-resident during sglang generation and OOM the colocate DiT-resume.
-  aux_components_on_cpu: true
+  # With sglang doing all generation/encode/decode, the trainside only replays
+  # the DiT, so skip loading the frozen aux components (VAE, Gemma3, connectors).
+  load_text_encoder: false
+  load_vae: false
 
 strategy:
   _target_: unirl.sde.kernels.FlowSDEStrategy

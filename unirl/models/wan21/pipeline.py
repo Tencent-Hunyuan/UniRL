@@ -38,14 +38,13 @@ class WAN21Pipeline(Pipeline):
         trajectory_precision: str = "fp16",
         logprob_precision: str = "fp32",
         max_sequence_length: int = 512,
+        batch_replay_steps: bool = False,
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = (
-            text_embed
-            if text_embed is not None
-            else WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
-        )
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=int(max_sequence_length))
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = WAN21DiffusionStage(
                 model=bundle,
@@ -54,6 +53,7 @@ class WAN21Pipeline(Pipeline):
                 autocast_precision=autocast_precision,
                 trajectory_precision=trajectory_precision,
                 logprob_precision=logprob_precision,
+                batch_replay_steps=batch_replay_steps,
             )
         self.diffusion = diffusion
         self.vae_decode = vae_decode if vae_decode is not None else WAN21VAEDecodeStage(bundle)
@@ -83,7 +83,11 @@ class WAN21Pipeline(Pipeline):
     ) -> "WAN21Pipeline":
         """Build the full pipeline from a config."""
         bundle = WAN21Bundle.from_config(config)
-        text_embed = WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+        text_embed = (
+            WAN21TextEmbedStage(bundle, max_sequence_length=config.max_sequence_length)
+            if bundle.text_encoder is not None
+            else None
+        )
         step = WAN21DiffusionStep()
         diffusion = WAN21DiffusionStage(
             model=bundle,
@@ -92,6 +96,7 @@ class WAN21Pipeline(Pipeline):
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
+            batch_replay_steps=config.batch_replay_steps,
         )
         vae_decode = WAN21VAEDecodeStage(bundle)
         return cls(
@@ -114,6 +119,11 @@ class WAN21Pipeline(Pipeline):
             raise ValueError(
                 f"WAN21Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "WAN21Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
@@ -187,7 +197,12 @@ class WAN21Pipeline(Pipeline):
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
-            wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
+            wan_conds,
+            schedule=schedule,
+            params=params,
+            initial_latents=initial_latents,
+            denoise_seed_keys=frontier.sample_ids if initial_latents is not None else None,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
         videos = self.vae_decode.decode(latent_seg)
 
