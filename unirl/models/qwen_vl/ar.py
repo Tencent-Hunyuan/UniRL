@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import functools
-import inspect
 import logging
+from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -88,34 +88,44 @@ class QwenVLARStep(ARStep):
         return token_id, log_prob
 
 
-def _vision_rope_positions(
+def _mrope_position_ids(
     transformer: Any,
     input_ids: torch.Tensor,
+    image_mask: torch.Tensor,
     *,
     image_grid_thw: Optional[torch.Tensor],
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Call Qwen2.5-VL ``get_rope_index`` across transformers versions → ``[3, bs, seq]``."""
-    get_rope_index = transformer.model.get_rope_index
-    kwargs = {"image_grid_thw": image_grid_thw, "attention_mask": attention_mask}
-    if "mm_token_type_ids" in inspect.signature(get_rope_index).parameters:
-        cfg = transformer.config
-        mm_token_type_ids = torch.zeros_like(input_ids)
-        image_token_id = getattr(cfg, "image_token_id", None)
-        video_token_id = getattr(cfg, "video_token_id", None)
-        if image_token_id is not None:
-            mm_token_type_ids[input_ids == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[input_ids == video_token_id] = 2
-        position_ids, _ = get_rope_index(input_ids, mm_token_type_ids, **kwargs)
-    else:
-        position_ids, _ = get_rope_index(input_ids, **kwargs)
-    return position_ids
+    """Qwen2.5-VL ``[4, bs, seq]`` position ids: text positions, then M-RoPE (t, h, w) with images at ``image_mask``."""
+    vision_pos, _ = transformer.model.get_rope_index(
+        input_ids, image_mask.long(), image_grid_thw=image_grid_thw, attention_mask=attention_mask
+    )
+    text_pos = attention_mask.long().cumsum(-1) - 1
+    text_pos.masked_fill_(attention_mask == 0, 1)
+    return torch.cat([text_pos[None], vision_pos], dim=0)
+
+
+def _prompt_image_forward(self: Any, *, image_mask: Optional[torch.Tensor] = None, **kw: Any) -> Any:
+    """``forward`` filling image features only at ``image_mask`` ``[bs, seq]``; see ``unirl/models/README.md``."""
+    forward = type(self).forward
+    if image_mask is None:
+        return forward(self, **kw)
+    inputs_embeds = self.get_input_embeddings()(kw.pop("input_ids"))
+    image_embeds = self.model.get_image_features(kw.pop("pixel_values"), kw.pop("image_grid_thw")).pooler_output
+    image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+    n_image_tokens = int(image_mask.sum())
+    if n_image_tokens != image_embeds.shape[0]:
+        raise ValueError(
+            f"Image features and image tokens do not match, tokens: {n_image_tokens}, features: {image_embeds.shape[0]}"
+        )
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask.unsqueeze(-1), image_embeds)
+    return forward(self, inputs_embeds=inputs_embeds, **kw)
 
 
 class QwenVLARStage(ARStage[QwenVLARConditions]):
     def __init__(self, *, model: QwenVLBundle) -> None:
         self.model = model
+        model.transformer.forward = MethodType(_prompt_image_forward, model.transformer)
 
     def trainable_module(self) -> "torch.nn.Module":
         return self.model.transformer
@@ -159,15 +169,22 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
 
         if pv is not None:
             model_kwargs["pixel_values"] = pv
         if igt is not None:
             model_kwargs["image_grid_thw"] = igt
+            model_kwargs["position_ids"] = _mrope_position_ids(
+                transformer,
+                input_ids,
+                input_ids == transformer.config.image_token_id,
+                image_grid_thw=igt,
+                attention_mask=attention_mask,
+            )
 
         cur_input_ids = input_ids
+        next_sequence_length = int(input_ids.shape[1])
 
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
@@ -178,7 +195,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             prep_kwargs: Dict[str, Any] = {
                 "past_key_values": model_kwargs.get("past_key_values"),
                 "attention_mask": model_kwargs.get("attention_mask"),
-                "cache_position": model_kwargs.get("cache_position"),
+                "position_ids": model_kwargs.get("position_ids"),
+                "next_sequence_length": next_sequence_length,
                 "use_cache": True,
                 "logits_to_keep": 1,
             }
@@ -221,6 +239,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             cur_input_ids = torch.cat([cur_input_ids, token_id.unsqueeze(-1)], dim=1)
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
+            next_sequence_length = 1
             is_first_step = False
 
         return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
@@ -302,20 +321,20 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             "use_cache": False,
             "return_dict": True,
         }
+        image_mask = torch.zeros_like(full_ids, dtype=torch.bool)
+        image_mask[:, :max_real_len] = prompt_ids == self.model.transformer.config.image_token_id
         if pv is not None:
             forward_kwargs["pixel_values"] = pv
-        if igt is not None:
             forward_kwargs["image_grid_thw"] = igt
+            forward_kwargs["image_mask"] = image_mask
 
-        vision_pos = _vision_rope_positions(
+        forward_kwargs["position_ids"] = _mrope_position_ids(
             self.model.transformer,
             full_ids,
+            image_mask,
             image_grid_thw=igt,
             attention_mask=full_mask,
         )
-        text_pos = full_mask.long().cumsum(-1) - 1
-        text_pos.masked_fill_(full_mask == 0, 1)
-        forward_kwargs["position_ids"] = torch.cat([text_pos[None], vision_pos], dim=0)
 
         out = self.model.transformer(**forward_kwargs)
         logits = out.logits
@@ -373,7 +392,9 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         real_prompt_lens = prompt_mask.long().sum(dim=-1)
 
         cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
+        image_token_id = self.model.transformer.config.image_token_id
         streams: List[torch.Tensor] = []
+        mask_parts: List[torch.Tensor] = []
         pos_parts: List[torch.Tensor] = []
         pred_parts: List[torch.Tensor] = []
         offset = 0
@@ -383,15 +404,21 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
             assert n_p >= 1, "packed_replay: stream has 0 real prompt tokens"
             seq = torch.cat([prompt_ids[b, :n_p], flat_resp[cu_p[b] : cu_p[b] + n_r]])
             streams.append(seq)
+            stream_mask = torch.zeros_like(seq, dtype=torch.bool)
+            stream_mask[:n_p] = seq[:n_p] == image_token_id
+            mask_parts.append(stream_mask)
             one = seq.unsqueeze(0)
             grid = igt_list[b] if (igt_list is not None and igt_list[b] is not None) else None
             if grid is not None:
                 grid = grid.to(device)
-            vision_pos = _vision_rope_positions(
-                self.model.transformer, one, image_grid_thw=grid, attention_mask=torch.ones_like(one)
+            pos = _mrope_position_ids(
+                self.model.transformer,
+                one,
+                stream_mask.unsqueeze(0),
+                image_grid_thw=grid,
+                attention_mask=torch.ones_like(one),
             )
-            text_pos = torch.arange(seq.numel(), device=device).unsqueeze(0)
-            pos_parts.append(torch.cat([text_pos, vision_pos[:, 0, :]], dim=0))
+            pos_parts.append(pos[:, 0, :])
             if n_r > 0:
                 pred_parts.append(torch.arange(offset + n_p - 1, offset + n_p - 1 + n_r, device=device))
             offset += int(seq.numel())
@@ -412,8 +439,8 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         }
         if pv is not None:
             forward_kwargs["pixel_values"] = pv
-        if igt is not None:
             forward_kwargs["image_grid_thw"] = igt
+            forward_kwargs["image_mask"] = torch.cat(mask_parts).unsqueeze(0)  # [1, L]
 
         out = self.model.transformer(**forward_kwargs)
         pred_logits = out.logits[0].float()
