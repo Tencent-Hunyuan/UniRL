@@ -5,6 +5,7 @@
 # 480 tier), 16 steps, guidance 4.0, eta 0.7, two SDE steps per rollout drawn from steps 10-12.
 # Smoke-tested on 4x H100 80GB with torch 2.13 / cu130 at 8 prompts x 8 samples, 3 rollouts (peak 65 GiB allocated
 # per GPU, 70 GiB in nvidia-smi with the reward model); the bf16 base is not validated on H20.
+# The default scale, periodic evaluation and a reward trend are not validated.
 # Reward, evaluation and precision notes: unirl/models/cosmos3/README.md.
 #
 # DATA_PATH is a manifest with one source image per prompt:
