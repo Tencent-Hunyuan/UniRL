@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import torch
+
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
@@ -97,9 +99,10 @@ class PEPipeline(Pipeline):
         if M < 1:
             raise ValueError(f"PEPipeline.generate: diffusion branch M={M} must be >= 1")
 
+        source = input_part.primitives.get("image")
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
-            primitives={"text": prompts},
+            primitives={"text": prompts} if source is None else {"text": prompts, "image": source},
             control=ar_child_control(input_part.control, system_instruction=self.pe_instruction),
         )
         ar_out = self.llm_pipeline.generate(Sample(parts=[ar_input, ar_shell]))
@@ -135,7 +138,10 @@ class PEPipeline(Pipeline):
             rewritten = Texts(texts=cleaned_texts)
         ar_part = ar_part.fill(primitives={"text": rewritten})
 
-        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives={"text": rewritten})
+        pe_primitives = {"text": rewritten}
+        if source is not None:
+            pe_primitives["image"] = source.select(torch.arange(P).repeat_interleave(N))  # [P*N]
+        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives=pe_primitives)
         diff_child_shell = pe_input.fork(
             M,
             sampling_params=diff_shell.sampling_params,
