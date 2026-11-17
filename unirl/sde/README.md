@@ -145,3 +145,8 @@ independently of how many steps `num_sde_steps` draws per rollout.
   generates, so `PerSampleStepReplayMixin.replay_per_sample` pins it from `segment.sigmas` itself.
   Any new replay path that reads this coefficient must do the same: a silent 0 default would be
   correct only while every schedule's terminal σ happens to be 0.
+- **Keep scheduled `sigmas` as `fp32` GPU tensors through the denoise loop.** Do
+  not convert `sigmas` to Python floats via `.tolist()` or `float()` before stepping;
+  host scalars inside hot denoising loops force syncs, and explicit `fp32`
+  normalization avoids caller-dtype / `float64` drift. (`regen_initial_noise`
+  intentionally draws on CPU in `fp32` for cross-hardware `x_T` bit-identity.)

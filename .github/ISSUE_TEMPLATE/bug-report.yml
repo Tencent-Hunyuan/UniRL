@@ -40,8 +40,10 @@ body:
       options:
         - vLLM-Omni
         - SGLang
+        - SGLang-Diffusion
         - FastVideo
         - Train-side only
+        - Composed / PE
         - Install / docs / CI (no engine)
         - Other / mixed
     validations:
