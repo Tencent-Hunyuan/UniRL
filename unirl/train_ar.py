@@ -44,6 +44,7 @@ def main(cfg: DictConfig) -> None:
             eval_temperature=cfg.get("eval_temperature", 1.0),
             rollout_anchor_device=cfg.get("rollout_anchor_device", None),
             enable_fsdp_offload=cfg.get("enable_fsdp_offload", True),
+            accumulate_rollouts=cfg.get("accumulate_rollouts", 1),
         )
         guard.claim_signals()
         trainer.train(

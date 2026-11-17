@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from typing import List, Optional, Sequence
 
 import torch
@@ -26,6 +27,7 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
         pipeline: Pipeline,
         stage_attrs: Sequence[str] = ("diffusion",),
         forward_batch_size: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> None:
         self.pipeline = pipeline
         stages = [getattr(pipeline, a) for a in stage_attrs]
@@ -35,6 +37,9 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 f"TrainsideRolloutEngine.forward_batch_size must be >= 1 when set; got {forward_batch_size!r}"
             )
         self.forward_batch_size = forward_batch_size
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise ValueError("TrainsideRolloutEngine.seed must be an integer when set.")
+        self.seed = seed
         if any(isinstance(s, DiffusionStage) for s in stages):
             if hasattr(pipeline, "build_schedule_policy"):
                 self.schedule_policy = pipeline.build_schedule_policy()
@@ -74,7 +79,18 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
             for m in self.models:
                 m.eval()
             try:
-                with torch.no_grad():
+                devices = [torch.cuda.current_device()] if torch.cuda.is_available() else []
+                rng_scope = torch.random.fork_rng(devices=devices) if self.seed is not None else nullcontext()
+                with torch.no_grad(), rng_scope:
+                    if self.seed is not None:
+                        rollout_ids = {row["rollout_id"] for row in sample.parts[0].metadata}
+                        if len(rollout_ids) != 1:
+                            raise ValueError("Seeded trainside generation requires one rollout_id per request.")
+                        rank = self.rank_info
+                        seed = self.seed + rollout_ids.pop() * rank.dp_size + rank.dp_rank
+                        torch.random.default_generator.manual_seed(seed)
+                        if devices:
+                            torch.cuda.manual_seed(seed)
                     fbs = self.forward_batch_size
                     gen = sample.parts[-1]
                     bs = gen.batch_size
