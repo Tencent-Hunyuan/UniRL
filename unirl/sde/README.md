@@ -138,3 +138,8 @@ strategy in `PostWindowDPMStrategy` for the steps after the window.
   `ensure_sample_sigmas`. The tail keeps at least 2 points where the reference allows 1,
   because a 1-point tail never reaches σ=0, except when the window ends on the last step,
   where the schedule is the full one. `compress_ratio=1, order=1` is the plain Euler ODE.
+- **Keep scheduled `sigmas` as `fp32` GPU tensors through the denoise loop.** Do
+  not convert `sigmas` to Python floats via `.tolist()` or `float()` before stepping;
+  host scalars inside hot denoising loops force syncs, and explicit `fp32`
+  normalization avoids caller-dtype / `float64` drift. (`regen_initial_noise`
+  intentionally draws on CPU in `fp32` for cross-hardware `x_T` bit-identity.)

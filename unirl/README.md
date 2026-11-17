@@ -95,8 +95,14 @@ Directions the tree does not yet satisfy are left unlocked rather than hidden
 behind allowlists. The open debt, named so it is not copied as precedent:
 `models/` (`hunyuan_image3`, `qwen3_5`, `qwen3_moe`) reaches into
 `train/backend/veomni` (EP fusing / `_compat`), `models/cosmos3` subclasses the
-train-side SFT track builder, and `algorithms/` flips `train/lora` adapters.
-That is migration work, not a convention to copy.
+train-side SFT track builder, `algorithms/` flips `train/lora` adapters,
+`train/backend/sharded_load.py` imports VeOmni EP Qwen helpers,
+`utils/peft_merge.py` unpacks model internals, `distributed/weight_sync/full/tensor.py`
+sniffs adapter module names, and `rollout/engine/vllm_omni/pipelines/_shared/flow_match_sde_scheduler.py`
+duplicates `sde/` math. Additionally, `reward/`, `rollout/`, and `experimental/`
+boundaries are checked by [`lint/check_core_dependencies.py`](../lint/check_core_dependencies.py)
+and [`lint/check_experimental_boundaries.py`](../lint/check_experimental_boundaries.py).
+That debt is migration work, not a convention to copy.
 
 ## Where new code goes
 
@@ -106,16 +112,20 @@ That is migration work, not a convention to copy.
 | Generic dataset reading, batching, runtime normalization | `data/` |
 | One-off dataset download/conversion CLI | [`datasets/<dataset>/`](../datasets/README.md), repo root beside `unirl/` |
 | Loss, ratio/clip, advantage policy for one RL method | `algorithms/` |
-| Engine lifecycle or model↔engine wire translation | `rollout/engine/<backend>/` and its `adapters/` |
+| Engine lifecycle or model↔engine wire translation | `rollout/engine/<backend>/` and its `adapters/` (patches with `DELETE-WHEN`) |
 | Score construction and scorer-specific loading | `reward/` |
-| Optimizer, sharding, EMA/LoRA lifecycle | `train/` |
+| Optimizer, sharding, backend operators (FSDP2 / VeOmni SP+EP), EMA/LoRA lifecycle | `train/` |
 | Cross-component sequencing, placement, retries, checkpoints | `trainer/` |
 | Communication, tensor transport, device placement | `distributed/` |
 | Stable domain-agnostic leaf helper with multiple owners | a narrowly named module under `utils/` |
 
 Prefer a small amount of policy duplication over a shared base class that makes
 one model change touch several unrelated modules. Share mechanisms; keep model,
-algorithm, reward, and backend policy local.
+algorithm, reward, and backend policy local (promote a shared helper only on its
+second independent consumer). For backend composability constraints (such as
+mutually exclusive `sglang`/`vllm` extras in `pyproject.toml`), custom operators,
+and Class A/B/C host-device sync rules across training and rollout hot paths, see
+[`.claude/skills/development/hot-path-and-backend-changes/SKILL.md`](../.claude/skills/development/hot-path-and-backend-changes/SKILL.md).
 
 ## Deployment modes
 
