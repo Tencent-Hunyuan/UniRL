@@ -1,8 +1,10 @@
-# Cosmos3 (NVIDIA omnimodal world model) — SFT support
+# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image generation
 
-> **Where it fits:** one model package under [`unirl/models/`](../README.md), currently
-> train-loss only: `Cosmos3Pipeline.generate` is unimplemented; the package exists for the
-> two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`).
+> **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
+> two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
+> `Cosmos3Pipeline.generate` samples single-frame text-to-image. Trajectory replay is not
+> implemented: `Cosmos3DiffusionStage.replay` and `predict_noise_at_step` raise, so no RL
+> recipe ships yet.
 
 ## What it is
 
@@ -45,12 +47,13 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   runtime via `_needs_h20_cu128_workaround()`. Newer CUDA stacks may switch back to
   fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
-  (`_keep_in_fp32_modules = ["time_embedder"]`; the forward casts only *after* the
-  embedder). The shipped full-fp32 recipes satisfy this trivially. A future bf16
-  mixed-precision recipe must land an fp32 exemption for it (e.g. its own FSDP group with
-  an fp32 gather/reduce policy) together with that recipe — without one, the bf16
-  all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul rather than silently
-  coarsening the timestep signal.
+  (`_keep_in_fp32_modules = ["time_embedder"]`). The shipped full-fp32 recipes satisfy
+  this trivially. A future bf16 mixed-precision recipe must land an fp32 exemption for it
+  (e.g. its own FSDP group with an fp32 gather/reduce policy) together with that recipe.
+  Without one the outcome depends on the diffusers version: 0.39 casts only *after* the
+  embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul;
+  0.40 casts the sinusoid to the embedder's parameter dtype first, so the embedder
+  silently runs in bf16.
 - **Timestep conditioning stays continuous fp32** (`sigma * num_train_timesteps`, no
   rounding), matching NVIDIA's official training (`cosmos-framework`
   `omni_mot_model.py`: `timesteps = sigmas * max_timestep`, fp32). diffusers-0.39
@@ -95,8 +98,45 @@ inference see the same canvas. Manifest media entries use `role="target"` with
 `modality="video"` (frames) and `modality="action"` (chunk) — `"action"` is a supported
 `MediaRef` modality whose URI only this package's track builder consumes.
 
+## Generation
+
+`Cosmos3Pipeline.generate` covers `num_frames=1` only; `DiffusionSamplingParams.num_frames`
+defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
+loops over samples, because the transformer takes one packed sequence per call, and
+`Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence` with no condition frame.
+Latents are `[B, 48, 1, H/16, W/16]` for `nvidia/Cosmos3-Nano`. The sigma schedule comes
+from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
+constructor argument); the solver is the injected `StepStrategy`. The running latent is
+stored in `trajectory_precision` between steps.
+
 ## Gotchas
 
+- **CFG runs two transformer calls per step, not one batched call.** The cond and uncond
+  prompts have different token lengths and the forward takes a single unbatched sequence,
+  so `predict_noise` runs them one after the other and combines
+  `uncond + guidance_scale * (cond - uncond)`, like `Cosmos3OmniPipeline`.
+  `guidance_scale == 1.0` skips the uncond call.
+- **`build_schedule_policy` ignores the checkpoint's `scheduler_config.json`.** The shipped
+  config has `use_karras_sigmas: true`, under which diffusers drops `flow_shift`; official
+  examples override it with `flow_shift=10, use_karras_sigmas=False`. Pin sigmas on the
+  Sample to reproduce either one.
+- **Generation feeds continuous fp32 `sigma * 1000` timesteps; diffusers inference
+  truncates them to int64.** With matching sigmas, initial latents and `UniPCStrategy`,
+  flooring the timestep reproduces `Cosmos3OmniPipeline` latents bit-for-bit with fp32
+  weights (`nvidia/Cosmos3-Nano`, 832x480, 16 steps, guidance 4.0, H100,
+  `trajectory_precision="fp32"`).
+- **Each solver step runs in fp32 here and in the transformer dtype in diffusers 0.40.**
+  `Cosmos3OmniPipeline` casts the sampling latents to `transformer.dtype`, so with bf16
+  weights its UniPC arithmetic is bf16; `StepStrategy.denoise` promotes to fp32. With bf16
+  weights the final latents therefore differ from stock diffusers (relative RMS 0.05 to
+  0.17 over six prompt/seed pairs) and match bit-for-bit once the diffusers scheduler step
+  is given fp32 inputs. Both bf16 variants sit equally far from the fp32-weight result.
+- **The bundle loads `time_embedder` in fp32 for any `master_precision`.**
+  `from_pretrained` keeps it fp32 (`_keep_in_fp32_modules`), so the eager load moves the
+  transformer to the device without a dtype, and the meta-init load passes `keep_in_fp32`.
+  `Cosmos3DiffusionStage.diffuse` raises if the stored dtype is not fp32. That check reads
+  the stored parameter, so it does not catch an FSDP `mp_policy` that gathers the embedder
+  in bf16 for the forward (see Precision & loading).
 - The und-param regexes are anchored with trailing `\.` on purpose: `to_out` must not
   swallow `to_add_out`, and `norm.` must not swallow `norm_moe_gen.`. Touch
   `_UND_PARAM_PATTERNS` only with the freeze-count log line as your regression check.
@@ -108,8 +148,12 @@ inference see the same canvas. Manifest media entries use `role="target"` with
   stage's own helpers); it still reuses the generic `_media_uris` / `_require_local_uri`
   from `unirl/train/sft/track_builder.py`, whose builders stay model-agnostic.
 - diffusers>=0.39 is required (first release with `Cosmos3OmniTransformer` /
-  `Cosmos3OmniPipeline`); its `forward` returns the bare `(vision, sound, action)` tuple
-  and has no `return_dict`.
+  `Cosmos3OmniPipeline`). The transformer `forward` return differs by version: 0.39 has
+  no `return_dict` and returns the bare `(vision, sound, action)` tuple; 0.40 added
+  `return_dict=True` and returns a `Cosmos3OmniTransformerOutput` (`sample` / `sound` /
+  `action`) by default. That output is a `BaseOutput`, so tuple-unpacking it yields its
+  non-`None` field names rather than the three lists. `Cosmos3JointStage.predict_velocity`
+  reads both forms; passing `return_dict=False` instead would break 0.39.
 - The H20 workaround patches in `bundle.py` install frozen diffusers-0.39 copies of
   `DomainAwareLinear.forward`, `dispatch_attention_fn`, and the rotary `forward`. Because
   the pin is an open `diffusers>=0.39`, each patch first fingerprints the upstream

@@ -338,7 +338,7 @@ def _per_sample_rope(
         )
         position_parts.append(position_ids)
         delta_parts.append(torch.as_tensor(rope_delta, device=device).reshape(1, -1))
-    position_ids = torch.cat(position_parts, dim=1).long()
+    position_ids = torch.cat(position_parts, dim=1)  # [3, B, L] float: video temporal positions can be fractional
     rope_deltas = torch.cat(delta_parts, dim=0)
     rope_deltas = rope_deltas - (1 - attention_mask.long()).sum(dim=-1, keepdim=True)
     return position_ids, rope_deltas
@@ -403,7 +403,6 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             "attention_mask": attention_mask,
             "use_cache": True,
             "past_key_values": None,
-            "cache_position": torch.arange(int(input_ids.shape[1]), device=device, dtype=torch.long),
         }
         pv = concat_optional_tensors(conditions.pixel_values)
         igt = concat_optional_tensors(conditions.image_grid_thw)
@@ -432,6 +431,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
                 transformer.model.rope_deltas = rope_deltas
 
         cur_input_ids = input_ids
+        next_sequence_length = int(input_ids.shape[1])
         generated_tokens: List[List[int]] = [[] for _ in range(batch_size)]
         per_token_logps: List[List[float]] = [[] for _ in range(batch_size)]
         finished = [False] * batch_size
@@ -441,7 +441,8 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             prep_kwargs: dict = {
                 "past_key_values": model_kwargs.get("past_key_values"),
                 "attention_mask": model_kwargs.get("attention_mask"),
-                "cache_position": model_kwargs.get("cache_position"),
+                "next_sequence_length": next_sequence_length,
+                "is_first_iteration": is_first_step,
                 "use_cache": True,
             }
             if is_first_step:
@@ -492,6 +493,7 @@ class Qwen3OmniARStage(ARStage[Qwen3OmniARConditions]):
             cur_input_ids = torch.cat([cur_input_ids, token_id.unsqueeze(-1)], dim=1)
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
+            next_sequence_length = 1
             is_first_step = False
 
         return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)

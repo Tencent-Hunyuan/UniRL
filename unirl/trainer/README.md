@@ -101,7 +101,7 @@ The current trainer surface is:
 | `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
 | `AsyncARTrainer` | FIFO AR generation batch → one `TrainStack` | Separate train/rollout slabs with resident generation and optimizer-update versioning. The trainer refills immediately after collection so the manager's existing dispatch thread overlaps the next generation with scoring and training, then quiesces before weight sync, eval, or checkpoint. |
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
-| `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
+| `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only; `freeze_diffusion=true` trains and checkpoints the rewriter only (trainside engine only). On the trainside engine the request may carry one source image per prompt, passed to the rewriter and the editor. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
 | `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
@@ -271,8 +271,8 @@ flushes shards in the background. The next save/load drains the prior future,
 and every trainer drains the final save before worker teardown.
 
 PE checkpoints use one checkpoint directory per trained side:
-`<save_dir>/checkpoint-<step>/diffusion/` and, unless `freeze_llm=true`,
-`<save_dir>/checkpoint-<step>/ar/`. Each side uses its backend's selected format.
+`<save_dir>/checkpoint-<step>/diffusion/` unless `freeze_diffusion=true` and,
+unless `freeze_llm=true`, `<save_dir>/checkpoint-<step>/ar/`. Each side uses its backend's selected format.
 The driver-owned `trainer_state.json` remains at the common
 `checkpoint-<step>/` level. A normal PE save writes every trained side at the
 same rollout step; resume expects those sibling directories together.
