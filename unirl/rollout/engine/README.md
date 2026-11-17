@@ -105,8 +105,10 @@ pipe, so vLLM's imports stay out of the Worker process.
   `max_loaded_loras` set and a synced adapter active, UniRL splits `n > 1`
   payloads into `n = 1` requests in prompt order. SGLang 0.5.19 over-releases
   the adapter usage counter on the `n > 1` path, so eviction waits indefinitely
-  for zero (#671). The split reuses encoded inputs and keeps replay aligned
-  with the original prompt groups. Recheck the workaround on a SGLang bump.
+  for zero (#671). The split reuses the payloads UniRL already built and keeps
+  replay aligned with the original prompt groups; the server prefills each
+  request on its own, and `concurrency` then bounds candidates in flight, not
+  prompts. Recheck the workaround on a SGLang bump.
   Without a cap, each synced adapter stays in the server's host memory.
 - **`keep_diffusion_resident` is for diffusion servers that cannot sleep.** The
   Qwen-Image-Edit SGLang server fails to move its transformer to CPU, so the
