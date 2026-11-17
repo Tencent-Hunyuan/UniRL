@@ -3,7 +3,7 @@
 > **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
 > `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the single-frame
-> text-to-image FlowGRPO recipe `examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml`.
+> text-to-image FlowGRPO recipes `examples/diffusion/cosmos3/cosmos3_{nano,super}_trainside.yaml`.
 
 ## What it is
 
@@ -104,7 +104,7 @@ inference see the same canvas. Manifest media entries use `role="target"` with
 defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
 loops over samples, because the transformer takes one packed sequence per call, and
 `Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence` with no condition frame.
-Latents are `[B, 48, 1, H/16, W/16]` for `nvidia/Cosmos3-Nano`. The sigma schedule comes
+Latents are `[B, 48, 1, H/16, W/16]` for both checkpoints. The sigma schedule comes
 from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
 stored in `trajectory_precision` between steps.
@@ -113,6 +113,23 @@ stored in `trajectory_precision` between steps.
 one step per packed forward (two with CFG), feeding the stored latents back through the
 same `step_with_logp` call as rollout. `predict_noise_at_step` is the same forward without
 the solver step.
+
+## Cosmos3-Super
+
+`nvidia/Cosmos3-Super` (64.0B parameters, 64 layers, hidden size 5120, 128 GB in bf16) is
+Nano at a larger size: its transformer config differs from Nano's only in `hidden_size`,
+`intermediate_size`, `num_attention_heads` and `num_hidden_layers`, and its VAE, scheduler,
+tokenizer and `model_index.json` equal Nano's. `cosmos3_super_trainside.yaml` inherits
+`cosmos3_nano_trainside` and overrides only the checkpoint, run name and tags.
+
+- **`fsdp_mode: no_shard` needs about 166 GiB per GPU.** Each rank holds the full bf16 base
+  (119 GiB). Measured on B200 (179 GiB) with the recipe's two SDE steps per backward: 161
+  GiB allocated per GPU, 166 GiB in `nvidia-smi` with PickScore. On one card without FSDP,
+  replay with gradients peaks at 140 GiB with one SDE step per backward and 158 GiB with
+  two, so an H200 (141 GB) or an 80 GB card does not fit `no_shard` training.
+  `fsdp_mode: full` on smaller cards is not validated.
+- **Scope.** The recipe is smoke-tested only (4 prompts x 8 samples, 3 rollouts, 2x B200,
+  torch 2.13 / cu130). The default scale, a reward trend and H20 are not validated.
 
 ## Gotchas
 
@@ -171,7 +188,8 @@ the solver step.
   diffusers would be silently overridden by the stale copy. Re-verify the frozen bodies
   against the installed diffusers before extending the fingerprints on a version bump.
 - The H20 SDPA wrapper repeats kv heads before dispatch: Cosmos3 attention is GQA
-  (32 q / 8 kv heads), the fused Flash/Efficient kernels require equal head counts, and
+  (32 q / 8 kv heads on Nano, 64 / 8 on Super), the fused Flash/Efficient kernels require
+  equal head counts, and
   the MATH fallback is exactly the strided-batched GEMM that is broken on H20+cu128.
 - Eval loss is noised velocity MSE at a per-sample deterministic (σ, ε) draw
   (`unirl.algorithms.sft.sample_eval_seed`) — comparable across runs, but not a
