@@ -102,6 +102,7 @@ rollout engine, and restriction per model — in
 | Qwen2.5-VL | VLM AR | Text + Image → Text | [`qwen_vl_grpo_geo3k_mc_4x8`](examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml) | ✅ |
 | Qwen3-Omni Thinker | Omni-modality AR | Text / Image / Audio / Video → Text | [`qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4`](examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4.yaml) | ✅ vllm_omni only |
 | Cosmos3-Nano | World model | Video (+ action) prediction; Text → Image; Text + Image → Video | [`sft/cosmos3_droid100_videopred`](examples/sft/cosmos3_droid100_videopred.yaml), [`cosmos3_nano_trainside`](examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml), [`cosmos3_nano_i2v_trainside`](examples/diffusion/cosmos3/cosmos3_nano_i2v_trainside.yaml) | ✅ trainside only |
+| Cosmos3-Edge | World model | Text + Image → Video | [`cosmos3_edge_i2v_trainside`](examples/diffusion/cosmos3/cosmos3_edge_i2v_trainside.yaml) | ✅ trainside only |
 | Prompt-Enhancer | LLM + diffusion (composed) | Text → Text → Image; Text + Image → Text → Image | [`pe_trainside_pickscore`](examples/pe/pe_trainside_pickscore.yaml), [`pe_it2i_trainside_editreward`](examples/pe/pe_it2i_trainside_editreward.yaml) | 🔗 composed |
 
 </div>
