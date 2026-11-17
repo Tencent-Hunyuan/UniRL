@@ -46,7 +46,7 @@ listed scorer classes directly with Hydra `_target_`.
 | `mc_exact_match` | text + metadata | Multiple-choice answer match against `metadata.answer`; rows without it score 0 rather than raising. |
 | `clap` | generated audio/video | CLAP prompt-audio alignment for T2AV output; requires the generated audio and its sample rate. |
 | `imagebind` | generated audio/video | ImageBind audio/video/text alignment; noncommercial upstream license. `RewardService` rejects it for training unless `mode` is `text_video` or `all` with a positive `text_video` weight (override with `require_prompt_video: false`). |
-| `t2av_composite` | generated audio/video | Weighted composition of video-capable inner scorers; rejects a mix without a positive prompt-video term. |
+| `composite` | image, video, or text (one kind) | Aggregates a panel of inner backends, local or remote, with optional score-only `monitors`; a video panel is rejected when a prompt-video-capable training scorer exists and none has positive weight. |
 | `per_domain` | image + metadata | Routes rows by `metadata.domain` to configured inner scorers. |
 
 `MathVerifyRewardScorer` (`math_verify`) and `LLMJudgeRewardScorer`
@@ -230,6 +230,20 @@ new remote reward needs no UniRL code — add it to the server and list its name
   in `component_rewards` as `monitor_<name>`, so `required_rewards` cannot also contain that
   name. A monitor cannot have a `reward_weights` entry, and a missing or non-finite monitor
   fails the sample like any training reward.
+- **`CompositeRewardScorer` and `RemoteRewardBackend` share one panel rule, [`panel.py`](panel.py).**
+  `aggregation_method` is `weighted_sum` (divides by the weight total; a total `<= 0` gives
+  `0.0`), `linear_sum` (no division), `mean`, `min`, or `max`; the last three ignore weights.
+  A non-finite aggregate (overflow) raises instead of returning a reward.
+  The composite defaults to `weighted_sum`, so a recipe that sums raw weighted scores must
+  set `linear_sum` or its reward is divided by the weight total. `aggregate_panel` computes in
+  the dtype of the scores it is given: the remote backend passes Python floats and the
+  composite passes float32 scalars in scorer order. The three T2AV recipes depend on that
+  float32, in-order accumulation bit-for-bit; changing the dtype or the order changes their
+  rewards in the last bits.
+- **Composite `monitors` are scored on the same request and never aggregated.** They report
+  as `monitor_<name>`, cannot carry `weights`, must consume the same input kind as `scorers`,
+  and do not satisfy the prompt-video requirement. Any inner failure, wrong row count, or
+  non-finite score, from a scorer or a monitor, fails the whole batch.
 - **`input_kind` must match the media** (`image`/`video`/`text`) — it picks which
   decoded key the backend sees. Remote allows only `image`/`video`; local scorers
   may be `text`.
@@ -252,7 +266,7 @@ new remote reward needs no UniRL code — add it to the server and list its name
   calls `load()` once after its own validation so an invalid reward graph fails before any
   checkpoint read, child-process boot, or GPU allocation. `load()` is idempotent and the base
   implementation is a no-op (`RemoteRewardBackend` inherits it since the external HTTP server
-  owns its own lifecycle). Composite/wrapper backends (`T2AVCompositeScorer`,
+  owns its own lifecycle). Composite/wrapper backends (`CompositeRewardScorer`,
   `PerDomainRewardScorer`, `VideoRewardScorer`, or any custom wrapper) fan `load()` out to
   their children just like `offload`/`onload`/`dispose`, and any scorer constructed directly
   outside `RewardService` must call `load()` before `compute_rewards`.

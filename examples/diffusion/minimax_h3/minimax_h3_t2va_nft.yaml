@@ -132,9 +132,10 @@ rollout:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    _target_: unirl.reward.local.composite.CompositeRewardScorer
     config:
-      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      _target_: unirl.reward.local.composite.CompositeRewardSpec
+      aggregation_method: linear_sum
       # Summed raw, not renormalised. The imagebind package loads its checkpoint
       # from a RELATIVE ./.checkpoints/imagebind_huge.pth.
       #
