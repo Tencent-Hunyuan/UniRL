@@ -16,6 +16,8 @@
 # Pairs with unirl/train_pe.py (PETrainer). Geometry:
 # P=4 prompts × N=4 rewrites × M=2 edits = 32 edits / 16 rewrites per rollout and device;
 # the diffusion server renders them in chunks of forward_batch_size.
+# Validated on one H200 (143 GB) only: both servers stay on the GPU, peak about 111 GB.
+# Not run with num_devices > 1 or on a smaller GPU.
 #
 # Needs the sglang environment (INSTALL.md) and REWARD_SERVICE_URL
 # (unirl-reward-service with the editreward scorer on its own GPU). Optional
