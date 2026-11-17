@@ -1,10 +1,10 @@
-# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image generation
+# Cosmos3 (NVIDIA omnimodal world model) — SFT, text-to-image RL and image-to-video RL
 
 > **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
-> `Cosmos3Pipeline.generate` samples single-frame text-to-image. Trajectory replay is not
-> implemented: `Cosmos3DiffusionStage.replay` and `predict_noise_at_step` raise, so no RL
-> recipe ships yet.
+> `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the FlowGRPO recipes
+> `examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml` (single-frame text-to-image) and
+> `cosmos3_nano_i2v_trainside.yaml` (image-to-video).
 
 ## What it is
 
@@ -40,16 +40,17 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
 
 - **Uniform `master_precision` storage**: upcasting only trainable params would mix
   bf16/fp32 inside every MoT layer (the und stream is frozen), which FSDP2 rejects.
-- **The shipped recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
+- **The SFT recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
   `mixed_precision: false`): torch 2.10/cu128 on H20 rejects every bf16 `cublasGemmEx`,
   and `bundle.py` scopes further cuBLAS workarounds (contiguous mRoPE, 2-D-GEMM
   DomainAwareLinear, non-MATH SDPA, frozen-DTensor `full_tensor()` linears) to that
   runtime via `_needs_h20_cu128_workaround()`. Newer CUDA stacks may switch back to
   fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
-  (`_keep_in_fp32_modules = ["time_embedder"]`). The shipped full-fp32 recipes satisfy
-  this trivially. A future bf16 mixed-precision recipe must land an fp32 exemption for it
-  (e.g. its own FSDP group with an fp32 gather/reduce policy) together with that recipe.
+  (`_keep_in_fp32_modules = ["time_embedder"]`). The full-fp32 SFT recipes satisfy
+  this trivially. The bf16 RL recipe `cosmos3_nano_trainside` keeps it out of every FSDP
+  group with `root_wrap: false` (see Gotchas); it is validated on H100 with torch 2.13/cu130,
+  not on H20. Any other bf16 mixed-precision recipe needs its own fp32 exemption.
   Without one the outcome depends on the diffusers version: 0.39 casts only *after* the
   embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul;
   0.40 casts the sinusoid to the embedder's parameter dtype first, so the embedder
@@ -62,7 +63,7 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   tolerates. Do not "align" training to it: training σ are logit-normal draws that
   never land on the inference grid anyway, so flooring only quantizes the signal and
   biases the σ↔conditioning map by an average of −0.5 timestep units.
-- **`meta_init_transformer: true`** (both recipes) builds the 16B transformer on the meta
+- **`meta_init_transformer: true`** (both SFT recipes) builds the 16B transformer on the meta
   device and lets the backend load sharded weights after wrapping — the eager path would
   put the full ~64 GB fp32 model on every rank before sharding. The sharded loader reads
   local `*.safetensors` only, so the shared meta-init resolver downloads and validates
@@ -100,17 +101,88 @@ inference see the same canvas. Manifest media entries use `role="target"` with
 
 ## Generation
 
-`Cosmos3Pipeline.generate` covers `num_frames=1` only; `DiffusionSamplingParams.num_frames`
+`Cosmos3Pipeline.generate` covers two modes: `num_frames=1` text-to-image, and
+`num_frames = 4k + 1 > 1` image-to-video from an `Images` turn (one source image per prompt,
+a manifest `(image, condition)` ref through `MultimodalRLDataSource`). Text-to-video is
+rejected: it has no parity or log-prob evidence. `DiffusionSamplingParams.num_frames`
 defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
 loops over samples, because the transformer takes one packed sequence per call, and
-`Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence` with no condition frame.
-Latents are `[B, 48, 1, H/16, W/16]` for `nvidia/Cosmos3-Nano`. The sigma schedule comes
+`Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence`.
+Latents are `[B, 48, T_gen, H/16, W/16]` for `nvidia/Cosmos3-Nano`, with `T_gen = 1` for an
+image and `(num_frames - 1) / 4` for a video. The sigma schedule comes
 from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
 stored in `trajectory_precision` between steps.
 
+For image-to-video, `build_conditions` runs the source image through diffusers'
+`_preprocess_conditioning_image` (aspect-preserving resize, centre crop) and the VAE, and
+stores latent frame 0 as `Cosmos3Conditions.image_latent`. The solver state, the stored
+trajectory and the SDE log-prob cover the generated latent frames only.
+`Cosmos3DiffusionStep._velocity` prepends the clean frame for the packed forward
+(`condition_frame_indexes=[0]`, no timestep embedding on it) and drops its velocity;
+`decode` prepends it again and returns `Videos`. Replay reads `image_latent` back from
+`Part.conditions`, so the image is encoded once per sample.
+
+`Cosmos3DiffusionStage.replay` recomputes the SDE log-probs with gradients, one sample and
+one step per packed forward (two with CFG), feeding the stored latents back through the
+same `step_with_logp` call as rollout. `predict_noise_at_step` is the same forward without
+the solver step.
+
+## Image-to-video recipe: reward and evaluation
+
+`cosmos3_nano_i2v_trainside` scores each video with `VideoPickScoreScorer`, the reward of
+the WAN image-to-video recipes: PickScore of one frame against the prompt. It sets
+`frame_selection: middle`, pixel frame `num_frames // 2`. The reward measures prompt
+alignment and appearance of that frame. It does not measure motion, temporal consistency
+or fidelity to the source image, and no local reward reads the source image.
+
+Evaluation runs every `eval_interval` rollouts on `EVAL_DATA_PATH` (an image manifest like
+`DATA_PATH`; the PickScore prompt lists have no images) with deterministic sampling
+(`eval_eta` defaults to 0) and the same reward.
+
+Scope: the recipe is smoke-tested only (8 prompts x 8 samples, 3 rollouts, 4x H100). The
+default scale, the periodic evaluation and a reward trend are not validated. Middle-frame
+PickScore had a within-group standard deviation of 2e-3 to 4e-3 (two prompts, four samples
+each, 9 frames), so it is a smoke baseline, not evidence of video RL gains.
+
+The two SDE steps per rollout are drawn from steps 10-12 of 16 (sigma 0.750, 0.694, 0.625 at
+shift 5). That is the sigma band of the text-to-image recipe (0.75 to 0.58 at shift 3)
+re-derived for the shift-5 grid, not a setting tuned for video.
+
 ## Gotchas
 
+- **A stored image-to-video trajectory does not contain the source frame.**
+  `LatentSegment.latents[:, -1]` holds the generated frames only; decoding it needs
+  `Cosmos3Conditions.image_latent` (`Cosmos3Pipeline.decode(segment, image_latent)`).
+  `latent_shape` returns the same generated-frame shape for driver-side noise. Keeping the
+  clean frame out of the state is what lets `FlowSDEStrategy`, `replay`, and algorithms that
+  noise the final latent and call `predict_noise_at_step` run without a frame mask: the
+  kernel adds noise to every element it is given and averages the log-prob over all of them.
+- **`Cosmos3OmniPipeline` steps the clean frame, this package does not.** Upstream zeroes
+  the velocity on frame 0 and runs the scheduler on the whole latent, so its frame 0 stays
+  equal to the image latent only up to solver rounding and that rounding feeds the next
+  forward. Here frame 0 is the stored latent at every step. Measured on
+  `nvidia/Cosmos3-Nano`, 832x480, 9 frames, 16 steps, guidance 4.0, shift 5, H100, with
+  matching sigmas, noise, `UniPCStrategy` and floored timesteps: with fp32 weights the
+  generated frames match upstream bit-for-bit once a step callback restores its frame 0,
+  and differ from stock upstream by relative RMS 2.5e-6 to 5e-5 (its frame 0 drifts by up
+  to 1.2e-6). With bf16 weights upstream also runs the solver in bf16 (next bullets): its
+  frame 0 drifts by up to 0.056 against a latent RMS of 0.7, stock upstream differs by
+  relative RMS 0.03 to 0.04, and the match is bit-for-bit again once upstream gets the
+  restored frame and fp32 solver inputs.
+- **The source image is encoded as one frame, in fp32.** Upstream encodes the image
+  repeated over all `num_frames` and keeps latent frame 0; the Wan VAE is causal, and the
+  two encodes are bit-identical on the real checkpoint (9 and 17 frames). Upstream with
+  bf16 weights first rounds the preprocessed pixels to bf16, which moves the latent by a
+  relative RMS of 0.1% to 0.2%; this package keeps fp32 pixels.
+- **Video decode costs about 9 GiB per sample at 832x480** on top of the 31 GiB bf16
+  model (fp32 Wan VAE, same for 9 and 17 frames); four videos decoded together peak at
+  66 GiB. `decode` takes the whole `generate` batch, so the recipe's
+  `forward_batch_size: 1` is what keeps it at one video.
+- **VideoPickScore's default `frame_selection: first` leaves no reward spread here.** Decoded
+  frame 0 is the VAE round trip of the source image for all samples of a prompt: its reward
+  std within a prompt group was 2e-5 to 3e-5, against 2e-3 to 4e-3 for the middle frame
+  (two prompts, four samples each, 9 frames).
 - **CFG runs two transformer calls per step, not one batched call.** The cond and uncond
   prompts have different token lengths and the forward takes a single unbatched sequence,
   so `predict_noise` runs them one after the other and combines
@@ -137,6 +209,11 @@ stored in `trajectory_precision` between steps.
   `Cosmos3DiffusionStage.diffuse` raises if the stored dtype is not fp32. That check reads
   the stored parameter, so it does not catch an FSDP `mp_policy` that gathers the embedder
   in bf16 for the forward (see Precision & loading).
+- **The RL recipe needs `root_wrap: false`.**
+  `time_embedder`, `proj_in` and `proj_out` live outside the decoder layers; a root shard
+  group would gather them in `param_dtype` (bf16) and the timestep MLP would run in bf16
+  silently. Every LoRA target (`add_{q,k,v}_proj`, `to_add_out`) is inside a
+  `Cosmos3VLTextMoTDecoderLayer`, so no trainable parameter is left outside the wrap.
 - The und-param regexes are anchored with trailing `\.` on purpose: `to_out` must not
   swallow `to_add_out`, and `norm.` must not swallow `norm_moe_gen.`. Touch
   `_UND_PARAM_PATTERNS` only with the freeze-count log line as your regression check.
