@@ -4,7 +4,7 @@
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
 > `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the FlowGRPO recipes
 > `examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml` (single-frame text-to-image) and
-> `cosmos3_nano_i2v_trainside.yaml` (image-to-video).
+> `cosmos3_{nano,edge}_i2v_trainside.yaml` (image-to-video).
 
 ## What it is
 
@@ -108,7 +108,7 @@ rejected: it has no parity or log-prob evidence. `DiffusionSamplingParams.num_fr
 defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
 loops over samples, because the transformer takes one packed sequence per call, and
 `Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence`.
-Latents are `[B, 48, T_gen, H/16, W/16]` for `nvidia/Cosmos3-Nano`, with `T_gen = 1` for an
+Latents are `[B, 48, T_gen, H/16, W/16]` for both checkpoints, with `T_gen = 1` for an
 image and `(num_frames - 1) / 4` for a video. The sigma schedule comes
 from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
@@ -148,6 +148,45 @@ each, 9 frames), so it is a smoke baseline, not evidence of video RL gains.
 The two SDE steps per rollout are drawn from steps 10-12 of 16 (sigma 0.750, 0.694, 0.625 at
 shift 5). That is the sigma band of the text-to-image recipe (0.75 to 0.58 at shift 3)
 re-derived for the shift-5 grid, not a setting tuned for video.
+
+## Cosmos3-Edge
+
+`nvidia/Cosmos3-Edge` (3.4B parameters, 28 layers, hidden size 2048, vocabulary 131072) loads
+through the same `Cosmos3OmniTransformer` class. Its decoder layers are still
+`Cosmos3VLTextMoTDecoderLayer` and keep the `add_{q,k,v}_proj` / `to_add_out` names, so the
+backend block class and LoRA targets are those of Nano, and its VAE and scheduler configs
+equal Nano's. `cosmos3_edge_i2v_trainside.yaml` inherits `cosmos3_nano_i2v_trainside` and
+overrides the checkpoint, the prompting flags and the sampler.
+
+- **Edge needs diffusers>=0.40.** Its architecture is selected by `hidden_act: relu2`,
+  `qk_norm_for_text: false` and `use_und_k_norm_for_gen: true`, which
+  `Cosmos3OmniTransformer` reads from 0.40.0 on; 0.39.0 has none of them. 0.40.0 warns
+  that it ignores `backbone_type` and `temporal_compression_factor` from Edge's config,
+  which is expected.
+- **Prompting and sampler follow the model card's image-to-video example**: no system
+  prompt (`default_use_system_prompt: false` in its `model_index.json`), no resolution or
+  duration sentence, flow shift 12, 20 steps, guidance 6.0, 832x480 at 24 fps.
+  `Cosmos3JointStage` builds `Cosmos3OmniPipeline` from the bundle's parts rather than
+  `from_pretrained`, so the pipeline defaults in `model_index.json` are not read; the
+  bundle config carries `use_system_prompt`, `add_resolution_template` and
+  `add_duration_template`.
+- **Where the recipe differs from the card.** It generates 9 frames, the smoke scope of the
+  Nano recipe; the card's example generates 121 and lists 50 to 150 as supported. The
+  negative prompt is empty and the prompts are plain text; the card ships a JSON negative
+  prompt and recommends JSON-upsampled prompts. The sigma grid is the static shift-12 grid
+  starting at 1.0; Edge's `use_native_flow_schedule: true` starts upstream at
+  `1 - 1/1000` before the shift, a difference below 3e-4 in sigma on this grid.
+- **SDE steps.** The two SDE steps per rollout are drawn from steps 16-18 of 20 (sigma
+  0.750, 0.679, 0.571 at shift 12), the sigma band of the Nano recipes re-derived for this
+  grid, not a setting tuned for Edge.
+- **Scope.** The recipe is smoke-tested only (8 prompts x 8 samples, 3 rollouts, 4x A100
+  80GB, torch 2.13 / cu130; peak 22 GiB allocated per GPU, 30 GiB in `nvidia-smi` with the
+  reward model). The default scale, the periodic evaluation, a reward trend, the card's
+  121-frame length and H20 are not validated. The reward limits of the Nano
+  image-to-video recipe apply unchanged.
+- **`freeze_understanding` leaves `k_norm_und_for_gen` trainable on Edge.** Edge has no und
+  `norm_q` / `norm_k` and adds `self_attn.k_norm_und_for_gen` per layer, which
+  `_UND_PARAM_PATTERNS` does not match. No Edge SFT recipe ships.
 
 ## Gotchas
 
@@ -225,7 +264,7 @@ re-derived for the shift-5 grid, not a setting tuned for video.
   stage's own helpers); it still reuses the generic `_media_uris` / `_require_local_uri`
   from `unirl/train/sft/track_builder.py`, whose builders stay model-agnostic.
 - diffusers>=0.39 is required (first release with `Cosmos3OmniTransformer` /
-  `Cosmos3OmniPipeline`). The transformer `forward` return differs by version: 0.39 has
+  `Cosmos3OmniPipeline`), and >=0.40 for Cosmos3-Edge. The transformer `forward` return differs by version: 0.39 has
   no `return_dict` and returns the bare `(vision, sound, action)` tuple; 0.40 added
   `return_dict=True` and returns a `Cosmos3OmniTransformerOutput` (`sample` / `sound` /
   `action`) by default. That output is a `BaseOutput`, so tuple-unpacking it yields its

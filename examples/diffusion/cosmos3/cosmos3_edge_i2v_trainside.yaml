@@ -1,0 +1,35 @@
+# @package _global_
+# Cosmos3-Edge image-to-video FlowGRPO + VideoPickScore with trainside rollout (LoRA on the generation stream).
+# Inherits cosmos3_nano_i2v_trainside.yaml: backend, LoRA, optimizer, reward, data and the 832x480 / 9 frames / 24 fps
+# video shape. Prompting and sampler follow the Edge model card's image-to-video example: no system prompt, no
+# resolution or duration sentence, flow shift 12, 20 steps, guidance 6.0. The card generates 121 frames; 9 frames is
+# the smoke scope of the Nano recipe. Two SDE steps per rollout are drawn from steps 16-18 of 20.
+# Scope, measured numbers and the differences from the card: unirl/models/cosmos3/README.md (Cosmos3-Edge).
+#
+# Launch (needs the `cosmos3` extra with diffusers>=0.40):
+#   PRETRAINED_MODEL=/path/to/Cosmos3-Edge DATA_PATH=/path/to/train.jsonl \
+#   python -m unirl.train_diffusion --config-name diffusion/cosmos3/cosmos3_edge_i2v_trainside
+
+defaults:
+  - cosmos3_nano_i2v_trainside
+  - _self_
+
+logging:
+  run_name: cosmos3-edge-i2v-grpo
+  tags: [cosmos3, edge, i2v, trainside, lora]
+
+bundle:
+  config:
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Edge}
+    use_system_prompt: false
+    add_resolution_template: false
+    add_duration_template: false
+
+pipeline:
+  shift: 12.0
+
+sampling:
+  num_inference_steps: 20
+  guidance_scale: 6.0
+  scheduler:
+    timestep_fraction: [0.8, 0.95]   # steps 16-18 of 20, sigma 0.75 to 0.57 at shift 12
