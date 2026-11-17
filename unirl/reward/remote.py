@@ -21,6 +21,7 @@ from PIL import Image
 
 from unirl.config.require import require
 from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
+from unirl.reward.panel import aggregate_panel, monitor_key, validate_panel
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.utils.media import tensor_frame_to_pil
 
@@ -144,7 +145,7 @@ class RemoteRewardBackend(RewardBackend):
         self.monitor_rewards = set(config.monitor_rewards)
         self.wire_rewards = [*config.required_rewards, *config.monitor_rewards]
         self.component_keys = {
-            name: f"monitor_{name}" if name in self.monitor_rewards else name for name in self.wire_rewards
+            name: monitor_key(name) if name in self.monitor_rewards else name for name in self.wire_rewards
         }
         self.max_retries = config.max_retries
         self.retry_delay = config.retry_delay
@@ -417,16 +418,7 @@ class RemoteRewardBackend(RewardBackend):
                         error_parts.append(f"{reward_name}: missing from server response without error")
 
             if scores:
-                if self.aggregation_method == "weighted_sum":
-                    total_w = sum(weights)
-                    agg = sum(s * w for s, w in zip(scores, weights)) / total_w if total_w > 0 else 0.0
-                elif self.aggregation_method == "mean":
-                    agg = sum(scores) / len(scores)
-                elif self.aggregation_method == "min":
-                    agg = min(scores)
-                else:
-                    agg = max(scores)
-                aggregated_rewards.append(agg)
+                aggregated_rewards.append(aggregate_panel(scores, weights, self.aggregation_method))
                 successes.append(len(error_parts) == 0)
             else:
                 aggregated_rewards.append(0.0)
@@ -498,26 +490,12 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
             bool(str(self.base_url).strip()),
             "RemoteRewardSpec.base_url must be non-empty",
         )
-        require(
-            len(self.required_rewards) > 0,
-            "RemoteRewardSpec.required_rewards must be non-empty",
-        )
-        overlapping = set(self.required_rewards) & set(self.monitor_rewards)
-        require(
-            not overlapping,
-            f"RemoteRewardSpec.required_rewards and monitor_rewards must be disjoint; "
-            f"both name {sorted(overlapping)!r}",
-        )
-        colliding = {f"monitor_{name}" for name in self.monitor_rewards} & set(self.required_rewards)
-        require(
-            not colliding,
-            f"RemoteRewardSpec.required_rewards must not contain {sorted(colliding)!r}; "
-            f"monitor_rewards report as monitor_<name>",
-        )
-        weighted_monitors = set(self.monitor_rewards) & set(self.reward_weights or ())
-        require(
-            not weighted_monitors,
-            f"RemoteRewardSpec.reward_weights must not name monitor_rewards; got {sorted(weighted_monitors)!r}",
+        validate_panel(
+            "RemoteRewardSpec",
+            training=self.required_rewards,
+            monitors=self.monitor_rewards,
+            weighted=self.reward_weights or (),
+            aggregation_method=self.aggregation_method,
         )
         require(
             self.max_retries >= 1,
@@ -534,11 +512,6 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
         require(
             self.sub_metric_reduce in {"first", "mean", "max"},
             f"RemoteRewardSpec.sub_metric_reduce must be one of first/mean/max; got {self.sub_metric_reduce!r}",
-        )
-        require(
-            self.aggregation_method in {"weighted_sum", "mean", "min", "max"},
-            f"RemoteRewardSpec.aggregation_method must be one of "
-            f"weighted_sum/mean/min/max; got {self.aggregation_method!r}",
         )
         require(
             self.input_kind in {"image", "video"},

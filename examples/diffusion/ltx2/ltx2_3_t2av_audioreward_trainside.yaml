@@ -7,7 +7,7 @@
 # stream; the reward service injects it into the reward request so a composite
 # scorer can blend video + audio signals.
 #
-# Reward = T2AVCompositeScorer:
+# Reward = CompositeRewardScorer (linear_sum):
 #   - videopickscore (video quality / image-text alignment on first frame)
 #   - clap           (audio-text alignment, LAION CLAP; zero extra deps)
 # ImageBind (audio-video alignment) is also available as an inner scorer but is
@@ -120,9 +120,10 @@ rollout:
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
-    _target_: unirl.reward.local.t2av_composite.T2AVCompositeScorer
+    _target_: unirl.reward.local.composite.CompositeRewardScorer
     config:
-      _target_: unirl.reward.local.t2av_composite.T2AVCompositeSpec
+      _target_: unirl.reward.local.composite.CompositeRewardSpec
+      aggregation_method: linear_sum
       weights:
         videopickscore: 0.5
         clap: 0.5
