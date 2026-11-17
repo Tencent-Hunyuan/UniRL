@@ -246,7 +246,45 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
-        raise NotImplementedError("Cosmos3DiffusionStage.replay is not implemented yet (generation only).")
+        """Recompute SDE log-probs ``[B, S]`` and means ``[B, S, C, 1, H_lat, W_lat]`` with gradients."""
+        require(
+            segment.sde_indices is not None and segment.latents is not None and segment.sigmas is not None,
+            "Cosmos3DiffusionStage.replay requires segment sde_indices, latents and sigmas",
+        )
+        sde_steps = segment.sde_indices.tolist()
+        target = step_indices if step_indices is not None else sde_steps
+        require(
+            set(target) <= set(sde_steps),
+            f"Cosmos3DiffusionStage.replay: steps {target} are not all SDE steps {sde_steps}",
+        )
+        device = torch.device(self.model.device)
+        schedule = segment.sigmas.to(device)
+        sigma_max = schedule[1].float()
+        log_probs: List[torch.Tensor] = []
+        means: List[torch.Tensor] = []
+        for sample_idx in range(conditions.batch_size):
+            single = conditions.slice(sample_idx, sample_idx + 1)
+            for step_index in target:
+                _, log_prob, mean = self.step.step_with_logp(
+                    self.model,
+                    single,
+                    strategy=self.strategy,
+                    sample=segment.latents_at(step_index)[sample_idx : sample_idx + 1].to(device),
+                    prev_sample=segment.latents_at(step_index + 1)[sample_idx : sample_idx + 1].to(device),
+                    sigma=schedule[step_index],
+                    sigma_next=schedule[step_index + 1],
+                    guidance_scale=params.guidance_scale,
+                    sigma_max=sigma_max,
+                    eta=params.eta,
+                    step_index=step_index,
+                )
+                log_probs.append(log_prob)
+                means.append(mean)
+        shape = (conditions.batch_size, len(target))
+        return ReplayResult(
+            log_probs=torch.cat(log_probs).reshape(shape).to(dtype=self.logprob_dtype),
+            prev_sample_means=torch.cat(means).reshape(*shape, *means[0].shape[1:]),
+        )
 
     def predict_noise_at_step(
         self,
@@ -256,7 +294,20 @@ class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
         sigma: torch.Tensor,
         params: DiffusionSamplingParams,
     ) -> torch.Tensor:
-        raise NotImplementedError("Cosmos3DiffusionStage.predict_noise_at_step is not implemented yet.")
+        """Guided velocity for ``sample`` ``[B, C, 1, H_lat, W_lat]`` at scalar or per-sample ``sigma``."""
+        sigma = sigma.reshape(-1).expand(sample.shape[0])
+        return torch.cat(
+            [
+                self.step.predict_noise(
+                    self.model,
+                    sample[i : i + 1].to(self.model.device),
+                    sigma[i],
+                    conditions.slice(i, i + 1),
+                    guidance_scale=params.guidance_scale,
+                )
+                for i in range(sample.shape[0])
+            ]
+        )
 
     def trainable_module(self) -> torch.nn.Module:
         """Return the transformer the diffusion forward runs on."""
