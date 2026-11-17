@@ -24,6 +24,7 @@ class BaseRolloutEngine(Remote, ABC):
     """Rollout engine ABC: fill and return one ``Sample``; ``generate`` may be called concurrently."""
 
     _component_name = "base"
+    packs_groups: bool = False  # Whether requests need whole samples_per_prompt groups.
 
     @classmethod
     def component_name(cls) -> str:
@@ -78,10 +79,6 @@ class BaseRolloutEngine(Remote, ABC):
     def generate_on_slot(self, sample: Sample) -> Sample:
         """Undecorated per-engine entry point for driver-side lane dispatch."""
         return self.generate(sample)
-
-    def packs_groups(self, sample: Sample) -> bool:
-        """Whether a request must hold whole samples_per_prompt groups; RewardStack then aligns its micros to them."""
-        return False
 
     def abort(self, ids: Optional[List[str]] = None) -> List[Sample]:
         """Best-effort cancel of in-flight generation; return any partials. Default no-op."""

@@ -24,6 +24,7 @@ breaking API change: there are no compatibility aliases for the retired types.
 - Lineage is encoded in `Part.sample_ids`: a fork appends a numeric path segment,
   such as `prompt-0/0`. `Part.group_ids` derives immediate-parent groups from
   those paths; `Sample.root_group_ids(i)` derives root-prompt groups.
+  `Sample` rejects a part with a blank, non-string, or repeated sample id.
 - Raw conditioning remains on ancestor `Part.primitives`. `Sample.conditioning()`
   and the role-aware `turns()`, `text_conditioning()`, and
   `vision_conditioning()` views align those ancestors to the frontier. Encoded

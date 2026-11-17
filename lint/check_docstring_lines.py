@@ -7,7 +7,7 @@ import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SKIP_PARTS = {".git", "vendor", "__pycache__"}
+SKIP_PARTS = {".git", "upstream", "vendor", "__pycache__"}
 SCAN_DIRS = ("benchmarks", "datasets", "examples", "experimental", "lint", "CPPO", "DRPO", "FlowDPPO", "unirl")
 MAX_LINE = 120  # matches [tool.ruff] line-length
 

@@ -74,24 +74,30 @@ class _RawResultView:
 
     @property
     def trajectory_latents(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "latents", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return rtd.dit_trajectory.latents
 
     @property
     def trajectory_timesteps(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "timesteps", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return rtd.dit_trajectory.timesteps
 
     @property
     def aux_trajectory_latents(self) -> Any:
         """LTX-2's co-denoised AUDIO trajectory ``[B, T+1, ...]``; ``None`` for models without one."""
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(getattr(rtd, "dit_trajectory", None), "audio_latents", None)
+        rtd = self._result.rollout_trajectory_data
+        if rtd is None or rtd.dit_trajectory is None:
+            return None
+        return getattr(rtd.dit_trajectory, "audio_latents", None)
 
     @property
     def trajectory_log_probs(self) -> Any:
-        rtd = getattr(self._result, "rollout_trajectory_data", None)
-        return getattr(rtd, "rollout_log_probs", None)
+        rtd = self._result.rollout_trajectory_data
+        return rtd.rollout_log_probs if rtd is not None else None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._result, name)
@@ -119,7 +125,7 @@ class SGLangBackend:
 
         generator = rt["DiffGenerator"].from_pretrained(
             server_args=server_args,
-            local_mode=bool(local_mode),
+            local_mode=local_mode,
         )
         return cls(generator, rt, server_args)
 
@@ -147,9 +153,8 @@ class SGLangBackend:
         from types import SimpleNamespace
 
         pcfg = self._server_args.pipeline_config
-        vae_cfg = getattr(pcfg, "vae_config", None)
-        arch = getattr(vae_cfg, "arch_config", None)
-        if arch is not None and not hasattr(arch, "vae_scale_factor") and hasattr(vae_cfg, "post_init"):
+        vae_cfg = pcfg.vae_config
+        if not hasattr(vae_cfg.arch_config, "vae_scale_factor"):
             vae_cfg.post_init()
 
         batch_stub = SimpleNamespace(height=height, width=width, num_frames=num_frames)
@@ -217,11 +222,11 @@ class SGLangBackend:
         self._forward(
             self._rt["InitWeightsUpdateGroupReqInput"](
                 master_address=master_address,
-                master_port=int(master_port),
-                rank_offset=int(rank_offset),
-                world_size=int(world_size),
-                group_name=str(group_name),
-                backend=str(backend),
+                master_port=master_port,
+                rank_offset=rank_offset,
+                world_size=world_size,
+                group_name=group_name,
+                backend=backend,
             ),
             op="init_weights_update_group",
         )
@@ -238,11 +243,11 @@ class SGLangBackend:
     ) -> None:
         self._forward(
             self._rt["UpdateWeightsFromDistributedReqInput"](
-                names=list(names),
-                dtypes=list(dtypes),
-                shapes=[list(shape) for shape in shapes],
-                group_name=str(group_name),
-                target_modules=list(target_modules),
+                names=names,
+                dtypes=dtypes,
+                shapes=shapes,
+                group_name=group_name,
+                target_modules=target_modules,
                 flush_cache=flush_cache,
             ),
             op="update_weights_from_distributed",
@@ -250,7 +255,7 @@ class SGLangBackend:
 
     def destroy_weights_group(self, *, group_name: str) -> None:
         self._forward(
-            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=str(group_name)),
+            self._rt["DestroyWeightsUpdateGroupReqInput"](group_name=group_name),
             op="destroy_weights_update_group",
         )
 
@@ -275,7 +280,7 @@ class SGLangBackend:
         response = self._rt["sync_scheduler_client"].forward(
             self._rt["GetWeightsChecksumReqInput"](module_names=list(module_names))
         )
-        output = getattr(response, "output", None)
+        output = response.output
         if not (isinstance(output, dict) and output):
             raise RuntimeError(f"SGLang checksum query returned invalid payload: {output!r}")
         return output
@@ -289,7 +294,7 @@ class SGLangBackend:
 
     @staticmethod
     def _extract_update_status(response: Any, *, op: str) -> tuple:
-        output = getattr(response, "output", None)
+        output = response.output
         if not isinstance(output, dict):
             raise RuntimeError(f"Invalid SGLang response for {op}: {response}")
         return bool(output.get("success", False)), str(output.get("message", "Unknown status"))

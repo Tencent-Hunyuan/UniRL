@@ -33,21 +33,6 @@ def is_fused_expert_param(name: str) -> bool:
     return fused_expert_kind(name) is not None
 
 
-def fuse_gate_up_pair(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """HF ``gate`` + ``up`` ``[I,H]`` → VeOmni ``gate_up`` ``[2I,H]``."""
-    if tuple(gate.shape) != tuple(up.shape):
-        raise RuntimeError(f"Qwen3-MoE layout: gate shape {tuple(gate.shape)} != up shape {tuple(up.shape)}.")
-    return torch.cat([gate, up], dim=0)
-
-
-def split_gate_up_pair(gate_up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Inverse of :func:`fuse_gate_up_pair`."""
-    if gate_up.ndim < 2 or gate_up.shape[-2] % 2:
-        raise RuntimeError(f"Qwen3-MoE layout: invalid fused gate_up shape {tuple(gate_up.shape)}.")
-    width = gate_up.shape[-2] // 2
-    return gate_up[..., :width, :], gate_up[..., width:, :]
-
-
 def build_local_fused_block(
     *,
     fused_param_name: str,
@@ -94,12 +79,13 @@ def build_local_fused_block(
             raise RuntimeError(
                 f"Qwen3-MoE layout: checkpoint has only one gate/up projection; missing {missing_projection}."
             )
-        block = torch.stack(
-            [
-                fuse_gate_up_pair(get_tensor(gate_key), get_tensor(up_key))
-                for gate_key, up_key in zip(gate_keys, up_keys)
-            ]
-        )
+        pairs = []
+        for gate_key, up_key in zip(gate_keys, up_keys):
+            gate, up = get_tensor(gate_key), get_tensor(up_key)
+            if tuple(gate.shape) != tuple(up.shape):
+                raise RuntimeError(f"Qwen3-MoE layout: gate shape {tuple(gate.shape)} != up shape {tuple(up.shape)}.")
+            pairs.append(torch.cat([gate, up], dim=0))
+        block = torch.stack(pairs)
 
     if tuple(block.shape) != expected_shape:
         raise RuntimeError(
@@ -121,7 +107,10 @@ def iter_hf_expert_tensors(
     prefix = name.rsplit(".experts.", 1)[0]
 
     if kind == "gate_up":
-        gate, up = split_gate_up_pair(stacked)
+        if stacked.ndim < 2 or stacked.shape[-2] % 2:
+            raise RuntimeError(f"Qwen3-MoE layout: invalid fused gate_up shape {tuple(stacked.shape)}.")
+        width = stacked.shape[-2] // 2
+        gate, up = stacked[..., :width, :], stacked[..., width:, :]
         for expert in range(int(stacked.shape[0])):
             yield f"{prefix}.experts.{expert}.gate_proj.weight", gate[expert].contiguous()
             yield f"{prefix}.experts.{expert}.up_proj.weight", up[expert].contiguous()
@@ -135,8 +124,6 @@ __all__ = [
     "normalize_fused_param_name",
     "fused_expert_kind",
     "is_fused_expert_param",
-    "fuse_gate_up_pair",
-    "split_gate_up_pair",
     "build_local_fused_block",
     "iter_hf_expert_tensors",
 ]

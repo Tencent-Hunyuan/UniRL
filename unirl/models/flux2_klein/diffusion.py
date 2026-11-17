@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
@@ -11,9 +10,8 @@ import torch
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import SDEStrategy, StepStrategy
-from unirl.types.conditions import TextEmbedCondition
-from unirl.types.sampling import compute_trajectory_positions
+from unirl.sde.kernels import StepStrategy
+from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment
 from unirl.utils.dtypes import parse_torch_dtype
 
@@ -25,22 +23,6 @@ from .flux2_klein_utils import (
     prepare_text_ids,
     unpack_latents,
 )
-
-
-@dataclass
-class Flux2KleinDiffusionParams:
-    """Per-request sampling knobs for FLUX.2-klein diffusion."""
-
-    num_inference_steps: int = 10
-    guidance_scale: float = 1.0
-    height: int = 512
-    width: int = 512
-    seed: int = 42
-    sde_indices: Optional[List[int]] = None
-    eta: float = 0.7
-    init_same_noise: bool = False
-    samples_per_prompt: int = 1
-    noise_group_ids: Optional[List[str]] = None
 
 
 class Flux2KleinDiffusionStep(DiffusionStep[Flux2KleinBundle, Flux2KleinConditions]):
@@ -245,29 +227,15 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         self.patchify_factor = int(patchify_factor)
         self.batch_replay_steps = bool(batch_replay_steps)
         if latent_channels is None:
-            tx_cfg = getattr(model.transformer, "config", None)
-            in_channels = getattr(tx_cfg, "in_channels", 128) if tx_cfg is not None else 128
-            latent_channels = int(in_channels)
+            latent_channels = model.transformer.config.in_channels
         self.latent_channels = int(latent_channels)
-
-    def _patchified_shape(self, height: int, width: int) -> Tuple[int, int, int]:
-        """Compute the patchified ``(C, H_pat, W_pat)`` for ``(height, width)`` pixels."""
-        downsample = self.vae_scale_factor * self.patchify_factor
-        if height % downsample != 0 or width % downsample != 0:
-            raise ValueError(
-                f"Flux2KleinDiffusionStage: height ({height}) and width ({width}) "
-                f"must be divisible by VAE×patchify downsample ({downsample})."
-            )
-        h_pat = height // downsample
-        w_pat = width // downsample
-        return (self.latent_channels, h_pat, w_pat)
 
     def diffuse(
         self,
         conditions: Flux2KleinConditions,
         *,
         schedule: torch.Tensor,
-        params: Flux2KleinDiffusionParams,
+        params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
     ) -> LatentSegment:
         """Run full FLUX.2-klein sampling; the segment stores patchified ``[B, K, 128, H_pat, W_pat]``."""
@@ -278,13 +246,19 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
-        T = int(params.num_inference_steps)
+        T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"Flux2KleinDiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
         schedule = schedule.to(device)
         self.strategy.init_schedule(schedule)
 
-        expected_latent_shape = self._patchified_shape(int(params.height), int(params.width))
+        downsample = self.vae_scale_factor * self.patchify_factor
+        if params.height % downsample != 0 or params.width % downsample != 0:
+            raise ValueError(
+                f"Flux2KleinDiffusionStage: height ({params.height}) and width ({params.width}) "
+                f"must be divisible by VAE×patchify downsample ({downsample})."
+            )
+        expected_latent_shape = (self.latent_channels, params.height // downsample, params.width // downsample)
         if initial_latents is not None:
             if int(initial_latents.shape[0]) != batch_size:
                 raise ValueError(
@@ -295,7 +269,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
                 raise ValueError(
                     f"Flux2KleinDiffusionStage.diffuse: initial_latents.shape[1:]="
                     f"{tuple(initial_latents.shape[1:])} != expected {expected_latent_shape} "
-                    f"for height={int(params.height)}, width={int(params.width)}."
+                    f"for height={params.height}, width={params.width}."
                 )
             latents = initial_latents.to(device=device, dtype=self.trajectory_dtype)
         else:
@@ -304,13 +278,13 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
                 latent_shape=expected_latent_shape,
                 device=device,
                 dtype=self.trajectory_dtype,
-                init_same_noise=bool(params.init_same_noise),
-                samples_per_prompt=int(params.samples_per_prompt),
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
                 noise_group_ids=params.noise_group_ids,
-                base_seed=int(params.seed),
+                base_seed=params.seed,
             )
 
-        sde_set: Set[int] = set(int(i) for i in (params.sde_indices or []))
+        sde_set: Set[int] = set(params.sde_indices or ())
         sde_sorted: List[int] = sorted(sde_set)
 
         needed: Set[int] = set(compute_trajectory_positions(sde_set, T))
@@ -333,7 +307,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
-            step_eta = float(params.eta) if i in sde_set else 0.0
+            step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -343,7 +317,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
                     sample=latents,
                     sigma=sigma,
                     sigma_next=sigma_next,
-                    guidance_scale=float(params.guidance_scale),
+                    guidance_scale=params.guidance_scale,
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
@@ -377,113 +351,31 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         conditions: Flux2KleinConditions,
         *,
         segment: LatentSegment,
-        params: Flux2KleinDiffusionParams,
+        params: DiffusionSamplingParams,
         step_indices: Optional[List[int]] = None,
     ) -> ReplayResult:
         """Segment-based log-prob replay over the rollout's SDE transitions."""
-        if segment.sde_indices is None or segment.latents is None:
-            raise ValueError("Flux2KleinDiffusionStage.replay: segment.sde_indices / latents missing")
-        if segment.sigmas is None:
-            raise ValueError("Flux2KleinDiffusionStage.replay: segment.sigmas missing")
-        if segment.latents.ndim != 5:
-            raise ValueError(
-                f"Flux2KleinDiffusionStage.replay: expected latents [B, K, C, H_pat, W_pat], "
-                f"got {tuple(segment.latents.shape)}"
-            )
-
-        sde_set = set(int(i) for i in segment.sde_indices.tolist())
-        target = (
-            [int(i) for i in step_indices]
-            if step_indices is not None
-            else [int(i) for i in segment.sde_indices.tolist()]
-        )
-        bad = [i for i in target if i not in sde_set]
-        if bad:
-            raise ValueError(
-                f"Flux2KleinDiffusionStage.replay: step_indices {bad} not in segment.sde_indices={sorted(sde_set)}"
-            )
-
-        device = segment.latents.device
-        sigmas = segment.sigmas.to(device)
-        sigma_max = sigmas[1].float() if int(sigmas.shape[0]) > 1 else torch.tensor(0.99)
-
+        device = segment.latents.device if segment.latents is not None else torch.device("cpu")
         autocast_ctx = (
             torch.autocast("cuda", self.autocast_dtype)
             if device.type == "cuda" and self.autocast_dtype in (torch.float16, torch.bfloat16)
             else nullcontext()
         )
-
         prior_training = self.model.transformer.training
         self.model.transformer.eval()
         try:
-            if self.batch_replay_steps and len(target) > 1 and isinstance(self.strategy, SDEStrategy):
-                with autocast_ctx:
-                    return self._replay_batched_steps(
-                        conditions,
-                        segment=segment,
-                        params=params,
-                        target=target,
-                        sigmas=sigmas,
-                        sigma_max=sigma_max,
-                        device=device,
-                    )
-
-            log_probs: List[torch.Tensor] = []
-            prev_sample_means: List[torch.Tensor] = []
             with autocast_ctx:
-                for step_idx in target:
-                    sigma = sigmas[step_idx].to(dtype=torch.float32)
-                    sigma_next = sigmas[step_idx + 1].to(dtype=torch.float32)
-                    sample = segment.latents_at(step_idx)
-                    prev_sample = segment.latents_at(step_idx + 1)
-                    _, log_prob, prev_mean = self.step.step_with_logp(
-                        self.model,
-                        conditions,
-                        strategy=self.strategy,
-                        sample=sample,
-                        prev_sample=prev_sample,
-                        sigma=sigma,
-                        sigma_next=sigma_next,
-                        guidance_scale=float(params.guidance_scale),
-                        eta=float(params.eta),
-                        sigma_max=sigma_max,
-                        step_index=step_idx,
-                    )
-                    if log_prob is None:
-                        raise RuntimeError(
-                            f"Flux2KleinDiffusionStage.replay: strategy returned None "
-                            f"log-prob at step_index={step_idx} (deterministic mode); "
-                            f"replay requires a stochastic SDE strategy."
-                        )
-                    log_probs.append(log_prob)
-                    if prev_mean is not None:
-                        prev_sample_means.append(prev_mean)
+                return self.replay_steps(
+                    conditions,
+                    segment=segment,
+                    params=params,
+                    step_indices=step_indices,
+                    expected_ndim=5,
+                    ndim_hint="[B, K, C, H_pat, W_pat]",
+                )
         finally:
             if prior_training:
                 self.model.transformer.train()
-
-        log_probs_t = torch.stack(log_probs, dim=1).to(dtype=self.logprob_dtype)
-        means_t = torch.stack(prev_sample_means, dim=1) if prev_sample_means else None
-        return ReplayResult(log_probs=log_probs_t, prev_sample_means=means_t)
-
-    @staticmethod
-    def _tile_conditions(conditions: Flux2KleinConditions, repeats: int) -> Flux2KleinConditions:
-        def _rep(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            return t.repeat(repeats, *([1] * (t.dim() - 1))) if t is not None else None
-
-        def _tile(cond: Optional[TextEmbedCondition]) -> Optional[TextEmbedCondition]:
-            if cond is None:
-                return None
-            return TextEmbedCondition(
-                embeds=_rep(cond.embeds), pooled=_rep(cond.pooled), attn_mask=_rep(cond.attn_mask)
-            )
-
-        return Flux2KleinConditions(
-            text=_tile(conditions.text),
-            negative_text=_tile(conditions.negative_text),
-            image_latent=_rep(conditions.image_latent),
-            image_latent_ids=_rep(conditions.image_latent_ids),
-        )
 
     def predict_noise_at_step(
         self,
@@ -491,7 +383,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
         *,
         sample: torch.Tensor,
         sigma: torch.Tensor,
-        params: Flux2KleinDiffusionParams,
+        params: DiffusionSamplingParams,
     ) -> torch.Tensor:
         """Single ``(xt, sigma)`` model forward — no scheduler iteration."""
         return self.step.predict_noise(
@@ -499,7 +391,7 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
             sample,
             sigma,
             conditions,
-            guidance_scale=float(params.guidance_scale),
+            guidance_scale=params.guidance_scale,
         )
 
     def trainable_module(self) -> "torch.nn.Module":
@@ -508,7 +400,6 @@ class Flux2KleinDiffusionStage(BatchedStepReplayMixin, DiffusionStage[Flux2Klein
 
 
 __all__ = [
-    "Flux2KleinDiffusionParams",
     "Flux2KleinDiffusionStage",
     "Flux2KleinDiffusionStep",
 ]

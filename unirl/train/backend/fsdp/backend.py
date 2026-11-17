@@ -57,6 +57,11 @@ class FSDPBackend(BaseFSDP2Backend):
         self._bundle = bundle
         self._rank = int(rank)
         self._device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if fsdp_cfg.expandable_segments:
+            require(self._device.type == "cuda", "FSDP expandable_segments requires a CUDA device.")
+            # Setting the allocator re-parses the whole config, resetting keys it omits.
+            launch_cfg = os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or os.environ.get("PYTORCH_ALLOC_CONF")
+            torch.cuda.memory._set_allocator_settings(",".join(filter(None, (launch_cfg, "expandable_segments:True"))))
         if fsdp_cfg.copy_engine_all_gather:
             require(
                 normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "no_shard",
@@ -118,11 +123,11 @@ class FSDPBackend(BaseFSDP2Backend):
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             forward_prefetch=fsdp_cfg.forward_prefetch,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
-            ac_wrap_order=getattr(fsdp_cfg, "ac_wrap_order", "outside"),
+            ac_wrap_order=fsdp_cfg.ac_wrap_order,
             use_torch_compile=fsdp_cfg.use_torch_compile,
-            master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_dtype=fsdp_cfg.master_dtype,
             master_params=tuple(shd for _, shd in shadow.iter_pairs()) if shadow is not None else (),
-            root_wrap=getattr(fsdp_cfg, "root_wrap", True),
+            root_wrap=fsdp_cfg.root_wrap,
             copy_engine_all_gather=fsdp_cfg.copy_engine_all_gather,
         )
 

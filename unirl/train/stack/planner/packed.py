@@ -69,11 +69,7 @@ def balance_into_k(samples: List[Sample], *, cost: Cost, k: int) -> List[List[Sa
 
 def _prompt_lengths(part: Part, total: int) -> Optional[List[int]]:
     """Per-sample prompt token counts from ``conditions['prompt'].attention_mask`` (None if absent)."""
-    conditions = getattr(part, "conditions", None)
-    if isinstance(conditions, dict):
-        prompt = conditions.get("prompt")
-    else:
-        prompt = getattr(conditions, "prompt", None) if conditions is not None else None
+    prompt = part.conditions.get("prompt")
     pmask = getattr(prompt, "attention_mask", None) if prompt is not None else None
     if isinstance(pmask, torch.Tensor) and pmask.dim() == 2 and int(pmask.shape[0]) == total:
         return [int(p) for p in pmask.long().sum(dim=-1).tolist()]
@@ -84,7 +80,7 @@ def _extract_samples(part: Part) -> Optional[List[Sample]]:
     """Clamped :class:`Sample` list from a track, or ``None`` when it exposes no per-sample lengths."""
     total = int(part.batch_size)
     segment = part.segment
-    raw = getattr(segment, "lengths", None) if segment is not None else None
+    raw = segment.lengths if segment is not None else None
     if not (isinstance(raw, torch.Tensor) and raw.numel() == total):
         return None
     resp_lens = [int(x) for x in raw.tolist()]

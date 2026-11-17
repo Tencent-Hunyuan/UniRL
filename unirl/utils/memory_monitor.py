@@ -69,7 +69,7 @@ class MemoryMonitor:
         empty_cache_at: Sequence[str] = (),
     ) -> None:
         self.log_boundaries = bool(log_boundaries)
-        self.empty_cache_at = tuple(empty_cache_at or ())
+        self.empty_cache_at = tuple(empty_cache_at)
         self._step_max: Dict[str, float] = {}
         self._fallback = None
         self._installed = False
@@ -84,7 +84,7 @@ class MemoryMonitor:
             return []
         if isinstance(results, dict):
             results = [results]
-        return [r for r in (results or []) if r]
+        return [] if results is None else [r for r in results if r]
 
     def _fold(self, readings: List[Dict[str, float]]) -> None:
         for r in readings:
@@ -206,9 +206,10 @@ class MemoryMonitor:
 
 def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:
     """Build a monitor from the trainer's ``logging.memory`` block (or env override)."""
-    logging_cfg = getattr(trainer, "logging_cfg", None) or {}
-    mem_cfg = logging_cfg.get("memory") if hasattr(logging_cfg, "get") else None
-    mem_cfg = mem_cfg or {}
+    logging_cfg = trainer.logging_cfg
+    mem_cfg = logging_cfg.get("memory") if logging_cfg is not None else None
+    if mem_cfg is None:
+        mem_cfg = {}
     enabled = bool(mem_cfg.get("enabled", False))
     env_override = os.environ.get("UNIRL_MEM_MONITOR")
     if env_override is not None:
@@ -223,7 +224,8 @@ def install_memory_monitoring(trainer: Any) -> Optional[MemoryMonitor]:
             enabled = True
     if not enabled:
         return None
+    empty_cache_at = mem_cfg.get("empty_cache_at")
     return MemoryMonitor(
         log_boundaries=bool(mem_cfg.get("log_boundaries", False)),
-        empty_cache_at=tuple(mem_cfg.get("empty_cache_at", ()) or ()),
+        empty_cache_at=() if empty_cache_at is None else tuple(empty_cache_at),
     )

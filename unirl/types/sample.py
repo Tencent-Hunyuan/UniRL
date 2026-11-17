@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
-from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
@@ -112,19 +112,6 @@ class Part(Batch):
             )
 
     @classmethod
-    def concat(cls, items: Sequence["Part"]) -> "Part":
-        """Concat batch rows while requiring identical shared primitive metadata."""
-        if items:
-            expected = items[0].primitive_metadata
-            mismatched = [i for i, item in enumerate(items[1:], start=1) if item.primitive_metadata != expected]
-            if mismatched:
-                raise ValueError(
-                    "Part.concat: primitive_metadata must be identical across shards; "
-                    f"mismatched item indices {mismatched}."
-                )
-        return super().concat(items)
-
-    @classmethod
     def input(
         cls,
         sample_ids: List[str],
@@ -165,14 +152,6 @@ class Part(Batch):
         if self.sample_ids:
             return len(self.sample_ids)
         return super().batch_size
-
-    def validated_sample_ids(self, *, context: str) -> List[str]:
-        """Return non-empty unique sample identities or raise."""
-        if not all(isinstance(sample_id, str) and sample_id.strip() for sample_id in self.sample_ids):
-            raise ValueError(f"{context} requires non-empty string sample_ids")
-        if len(set(self.sample_ids)) != len(self.sample_ids):
-            raise ValueError(f"{context} requires globally unique sample_ids")
-        return self.sample_ids
 
     @property
     def is_root(self) -> bool:
@@ -228,7 +207,6 @@ class Part(Batch):
             raise ValueError("Part.fork: parent has no sample_ids")
         if branch < 1:
             raise ValueError(f"Part.fork: branch must be >= 1, got {branch}")
-        self.validated_sample_ids(context="Part.fork")
 
         child_sample_ids = [child_id(pid, j) for pid in self.sample_ids for j in range(branch)]
 
@@ -378,7 +356,7 @@ class Part(Batch):
         segment_fields = {f.name: getattr(segment, f.name) for f in dc_fields(segment)}
         segment_fields["token_advantages"] = token_advantages
         segment_fields["returns"] = token_returns
-        updated_segment = segment._rebuild(segment_fields)
+        updated_segment = segment.rebuild(segment_fields)
 
         loss_mask = None
         if segment.loss_mask is not None:
@@ -423,6 +401,10 @@ class Sample(Batch):
         for i, p in enumerate(self.parts):
             if len(p.sample_ids) == 0:
                 continue
+            if not all(isinstance(sid, str) and sid.strip() for sid in p.sample_ids):
+                raise ValueError(f"Sample.parts[{i}] requires non-empty string sample_ids")
+            if len(set(p.sample_ids)) != len(p.sample_ids):
+                raise ValueError(f"Sample.parts[{i}] has duplicate sample_ids")
             if p.is_root:
                 if i != 0:
                     raise ValueError(
@@ -512,6 +494,25 @@ class Sample(Batch):
         by_root_id = dict(zip(root.sample_ids, root.metadata))
         return [by_root_id.get(rgid) for rgid in self.root_group_ids(part_index)]
 
+    def canvases(self) -> List[Tuple[int, int]]:
+        """Output canvas ``(H, W)`` per frontier row: the root row's ``metadata["canvas"]``, else the sampling one."""
+        params = self.parts[-1].sampling_params
+        default = (params.height, params.width)
+        canvases = [meta["canvas"] if meta and "canvas" in meta else default for meta in self.root_metadata()]
+        for canvas in canvases:
+            is_pair = isinstance(canvas, (list, tuple)) and len(canvas) == 2
+            if not is_pair or not all(type(side) is int and side > 0 for side in canvas):
+                raise ValueError(f"metadata['canvas'] must be [height, width] in positive pixels; got {canvas!r}.")
+        return [tuple(canvas) for canvas in canvases]
+
+    def reject_row_canvases(self, *, engine: str) -> None:
+        """Raise when dataset rows ask for their own canvas on an engine that renders one canvas per request."""
+        if any(meta and "canvas" in meta for meta in self.root_metadata()):
+            raise ValueError(
+                f"{engine}: dataset rows carry metadata['canvas'], but this engine renders every row at "
+                "sampling.height/width; per-row canvases need the vLLM-Omni BAGEL engine."
+            )
+
     def gen_parts(self) -> List[Part]:
         """The generated (non-input) Parts — those with :attr:`Part.is_gen`."""
         return [p for p in self.parts if p.is_gen]
@@ -592,7 +593,7 @@ class Sample(Batch):
     def select(self, indices: "torch.Tensor") -> "Sample":
         """Gather whole root prompt-trees by index (shuffle / subsample), mirroring"""
         groups = self.split()
-        idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+        idx = indices.tolist() if isinstance(indices, torch.Tensor) else list(indices)
         picked = [groups[int(i)] for i in idx]
         parts = Sample.concat(picked).parts if picked else []
         return type(self)(parts=parts, reward_compute_s=self.reward_compute_s)

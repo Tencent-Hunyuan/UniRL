@@ -75,7 +75,7 @@ class VLMAdapter(TextLMAdapter):
             "add_generation_prompt": True,
             "tokenize": False,
         }
-        template_kwargs.update(self.cfg.chat_template_kwargs or {})
+        template_kwargs.update(self.cfg.chat_template_kwargs)
         processor_messages = [
             {
                 **message,

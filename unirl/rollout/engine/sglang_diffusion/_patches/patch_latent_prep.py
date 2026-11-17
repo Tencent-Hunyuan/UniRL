@@ -2,23 +2,20 @@
 
 from __future__ import annotations
 
-import logging
 import math
 import os
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 _DEBUG = os.environ.get("UNIRL_DEBUG_LATENT_SHAPE") == "1"
 
 
 def _expand_initial_noise(latents: torch.Tensor, batch_size: int, num_outputs_per_prompt: int) -> torch.Tensor:
     """Expand provided initial noise to ``batch_size`` (fork's rule)."""
-    n = int(latents.shape[0])
+    n = latents.shape[0]
     if n == batch_size:
         return latents
-    nopp = max(1, int(num_outputs_per_prompt))
+    nopp = max(1, num_outputs_per_prompt)
     num_prompts = batch_size // nopp
     if n == 1:
         return latents.expand(batch_size, *latents.shape[1:]).contiguous()
@@ -42,31 +39,28 @@ def patch_latent_prep() -> None:
         return
 
     def forward(self, batch, server_args):
-        latents = getattr(batch, "latents", None)
+        latents = batch.latents
 
         if latents is None or not torch.is_tensor(latents):
             return orig(self, batch, server_args)
 
         device = get_local_torch_device()
-        batch_size = int(batch.batch_size)
-        nopp = int(getattr(batch, "num_outputs_per_prompt", 1) or 1)
+        batch_size = batch.batch_size
+        nopp = batch.num_outputs_per_prompt
         pcfg = server_args.pipeline_config
 
         latents = _expand_initial_noise(latents, batch_size, nopp).to(device=device)
 
-        try:
-            num_frames = int(getattr(batch, "num_frames", 1) or 1)
-            expected = tuple(int(d) for d in pcfg.prepare_latent_shape(batch, batch_size, num_frames))
-            if (
-                latents.ndim == 4
-                and len(expected) == 5
-                and expected[1] == int(latents.shape[1])
-                and expected[2] == 1
-                and latents.numel() == math.prod(expected)
-            ):
-                latents = latents.reshape(expected)
-        except Exception as exc:  # pragma: no cover - defensive; preserve prior behavior on any failure
-            logger.warning("latent_prep frame-axis reconcile skipped: %s: %s", type(exc).__name__, exc)
+        num_frames = batch.num_frames
+        expected = tuple(pcfg.prepare_latent_shape(batch, batch_size, num_frames))
+        if (
+            latents.ndim == 4
+            and len(expected) == 5
+            and expected[1] == latents.shape[1]
+            and expected[2] == 1
+            and latents.numel() == math.prod(expected)
+        ):
+            latents = latents.reshape(expected)
 
         latent_ids = pcfg.maybe_prepare_latent_ids(latents)
         if latent_ids is not None:
@@ -80,7 +74,7 @@ def patch_latent_prep() -> None:
         batch.latents = latents
         batch.raw_latent_shape = latents.shape
         if _DEBUG:
-            lid_shape = getattr(batch.latent_ids, "shape", None) if hasattr(batch, "latent_ids") else None
+            lid_shape = batch.latent_ids.shape if batch.latent_ids is not None else None
             print(
                 f"[UNIRL latent_prep] batch_size={batch_size} latents={tuple(latents.shape)} "
                 f"latent_ids={tuple(lid_shape) if lid_shape is not None else None} "

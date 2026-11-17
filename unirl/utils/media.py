@@ -40,10 +40,8 @@ def tensor_to_pil(images: torch.Tensor) -> List[Any]:
 
 def hstack_pils(left: Any, right: Any) -> Any:
     """Stack two PIL images side by side ("input | output"), matching heights."""
-    try:
-        from PIL import Image
-    except Exception:
-        return right
+    from PIL import Image
+
     if right.height != left.height:
         new_w = max(1, int(round(right.width * left.height / right.height)))
         right = right.resize((new_w, left.height))

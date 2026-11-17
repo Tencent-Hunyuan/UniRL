@@ -4,7 +4,7 @@
 # GRPO baseline for the DRPO comparison: the SAME model / data / SGLang rollout /
 # full-weight TensorWeightSync / sampling / advantage normalization as
 # qwen3_drpo_4b_base_dapo_sglang, with the DRPO trust-region loss swapped for
-# plain PPO-clip (GRPO, _grpo_clip_loss). Matches verl's `vanilla` GRPO
+# plain PPO-clip (GRPO, grpo_clip_loss). Matches verl's `vanilla` GRPO
 # reference (released run_qwen3_4b.sh):
 #   - DAPO clip-higher (eps_low 0.2 / eps_high 0.28)
 #   - loss_agg_mode=seq-mean-token-sum-norm (length-unbiased, per-seq token-sum
@@ -167,7 +167,7 @@ reward:
       _target_: unirl.reward.local.mathverify.MathVerifySpec
 
 algorithm:
-  # Plain PPO-clip GRPO (shares _grpo_clip_loss with FlowGRPO). old_logp =
+  # Plain PPO-clip GRPO (shares grpo_clip_loss with FlowGRPO). old_logp =
   # the SGLang rollout log-prob (segment.log_probs), frozen across the 4 mini-batch
   # updates below (rollout-anchored ratio, = verl bypass_mode=True parity; the
   # ratio also absorbs the rollout-vs-train engine gap — same trade-off as DRPO's

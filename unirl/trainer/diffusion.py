@@ -1,7 +1,6 @@
 import dataclasses
 import inspect
 import logging
-import os
 import sys
 import time
 from contextlib import contextmanager
@@ -79,7 +78,7 @@ def _validate_dp_geometry(
         "reward_dp_size": reward_dp_size,
         "train_dp_size": train_dp_size,
     }
-    invalid = {name: value for name, value in values.items() if int(value) < 1}
+    invalid = {name: value for name, value in values.items() if value < 1}
     if invalid:
         raise ValueError(f"Diffusion DP geometry values must be positive; got {invalid}.")
 
@@ -107,7 +106,6 @@ def _validate_dp_geometry(
 def _preflight_trainside_geometry(
     *,
     num_devices: int,
-    layout: str,
     reward_fraction: float,
     batch_size: int,
     samples_per_prompt: int,
@@ -115,13 +113,8 @@ def _preflight_trainside_geometry(
     prompt_local_rollout: bool,
     has_reward: bool,
     backend_cfg: DictConfig,
-    rollout_cfg: DictConfig,
 ) -> None:
     """Reject statically-known trainside DP geometry before constructing heavy model roles."""
-    rollout_target = str(rollout_cfg.get("_target_", ""))
-    if not rollout_target.endswith(".TrainsideRolloutEngine") or layout == "separate":
-        return
-
     shared_devices_f = (1.0 - reward_fraction) * num_devices
     shared_devices = int(round(shared_devices_f))
     if abs(shared_devices_f - shared_devices) > 1e-9:
@@ -133,7 +126,7 @@ def _preflight_trainside_geometry(
     # The recipe carries a raw DictConfig, so unset keys fall back to the one
     # place the defaults live rather than to literals repeated here.
     fsdp_cfg = backend_cfg.get("fsdp_cfg", {})
-    sp_size = int(fsdp_cfg.get("sp_size", None) or FSDPConfig.sp_size)
+    sp_size = fsdp_cfg.get("sp_size") or FSDPConfig.sp_size
     if shared_devices % sp_size:
         raise ValueError(
             f"Static trainside geometry: {shared_devices} shared devices are not divisible by sp_size={sp_size}."
@@ -143,7 +136,7 @@ def _preflight_trainside_geometry(
     resolve_fsdp_mesh_shape(
         fsdp_cfg.get("fsdp_mode", FSDPConfig.fsdp_mode),
         world_size=shared_devices,
-        hsdp_shard_size=int(fsdp_cfg.get("hsdp_shard_size", None) or FSDPConfig.hsdp_shard_size),
+        hsdp_shard_size=fsdp_cfg.get("hsdp_shard_size") or FSDPConfig.hsdp_shard_size,
     )
     shared_dp_size = shared_devices // sp_size
 
@@ -245,16 +238,16 @@ def build_eval_sampling(
         raise ValueError("build_eval_sampling: sampling params carry no `diffusion` entry to override.")
     field_names = {f.name for f in dataclasses.fields(base)}
 
-    updates: Dict[str, Any] = {"eta": float(eta)}
+    updates: Dict[str, Any] = {"eta": eta}
     if samples_per_prompt is not None:
-        updates["samples_per_prompt"] = int(samples_per_prompt)
+        updates["samples_per_prompt"] = samples_per_prompt
     updates.update(_resolve_overrides(overrides, field_names))
 
-    steps = int(updates.get("num_inference_steps", base.num_inference_steps))
-    if float(updates["eta"]) <= 0.0:
+    steps = updates.get("num_inference_steps", base.num_inference_steps)
+    if updates["eta"] <= 0.0:
         updates["sde_indices"] = []
         updates["scheduler"] = None
-    elif steps != int(base.num_inference_steps):
+    elif steps != base.num_inference_steps:
         raise ValueError(
             f"eval eta={updates['eta']} leaves the SDE gate on, but eval_sampling.num_inference_steps"
             f"={steps} differs from the rollout's {base.num_inference_steps}: the gated step indices "
@@ -328,41 +321,97 @@ class DiffusionTrainer(BaseTrainer):
         eval_rewards_cfg: Optional[Any] = None,
         control: Optional[Dict[str, Any]] = None,
     ) -> None:
+        reject_retired_eval_keys(cfg)
+        reject_retired_residency_keys(cfg)
+        if layout not in ("colocate", "separate"):
+            raise ValueError(f"DiffusionTrainer: layout must be 'colocate' or 'separate', got {layout!r}.")
+        rollout_parsed = parse_hydra_cfg(rollout_cfg)
+        takes_pipeline = "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters
+        if takes_pipeline:
+            if layout == "separate":
+                raise ValueError(
+                    "layout='separate' requires a dedicated-rollout engine "
+                    "(vllm/sglang); the trainside direct-sampling engine needs "
+                    "the pipeline as a local sibling and cannot live on a "
+                    "separate slab."
+                )
+            if sync_cfg is not None:
+                raise ValueError(
+                    "DiffusionTrainer: trainside direct-sampling engine reads the live training weights and cannot use a `sync:` block."
+                )
+        elif sync_cfg is None:
+            raise ValueError("DiffusionTrainer: dedicated rollout engine requires a `sync:` block.")
+        algo_cls = get_class(algorithm_cfg["_target_"])
+        self._uses_ema = algo_cls.requires_ema_rollout
+        # requires_advantages=False algorithms keep rewards for monitoring only.
+        self._algo_requires_advantages = algo_cls.requires_advantages
+        self.eval_interval = eval_interval
+        if reward_cfg is None:
+            if self._algo_requires_advantages:
+                raise ValueError(
+                    "The recipe has no `reward:` block, but the algorithm requires advantages "
+                    "(requires_advantages=True) — RL training cannot run without a reward model. "
+                    "Only supervised/teacher-anchored algorithms may omit `reward:`."
+                )
+            if self.eval_interval > 0:
+                raise ValueError(
+                    f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
+                    "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
+                    "(monitoring-only) reward."
+                )
+        if not 0.0 <= reward_fraction < 1.0:
+            raise ValueError(f"reward_fraction must be in [0, 1), got {reward_fraction}")
+        if layout == "separate" and train_fraction + reward_fraction >= 1.0:
+            raise ValueError(
+                f"layout='separate' leaves no rollout GPUs: train_fraction ({train_fraction}) "
+                f"+ reward_fraction ({reward_fraction}) must be < 1.0"
+            )
+        reward_separate = reward_fraction > 0.0
+        if reward_separate and reward_cfg is None:
+            raise ValueError(
+                f"reward_fraction={reward_fraction} carves reward its own slab, but the recipe "
+                "has no `reward:` block — drop reward_fraction or configure a reward."
+            )
+        if reward_stack_cfg is not None:
+            if reward_cfg is None:
+                raise ValueError("reward_stack needs a `reward:` block: it scores every micro through that sibling.")
+            if layout != "colocate" or reward_fraction > 0.0:
+                raise ValueError(
+                    "reward_stack needs layout='colocate' with reward_fraction=0, so the engine and the reward share a "
+                    f"Worker; got layout={layout!r}, reward_fraction={reward_fraction}."
+                )
+            if not reward_resident:
+                raise ValueError(
+                    "reward_stack needs reward_resident=true: it scores inside the rollout window, where a parked "
+                    "reward is never woken."
+                )
         super().__init__(
             cfg=cfg,
             logging_cfg=logging_cfg,
             worker_max_concurrency=worker_max_concurrency,
         )
-        reject_retired_eval_keys(cfg)
-        reject_retired_residency_keys(cfg)
         self.batch_size = batch_size
-        self._layout = str(layout)
-        self._train_fraction = float(train_fraction)
+        self._train_fraction = train_fraction
         # Residency is per role and phase-independent: `true` keeps a role's
         # weights on the GPU while it is idle, `false` parks them on CPU. No
         # value here ever stops a role's process; only its weights move.
-        self._residency_policy = ResidencyPolicy(
+        residency_policy = ResidencyPolicy(
             train_resident=train_resident,
             rollout_resident=rollout_resident,
             reward_resident=reward_resident,
         )
         self._residency: Optional[ResidencyPlanner] = None
-        self._adv_use_global_std = bool(adv_use_global_std)
-        self.eval_interval = int(eval_interval)
-        self.eval_num_prompts = int(eval_num_prompts)
-        self.eval_samples_per_prompt = int(eval_samples_per_prompt)
-        self.eval_chunk_prompts = int(eval_chunk_prompts)
-        self.eval_eta = float(eval_eta)
-        self._eval_rewards_cfg = eval_rewards_cfg
+        self._adv_use_global_std = adv_use_global_std
+        self.eval_num_prompts = eval_num_prompts
+        self.eval_samples_per_prompt = eval_samples_per_prompt
+        self.eval_chunk_prompts = eval_chunk_prompts
+        self.eval_eta = eval_eta
         self._eval_suites: List[EvalRewardSuite] = []
         self._control: Dict[str, Any] = dict(control) if control else {}
-        self._rollout_is_trainside = False
-        self._uses_ema = False
         # Set from the built weight_sync's capabilities in _build_residency_planner.
         self._staged_weight_sync = False
 
         self.data_source = instantiate(data_source_cfg)
-        self._data_source_cfg = data_source_cfg
 
         self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         # Frozen at init, so overlay contradictions surface at startup rather than an
@@ -374,84 +423,54 @@ class DiffusionTrainer(BaseTrainer):
             overrides=eval_sampling_cfg,
         )
 
-        self._noise_latent_shape: Optional[list] = (
-            None
-            if os.environ.get("DISABLE_DRIVER_XT")
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self.sampling_params.get("diffusion"),
-            )
+        self._noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self.sampling_params["diffusion"],
         )
         # Eval may render at its own resolution, so the driver-authored x_T has to
         # match THAT geometry rather than the rollout's.
-        self._eval_noise_latent_shape: Optional[list] = (
-            None
-            if self._noise_latent_shape is None
-            else self._resolve_noise_latent_shape(
-                pipeline_cfg=pipeline_cfg,
-                model_cfg=bundle_cfg,
-                sampling_spec=self._eval_sampling_params.get("diffusion"),
-            )
+        self._eval_noise_latent_shape: Optional[list] = self._resolve_noise_latent_shape(
+            pipeline_cfg=pipeline_cfg,
+            model_cfg=bundle_cfg,
+            sampling_spec=self._eval_sampling_params["diffusion"],
         )
         if self.eval_interval > 0 and bool((self.logging_cfg or {}).get("log_media", False)):
-            eval_diffusion = self._eval_sampling_params.get("diffusion")
-            if self._eval_noise_latent_shape is None or bool(eval_diffusion.disable_driver_xt):
+            eval_diffusion = self._eval_sampling_params["diffusion"]
+            if self._eval_noise_latent_shape is None:
                 logger.warning(
                     "logging.log_media is on, but eval has no driver-authored x_T "
-                    "(DISABLE_DRIVER_XT / disable_driver_xt, or latent_shape() opted out), so "
+                    "(disable_driver_xt, or latent_shape() opted out), so "
                     "every eval draws fresh noise and the eval panel will not be comparable "
                     "across evals."
                 )
-            elif float(eval_diffusion.eta) > 0.0:
+            elif eval_diffusion.eta > 0.0:
                 logger.warning(
                     "logging.log_media is on with eval eta=%.2f > 0: x_T is prompt-keyed, but "
                     "per-step SDE noise is seeded from the eval step's sample ids, so eval "
                     "panels differ by noise as well as policy. Set eval_eta: 0 for a "
                     "like-for-like filmstrip.",
-                    float(eval_diffusion.eta),
+                    eval_diffusion.eta,
                 )
 
         self.weight_sync = None
-        # None when the recipe has no ``reward:`` block (validated below).
+        # None when the recipe has no ``reward:`` block (validated above).
         self.reward = None
         self.reward_stack = None
 
-        reward_fraction = float(reward_fraction)
-        if not 0.0 <= reward_fraction < 1.0:
-            raise ValueError(f"reward_fraction must be in [0, 1), got {reward_fraction}")
-        if self._layout == "separate" and train_fraction + reward_fraction >= 1.0:
-            raise ValueError(
-                f"layout='separate' leaves no rollout GPUs: train_fraction ({train_fraction}) "
-                f"+ reward_fraction ({reward_fraction}) must be < 1.0"
-            )
-        reward_separate = reward_fraction > 0.0
-        if reward_separate and reward_cfg is None:
-            raise ValueError(
-                f"reward_fraction={reward_fraction} carves reward its own slab, but the recipe "
-                "has no `reward:` block — drop reward_fraction or configure a reward."
-            )
-        self._reward_is_separate = reward_separate
-        if reward_stack_cfg is not None:
-            self._check_reward_stack_layout(
-                has_reward=reward_cfg is not None,
-                reward_resident=reward_resident,
+        if takes_pipeline:
+            _preflight_trainside_geometry(
+                num_devices=self.num_devices,
                 reward_fraction=reward_fraction,
+                batch_size=batch_size,
+                samples_per_prompt=total_samples_per_prompt(self.sampling_params),
+                num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+                prompt_local_rollout=self._prompt_local_rollout,
+                has_reward=reward_cfg is not None,
+                backend_cfg=backend_cfg,
             )
 
-        _preflight_trainside_geometry(
-            num_devices=int(self.num_devices),
-            layout=self._layout,
-            reward_fraction=reward_fraction,
-            batch_size=int(batch_size),
-            samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
-            prompt_local_rollout=self._prompt_local_rollout,
-            has_reward=reward_cfg is not None,
-            backend_cfg=backend_cfg,
-            rollout_cfg=rollout_cfg,
-        )
-
+        needs_backend = self._uses_ema or algo_cls.requires_backend
         train_cfgs = dict(
             bundle_cfg=bundle_cfg,
             pipeline_cfg=pipeline_cfg,
@@ -459,20 +478,25 @@ class DiffusionTrainer(BaseTrainer):
             reward_cfg=(None if reward_separate else reward_cfg),
             algorithm_cfg=algorithm_cfg,
             stack_cfg=stack_cfg,
+            needs_backend=needs_backend,
+            eval_rewards_cfg=eval_rewards_cfg,
+            data_source_cfg=data_source_cfg,
         )
-        if self._layout == "separate":
+        if layout == "separate":
             with placement(self.pool, fraction=train_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
-                if sync_cfg is not None:
-                    self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
+                self.weight_sync = remote_hydra(sync_cfg, backend=self.backend)
             with placement(self.pool, fraction=1.0 - train_fraction - reward_fraction, shared_workers=True):
-                self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=False)
-            if self.weight_sync is not None:
-                self._connect_separate(sync_cfg)
+                self.rollout = remote(**rollout_parsed)
+            self._connect_separate(sync_cfg)
         else:
             with placement(self.pool, fraction=1.0 - reward_fraction, shared_workers=True):
                 self._build_train_side(**train_cfgs)
-                self.rollout = self._build_rollout(rollout_cfg, allow_pipeline=True)
+                if takes_pipeline:
+                    # Shard trainside rollout over model DP to preserve SP prompt alignment.
+                    self.rollout = remote(**rollout_parsed, pipeline=self.pipeline, sp_size=self.backend.sp_size)
+                else:
+                    self.rollout = remote(**rollout_parsed)
                 if reward_stack_cfg is not None:
                     self.reward_stack = self._build_reward_stack(reward_stack_cfg)
                 if sync_cfg is not None:
@@ -481,41 +505,29 @@ class DiffusionTrainer(BaseTrainer):
         if reward_separate:
             with placement(self.pool, fraction=reward_fraction, shared_workers=True):
                 self.reward = remote_hydra(reward_cfg)
-                self._wire_eval_suites()
+                self._eval_suites = build_eval_suites(
+                    eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+                )
 
-        self._validate_reward_config()
         # Cross-rollout gradient accumulation: one optimizer step per M rollouts
         # (the MOPD task-cycle contract).
-        self.accumulate_rollouts = int(accumulate_rollouts)
+        self.accumulate_rollouts = accumulate_rollouts
         self._validate_accumulation(stack_cfg)
 
-        self._build_residency_planner()
+        self._build_residency_planner(
+            policy=residency_policy,
+            layout=layout,
+            reward_separate=reward_separate,
+        )
         _validate_dp_geometry(
-            batch_size=int(batch_size),
+            batch_size=batch_size,
             samples_per_prompt=total_samples_per_prompt(self.sampling_params),
-            num_updates_per_batch=int(stack_cfg.get("num_updates_per_batch", 1)),
-            rollout_dp_size=int(self.rollout.dp_size),
-            reward_dp_size=int(self.reward.dp_size) if self.reward is not None else 1,
-            train_dp_size=int(self.stack.dp_size),
+            num_updates_per_batch=stack_cfg.get("num_updates_per_batch", 1),
+            rollout_dp_size=self.rollout.dp_size,
+            reward_dp_size=self.reward.dp_size if self.reward is not None else 1,
+            train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
         )
-
-    def _validate_reward_config(self) -> None:
-        """A missing ``reward:`` block is legal only for requires_advantages=False algorithms."""
-        if self.reward is not None:
-            return
-        if self._algo_requires_advantages:
-            raise ValueError(
-                "The recipe has no `reward:` block, but the algorithm requires advantages "
-                "(requires_advantages=True) — RL training cannot run without a reward model. "
-                "Only supervised/teacher-anchored algorithms may omit `reward:`."
-            )
-        if self.eval_interval > 0:
-            raise ValueError(
-                f"eval_interval={self.eval_interval} needs a reward to score eval generations, "
-                "but the recipe has no `reward:` block. Set eval_interval: 0 or configure a "
-                "(monitoring-only) reward."
-            )
 
     def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
         """``accumulate_rollouts > 1`` needs single-update, non-EMA, cycle-aligned cadences."""
@@ -524,7 +536,7 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError(f"accumulate_rollouts must be >= 1, got {acc}")
         if acc == 1:
             return
-        n_updates = int(stack_cfg.get("num_updates_per_batch", 1) or 1)
+        n_updates = stack_cfg.get("num_updates_per_batch", 1) or 1
         if n_updates != 1:
             raise ValueError(
                 f"accumulate_rollouts={acc} requires stack.num_updates_per_batch == 1 "
@@ -556,12 +568,6 @@ class DiffusionTrainer(BaseTrainer):
                 "num_batches_per_epoch % len(teachers))."
             )
 
-    def _wire_eval_suites(self) -> None:
-        """Build the ``eval_rewards`` suites in the CALLER's placement scope."""
-        self._eval_suites = build_eval_suites(
-            self._eval_rewards_cfg, data_source_cfg=self._data_source_cfg, enabled=self.eval_interval > 0
-        )
-
     def _build_train_side(
         self,
         *,
@@ -571,6 +577,9 @@ class DiffusionTrainer(BaseTrainer):
         reward_cfg,
         algorithm_cfg,
         stack_cfg,
+        needs_backend: bool,
+        eval_rewards_cfg,
+        data_source_cfg,
     ) -> None:
         """Build the train-side remotes in the *currently active* placement scope."""
         self.bundle = remote_hydra(bundle_cfg)
@@ -578,19 +587,21 @@ class DiffusionTrainer(BaseTrainer):
         self.backend = remote_hydra(backend_cfg, bundle=self.bundle)
         if reward_cfg is not None:
             self.reward = remote_hydra(reward_cfg)
-            self._wire_eval_suites()
-        algo_cls = get_class(str(algorithm_cfg.get("_target_", "")))
-        self._uses_ema = getattr(algo_cls, "requires_ema_rollout", False)
-        # requires_advantages=False algorithms keep rewards for monitoring only.
-        self._algo_requires_advantages = getattr(algo_cls, "requires_advantages", True)
-        needs_backend = self._uses_ema or getattr(algo_cls, "requires_backend", False)
+            self._eval_suites = build_eval_suites(
+                eval_rewards_cfg, data_source_cfg=data_source_cfg, enabled=self.eval_interval > 0
+            )
         algo_extra = {"backend": self.backend} if needs_backend else {}
         self.algorithm = remote_hydra(algorithm_cfg, pipeline=self.pipeline, **algo_extra)
         self.stack = remote_hydra(stack_cfg, fsdp_backend=self.backend, algorithm=self.algorithm)
 
-    def _build_residency_planner(self) -> None:
+    def _build_residency_planner(
+        self,
+        *,
+        policy: ResidencyPolicy,
+        layout: str,
+        reward_separate: bool,
+    ) -> None:
         """Wire the residency planner to the roles that actually share this slab."""
-        policy = self._residency_policy
         # Capability, not class name: a parked trainer needs the push split into a
         # read (weights resident) and a load (rollout awake), which only the LoRA
         # syncs expose. Probe the built object so a new implementation is picked up
@@ -602,14 +613,15 @@ class DiffusionTrainer(BaseTrainer):
         # Train is parkable only where parking frees something the active role can
         # use: not on a separate slab, and not behind a trainside rollout, whose
         # generation reads the very weights that would be parked.
-        train_parkable = self._layout != "separate" and not self._rollout_is_trainside
+        rollout_is_trainside = self.weight_sync is None
+        train_parkable = layout != "separate" and not rollout_is_trainside
         if not policy.train_resident:
             # Order matters: an unparkable trainer is the more basic reason, and
             # reporting the sync instead would send the reader after the wrong knob.
             if not train_parkable:
                 reason = (
-                    f"layout: {self._layout} puts the trainer on its own slab"
-                    if self._layout == "separate"
+                    f"layout: {layout} puts the trainer on its own slab"
+                    if layout == "separate"
                     else "a trainside rollout generates from the trainer's own weights"
                 )
                 raise ValueError(
@@ -617,7 +629,7 @@ class DiffusionTrainer(BaseTrainer):
                     "move memory no other role can use. Drop the key instead of having the trainer "
                     "silently ignore the requested policy."
                 )
-            if self.weight_sync is not None and not self._staged_weight_sync:
+            if not self._staged_weight_sync:
                 raise ValueError(
                     "train_resident=false is not supported with this weight sync: "
                     f"{type(self.weight_sync).__name__} exposes sync() alone, which reads the "
@@ -625,7 +637,7 @@ class DiffusionTrainer(BaseTrainer):
                     "run with the trainer parked. Use a LoRA sync, or set train_resident=true "
                     "instead of having the trainer silently ignore the requested policy."
                 )
-            if self._uses_ema and not self._rollout_is_trainside:
+            if self._uses_ema:
                 raise ValueError(
                     "train_resident=false is not supported with EMA/DiffusionNFT algorithms and an "
                     "external colocated rollout: parking the trainer has not been validated against "
@@ -637,32 +649,14 @@ class DiffusionTrainer(BaseTrainer):
             train=(self.backend.onload, self.backend.offload) if train_parkable else None,
             rollout=(self.rollout.wake_up, self.rollout.sleep),
             reward=(
-                (self.reward.onload, self.reward.offload)
-                if self.reward is not None and not self._reward_is_separate
-                else None
+                (self.reward.onload, self.reward.offload) if self.reward is not None and not reward_separate else None
             ),
             run_steps=_run_cleanup_steps,
         )
 
-    def _build_rollout(self, rollout_cfg, *, allow_pipeline: bool):
-        """Build the rollout remote in the currently active placement scope."""
-        rollout_parsed = parse_hydra_cfg(rollout_cfg)
-        if "pipeline" in inspect.signature(rollout_parsed["role_cls"]).parameters:
-            if not allow_pipeline:
-                raise ValueError(
-                    "layout='separate' requires a dedicated-rollout engine "
-                    "(vllm/sglang); the trainside direct-sampling engine needs "
-                    "the pipeline as a local sibling and cannot live on a "
-                    "separate slab."
-                )
-            self._rollout_is_trainside = True
-            # Shard trainside rollout over model DP to preserve SP prompt alignment.
-            return remote(**rollout_parsed, pipeline=self.pipeline, sp_size=self.backend.sp_size)
-        return remote(**rollout_parsed)
-
     def _connect_separate(self, sync_cfg: DictConfig) -> None:
         """One-time cross-slab handshake: hand rank 0 the rollout Worker handles."""
-        if str(sync_cfg.get("_target_", "")).endswith("NCCLWeightSync"):
+        if sync_cfg["_target_"].endswith("NCCLWeightSync"):
             addr, port = self.weight_sync.pick_master()[0]
             self.weight_sync.set_rollout_targets(self.rollout.workers, self.rollout.role_name)
             self.weight_sync.connect(
@@ -677,10 +671,9 @@ class DiffusionTrainer(BaseTrainer):
         self, *, pipeline_cfg: DictConfig, model_cfg: DictConfig, sampling_spec: Any
     ) -> Optional[list]:
         """Per-sample latent shape for the driver-authored x_T recipe, or ``None``."""
-        target = getattr(pipeline_cfg, "_target_", None)
-        if not isinstance(target, str):
+        if sampling_spec.disable_driver_xt:
             return None
-        resolved = get_object(target)
+        resolved = get_object(pipeline_cfg["_target_"])
         pipeline_cls = resolved if isinstance(resolved, type) else getattr(resolved, "__self__", None)
         latent_shape_fn = getattr(pipeline_cls, "latent_shape", None)
         if latent_shape_fn is None:
@@ -689,7 +682,7 @@ class DiffusionTrainer(BaseTrainer):
             shape = latent_shape_fn(model_config=model_cfg, sampling_spec=sampling_spec)
         except NotImplementedError:
             return None
-        return [int(x) for x in shape]
+        return list(shape)
 
     def _build_request_sample(
         self,
@@ -701,7 +694,7 @@ class DiffusionTrainer(BaseTrainer):
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
         noise_latent_shape = self._eval_noise_latent_shape if sampling is not None else self._noise_latent_shape
-        diffusion = sp.get("diffusion")
+        diffusion = sp["diffusion"]
         sde_indices = diffusion.get_sde_indices(rollout_id)
         diffusion = dataclasses.replace(
             diffusion, sde_indices=sde_indices, scheduler=None, init_noise_latent_shape=noise_latent_shape
@@ -765,27 +758,12 @@ class DiffusionTrainer(BaseTrainer):
         self._residency.enter(Role.REWARD, preserve=preserve)
         yield
 
-    def _check_reward_stack_layout(self, *, has_reward: bool, reward_resident: bool, reward_fraction: float) -> None:
-        """Reject the layouts in which the stack could not reach the engine and the reward as in-process siblings."""
-        if not has_reward:
-            raise ValueError("reward_stack needs a `reward:` block: it scores every micro through that sibling.")
-        if self._layout != "colocate" or reward_fraction > 0.0:
-            raise ValueError(
-                "reward_stack needs layout='colocate' with reward_fraction=0, so the engine and the reward share a "
-                f"Worker; got layout={self._layout!r}, reward_fraction={reward_fraction}."
-            )
-        if not reward_resident:
-            raise ValueError(
-                "reward_stack needs reward_resident=true: it scores inside the rollout window, where a parked "
-                "reward is never woken."
-            )
-
     def _build_reward_stack(self, reward_stack_cfg: DictConfig) -> Any:
         """Build the stack beside the engine it wraps and reject the SP/TP layouts it inherits but cannot serve."""
         stack = remote_hydra(reward_stack_cfg, rollout=self.rollout, reward=self.reward)
-        if int(stack.dp_size) != int(self.rollout.dp_size):
+        if stack.dp_size != self.rollout.dp_size:
             raise ValueError(f"reward_stack dp_size={stack.dp_size} must equal rollout dp_size={self.rollout.dp_size}.")
-        if int(stack.sp_size) != 1 or int(stack.tp_size) != 1:
+        if stack.sp_size != 1 or stack.tp_size != 1:
             raise ValueError(
                 f"reward_stack needs sp_size=1 and tp_size=1, got sp_size={stack.sp_size}, tp_size={stack.tp_size}: "
                 "every rank of an SP or TP group would score the same shard, or nothing."
@@ -807,7 +785,7 @@ class DiffusionTrainer(BaseTrainer):
         will_park_train = not self._residency.policy.train_resident and self._residency.parkable(Role.TRAIN)
         # Swap EMA weights only for trainside rollout; remote engines receive
         # them through weight sync.
-        should_swap_ema = self._uses_ema and self._rollout_is_trainside
+        should_swap_ema = self._uses_ema and self.weight_sync is None
         staged_sync = False
         ema_apply_attempted = False
         generation_succeeded = False
@@ -967,7 +945,7 @@ class DiffusionTrainer(BaseTrainer):
                 "block) — evaluation scores generations and needs one."
             )
         eval_sp = self._eval_sampling_params
-        eval_diffusion = eval_sp.get("diffusion")
+        eval_diffusion = eval_sp["diffusion"]
         sync_requested = bool(sync_weights)
         sleep_requested = sleep_after and not self._residency.policy.rollout_resident
         # A no-sync evaluation must preserve the already-resident adapter.
@@ -1023,12 +1001,12 @@ class DiffusionTrainer(BaseTrainer):
         logger.info(
             "EVAL step %d  (%d samples/prompt, %d steps, %dx%d, cfg=%.1f eta=%.1f)  %s",
             step,
-            int(eval_diffusion.samples_per_prompt),
-            int(eval_diffusion.num_inference_steps),
-            int(eval_diffusion.height),
-            int(eval_diffusion.width),
-            float(eval_diffusion.guidance_scale),
-            float(eval_diffusion.eta),
+            eval_diffusion.samples_per_prompt,
+            eval_diffusion.num_inference_steps,
+            eval_diffusion.height,
+            eval_diffusion.width,
+            eval_diffusion.guidance_scale,
+            eval_diffusion.eta,
             "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()),
         )
         self.wandb_logger.log_eval(step, metrics)
@@ -1068,13 +1046,13 @@ class DiffusionTrainer(BaseTrainer):
         chunk = max(1, self.eval_chunk_prompts)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
-        sync_pending = bool(sync_weights)
+        sync_pending = sync_weights
         for start in range(0, n_prompts, chunk):
             sub = all_inputs.slice(start, min(start + chunk, n_prompts))
             _validate_prompt_tree_dp_geometry(
-                batch_size=int(sub.batch_size),
-                rollout_dp_size=int(self.rollout.dp_size),
-                reward_dp_size=int(self.reward.dp_size),
+                batch_size=sub.batch_size,
+                rollout_dp_size=self.rollout.dp_size,
+                reward_dp_size=self.reward.dp_size,
                 context=f"evaluation chunk [{start}:{start + sub.batch_size}]",
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)

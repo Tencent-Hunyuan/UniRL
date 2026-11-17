@@ -7,7 +7,8 @@ score = unweighted mean of the six per-tag accuracies.
 Protocol: 4 images/prompt. Scoring is the official pipeline — Mask2Former (Swin-S)
 detection + CLIP color check — available as the reward service `geneval` scorer, which
 is **disabled by default** (needs a Python 3.10 env; see
-`unirl-reward-service/README.md`). Enable it there, then:
+`unirl-reward-service/README.md`). Start it on a Python 3.10 host with
+`unirl-reward-service/configs/geneval_service.yaml`, then:
 
 ```bash
 python -m benchmarks.run -b image/geneval --ckpt <base> [--lora <ckpt>] --reward-url http://<host>:8080

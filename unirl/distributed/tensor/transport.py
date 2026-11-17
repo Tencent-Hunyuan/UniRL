@@ -155,19 +155,6 @@ class TensorTransport(abc.ABC):
             parts[k].append(b[s.start : s.stop])
         return {k: cat_rows(parts[k]) for k in metas}
 
-    def transform(self, meta: TensorRef, fn: Callable[[torch.Tensor], torch.Tensor]) -> TensorRef:
-        """Apply fn to the remote tensor, return new TensorRef."""
-        tensor = self.get(meta.spans)
-        result = fn(tensor)
-        ref = self.put(result)
-        bs = int(result.shape[0]) if result.dim() > 0 else 1
-        return TensorRef(
-            spans=[TensorSpan(ref, 0, bs)],
-            shape=tuple(result.shape),
-            dtype=result.dtype,
-            device=str(result.device),
-        )
-
     @classmethod
     def localize(cls, shards: list, pool: Any, device_ids: list, worker_ids: list) -> list:
         """Make every ref in each shard resolvable on its target worker."""

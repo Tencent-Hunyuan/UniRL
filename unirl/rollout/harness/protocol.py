@@ -9,12 +9,16 @@ if TYPE_CHECKING:
     from unirl.types.sample import Sample
 
 
+class ContextOverflowError(RuntimeError):
+    """A built prompt exceeded the engine's context window; the trajectory cannot continue."""
+
+
 @dataclass(frozen=True)
 class HarnessOutcome:
     """What one task run produced."""
 
     sample: "Sample"
-    status: Literal["completed", "suspended", "failed"]
+    status: Literal["completed", "suspended", "failed", "overflow"]
 
 
 @dataclass(frozen=True)
@@ -45,4 +49,4 @@ class RolloutHarness(Protocol):
     def run(self, request: "Sample", context: HarnessContext) -> HarnessOutcome: ...
 
 
-__all__ = ["HarnessContext", "HarnessOutcome", "RolloutHarness"]
+__all__ = ["ContextOverflowError", "HarnessContext", "HarnessOutcome", "RolloutHarness"]

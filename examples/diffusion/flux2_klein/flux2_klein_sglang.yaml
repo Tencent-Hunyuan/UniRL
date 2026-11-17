@@ -41,6 +41,7 @@ model_config:
   # Static-shift fallback only; Klein's checkpoint enables empirical-mu dynamic
   # shifting (build_schedule_policy) and this value is ignored at runtime.
   shift: 1.0
+  load_text_encoder: false
   load_vae: false
   # SGLang builds its LoRA ServerArgs from these fields. Keep this list aligned
   # with backend.lora_cfg.target_modules, which owns trainside PEFT injection.
@@ -82,6 +83,7 @@ pipeline:
   logprob_precision: fp32
   max_sequence_length: 512
   qwen3_extraction_layers: [9, 18, 27]
+  batch_replay_steps: true
   strategy: ${strategy}
 
 backend:

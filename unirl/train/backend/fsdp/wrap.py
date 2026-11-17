@@ -301,8 +301,14 @@ def _validate_hsdp_mesh(model: nn.Module, *, expected_mesh: object) -> None:
         actual_mesh is not None,
         "fsdp_wrap: hybrid mode produced no DTensor parameters; HSDP was not installed.",
     )
-    expected = (tuple(expected_mesh.mesh_dim_names or ()), tuple(int(size) for size in expected_mesh.shape))
-    actual = (tuple(actual_mesh.mesh_dim_names or ()), tuple(int(size) for size in actual_mesh.shape))
+    expected = (
+        () if expected_mesh.mesh_dim_names is None else expected_mesh.mesh_dim_names,
+        expected_mesh.shape,
+    )
+    actual = (
+        () if actual_mesh.mesh_dim_names is None else actual_mesh.mesh_dim_names,
+        actual_mesh.shape,
+    )
     require(
         actual == expected,
         f"fsdp_wrap: hybrid mode requested mesh {expected[0]}={expected[1]}, "

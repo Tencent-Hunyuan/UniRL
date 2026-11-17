@@ -102,8 +102,8 @@ class Flux2KleinBundle(Bundle):
         *,
         transformer: nn.Module,
         vae: Optional[nn.Module],
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         scheduler: Any,
         dtype: torch.dtype,
         device: torch.device,
@@ -171,16 +171,19 @@ class Flux2KleinBundle(Bundle):
             vae = AutoencoderKLFlux2.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype).to(device).eval()
             vae.requires_grad_(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
-        if getattr(tokenizer, "pad_token", None) is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        text_encoder = None
+        tokenizer = None
+        if config.load_text_encoder:
+            tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, subfolder="tokenizer")
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
 
-        text_encoder = (
-            AutoModelForCausalLM.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
+            text_encoder = (
+                AutoModelForCausalLM.from_pretrained(text_encoder_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 

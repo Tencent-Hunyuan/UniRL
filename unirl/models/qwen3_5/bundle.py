@@ -7,10 +7,14 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from packaging.version import Version
 
 from unirl.models.types.bundle import Bundle
-from unirl.models.types.meta_init import build_meta_init_transformer, capture_init_state, resolve_meta_init_weights
+from unirl.models.types.meta_init import (
+    build_meta_init_transformer,
+    capture_init_state,
+    finalize_meta_init,
+    resolve_meta_init_weights,
+)
 from unirl.utils.dtypes import parse_torch_dtype
 
 from .config import Qwen3_5PipelineConfig
@@ -87,25 +91,6 @@ def _patch_fast_pos_embed_interpolate(visual_module: nn.Module) -> None:
     visual_module.fast_pos_embed_interpolate = types.MethodType(fast_pos_embed_interpolate, visual_module)
 
 
-def _model_class_for(model_type: str):
-    """Return the HF ``ForConditionalGeneration`` class for ``model_type``."""
-    import transformers
-
-    version = Version(transformers.__version__)
-    if version < Version("5.0.0"):
-        raise RuntimeError(
-            f"Qwen3_5Bundle requires transformers >= 5.0 (got {transformers.__version__}); "
-            "Qwen3.5 is natively supported only from 5.0 onward."
-        )
-    if model_type == "qwen3_5":
-        from transformers import Qwen3_5ForConditionalGeneration as Cls
-    elif model_type == "qwen3_5_moe":
-        from transformers import Qwen3_5MoeForConditionalGeneration as Cls
-    else:
-        raise ValueError(f"Qwen3_5Bundle: unexpected model_type {model_type!r}; expected 'qwen3_5' or 'qwen3_5_moe'.")
-    return Cls
-
-
 class Qwen3_5Bundle(Bundle):
     """Qwen3.5 bundle: VL transformer + processor + tokenizer."""
 
@@ -142,13 +127,20 @@ class Qwen3_5Bundle(Bundle):
         if config.meta_init_transformer:
             transformer_weights_path = resolve_meta_init_weights(path)
 
-        hf_config = AutoConfig.from_pretrained(path, trust_remote_code=bool(config.trust_remote_code))
+        hf_config = AutoConfig.from_pretrained(path, trust_remote_code=config.trust_remote_code)
         model_type = hf_config.model_type
-        ModelCls = _model_class_for(model_type)
+        if model_type == "qwen3_5":
+            from transformers import Qwen3_5ForConditionalGeneration as ModelCls
+        elif model_type == "qwen3_5_moe":
+            from transformers import Qwen3_5MoeForConditionalGeneration as ModelCls
+        else:
+            raise ValueError(
+                f"Qwen3_5Bundle: unexpected model_type {model_type!r}; expected 'qwen3_5' or 'qwen3_5_moe'."
+            )
 
         load_kwargs = {}
-        if getattr(config, "attn_implementation", None):
-            load_kwargs["attn_implementation"] = str(config.attn_implementation)
+        if config.attn_implementation:
+            load_kwargs["attn_implementation"] = config.attn_implementation
 
         meta_init_state = None
         if config.meta_init_transformer:
@@ -188,15 +180,14 @@ class Qwen3_5Bundle(Bundle):
                     ops_implementation=ops,
                 )
                 meta_init_state = capture_init_state(transformer)
-                transformer = transformer.to(dtype)
-                transformer.init_weights = lambda: None
+                transformer = finalize_meta_init(transformer, dtype=dtype)
             else:
                 transformer, meta_init_state = build_meta_init_transformer(lambda: ModelCls(hf_config), dtype=dtype)
         else:
             transformer = ModelCls.from_pretrained(
                 path,
                 torch_dtype=dtype,
-                trust_remote_code=bool(config.trust_remote_code),
+                trust_remote_code=config.trust_remote_code,
                 **load_kwargs,
             ).to(device)
 
@@ -231,7 +222,7 @@ class Qwen3_5Bundle(Bundle):
 
         processor = AutoProcessor.from_pretrained(
             path,
-            trust_remote_code=bool(config.trust_remote_code),
+            trust_remote_code=config.trust_remote_code,
             min_pixels=config.min_pixels,
             max_pixels=config.max_pixels,
         )
@@ -254,7 +245,7 @@ class Qwen3_5Bundle(Bundle):
 
     def prepare_for_expert_parallel(self) -> None:
         """Validate that the meta-built Qwen3.5-MoE model exposes VeOmni's EP plan."""
-        model_type = getattr(getattr(self.transformer, "config", None), "model_type", None)
+        model_type = self.transformer.config.model_type
         if model_type != "qwen3_5_moe":
             raise ValueError(
                 f"Qwen3_5Bundle expert parallelism requires a qwen3_5_moe checkpoint; got model_type={model_type!r}."

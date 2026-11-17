@@ -20,9 +20,9 @@ class LTX2Bundle(Bundle):
         self,
         *,
         transformer: nn.Module,
-        vae: nn.Module,
-        text_encoder: nn.Module,
-        tokenizer: Any,
+        vae: Optional[nn.Module],
+        text_encoder: Optional[nn.Module],
+        tokenizer: Optional[Any],
         connectors: Optional[nn.Module],
         scheduler: Any,
         dtype: torch.dtype,
@@ -65,7 +65,7 @@ class LTX2Bundle(Bundle):
         device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if isinstance(device, str):
             device = torch.device(device)
-        aux_device = torch.device("cpu") if getattr(config, "aux_components_on_cpu", False) else device
+        aux_device = torch.device("cpu") if config.aux_components_on_cpu else device
 
         dtype = parse_torch_dtype(config.model_precision, field_name="model_precision")
         vae_raw = config.vae_dtype if config.vae_dtype is not None else config.model_precision
@@ -76,28 +76,36 @@ class LTX2Bundle(Bundle):
         transformer = LTX2VideoTransformer3DModel.from_pretrained(path, subfolder="transformer", torch_dtype=dtype)
         transformer = transformer.to(device, dtype=dtype)
 
-        vae = (
-            AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
-            .to(aux_device)
-            .eval()
-        )
-        vae.requires_grad_(False)
+        vae: Optional[nn.Module] = None
+        if config.load_vae:
+            vae = (
+                AutoencoderKLLTX2Video.from_pretrained(vae_path, subfolder="vae", torch_dtype=vae_dtype)
+                .to(aux_device)
+                .eval()
+            )
+            vae.requires_grad_(False)
 
-        text_encoder = (
-            Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
-            .to(aux_device)
-            .eval()
-        )
-        text_encoder.requires_grad_(False)
+        text_encoder: Optional[nn.Module] = None
+        tokenizer: Optional[Any] = None
+        connectors: Optional[nn.Module] = None
+        if config.load_text_encoder:
+            text_encoder = (
+                Gemma3ForConditionalGeneration.from_pretrained(te_path, subfolder="text_encoder", torch_dtype=te_dtype)
+                .to(aux_device)
+                .eval()
+            )
+            text_encoder.requires_grad_(False)
 
-        tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
+            tokenizer = AutoTokenizer.from_pretrained(te_path, subfolder="tokenizer")
 
-        from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+            from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
 
-        connectors = (
-            LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype).to(aux_device).eval()
-        )
-        connectors.requires_grad_(False)
+            connectors = (
+                LTX2TextConnectors.from_pretrained(path, subfolder="connectors", torch_dtype=dtype)
+                .to(aux_device)
+                .eval()
+            )
+            connectors.requires_grad_(False)
 
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(path, subfolder="scheduler")
 
@@ -139,7 +147,7 @@ class LTX2Bundle(Bundle):
             dtype=dtype,
             device=device,
             pretrained_path=path,
-            max_sequence_length=int(config.max_sequence_length),
+            max_sequence_length=config.max_sequence_length,
             audio_vae=audio_vae,
             vocoder=vocoder,
         )

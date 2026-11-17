@@ -1,21 +1,26 @@
-"""Qwen3 AR stage: typed params + per-token kernel + rollout-level stage."""
+"""Qwen3 AR stage: per-token kernel + rollout-level stage."""
 
 from __future__ import annotations
 
 import functools
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
-from dataclasses import field as dc_field
 from types import MethodType
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-from unirl.models.types.ar import ARSamplingParams, ARStage, ARStep, left_pad_prompt
+from unirl.models.types.ar import (
+    ARSamplingParams,
+    ARStage,
+    ARStep,
+    left_pad_prompt,
+    pack_generated_text_segment,
+    resolve_ar_stop_ids,
+)
 from unirl.models.types.replay_result import ReplayResult
 from unirl.types.segments import TextSegment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -44,10 +49,6 @@ def _packed_replay_supported(attn_impl: Optional[str]) -> bool:
     """Feature-detect the packed varlen replay prerequisites (review #43)."""
     if attn_impl not in _SPARSE_PACKED_ATTN:
         _warn_packed_disabled(str(attn_impl))
-        return False
-    try:
-        from transformers.masking_utils import find_packed_sequence_indices  # noqa: F401
-    except Exception:
         return False
     return True
 
@@ -180,17 +181,6 @@ def _finalize_replay_output(
     return ReplayResult(log_probs=log_probs, values=values.float())
 
 
-@dataclass
-class Qwen3ARParams:
-    """Per-request AR-mode knobs for Qwen3."""
-
-    max_tokens: int = 512
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 0
-    stop_token_ids: List[int] = dc_field(default_factory=list)
-
-
 class Qwen3ARStep(ARStep):
     """Per-token sampling kernel."""
 
@@ -248,10 +238,12 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         model: Qwen3Bundle,
         autocast_precision: str = "bf16",
         logprob_precision: str = "fp32",
+        replay_kernel_options: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model = model
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
+        self.replay_kernel_options = replay_kernel_options
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
@@ -265,7 +257,6 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         conditions: Qwen3ARConditions,
         *,
         sampling_params: ARSamplingParams,
-        params: Optional[Qwen3ARParams] = None,
         **_kwargs: Any,
     ) -> TextSegment:
         """Run AR generation. Returns a varlen-packed ``TextSegment``."""
@@ -285,17 +276,18 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         attention_mask: torch.Tensor = conditions.prompt.attention_mask
         device = input_ids.device
 
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         input_ids, attention_mask = left_pad_prompt(input_ids, attention_mask, pad_id)
         batch_size = int(input_ids.shape[0])
 
-        stop_ids = self._resolve_stop_ids(params, sampling_params)
+        stop_ids = resolve_ar_stop_ids(sampling_params, self.model.tokenizer)
         step = Qwen3ARStep(
-            temperature=float(sampling_params.temperature),
-            top_p=float(sampling_params.top_p),
-            top_k=int(sampling_params.top_k),
+            temperature=sampling_params.temperature,
+            top_p=sampling_params.top_p,
+            top_k=sampling_params.top_k,
         )
-        max_new = int(sampling_params.max_new_tokens)
+        max_new = sampling_params.max_new_tokens
 
         model_kwargs = {
             "attention_mask": attention_mask,
@@ -346,7 +338,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             model_kwargs = transformer._update_model_kwargs_for_generation(out, model_kwargs)
             model_kwargs["use_cache"] = True
             next_sequence_length = 1
-        return _pack_text_segment(generated_tokens, per_token_logps, device=device)
+        return pack_generated_text_segment(generated_tokens, per_token_logps, device=device)
 
     def replay(
         self,
@@ -358,7 +350,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
     ) -> Union[torch.Tensor, ReplayResult]:
         """Per-token log-prob replay; falls back to the dense ``[B, P_max + T_max]`` :meth:`padding_replay`."""
         _require_value_head_for_replay(self.model.transformer, return_values)
-        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        attn_impl = self.model.transformer.config._attn_implementation
         if _packed_replay_supported(attn_impl):
             packed = self.packed_replay(
                 conditions,
@@ -396,7 +388,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             return None
 
         lengths = [int(n) for n in segment.lengths.tolist()]
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
         real_prompt_lens_p = prompt_mask.long().sum(dim=-1)
 
         cu_p = [int(c) for c in segment.cu_seqlens.tolist()]
@@ -421,7 +414,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         bucket = 1024
         L = int(packed_ids.shape[1])
         target = ((L + bucket - 1) // bucket) * bucket
-        attn_impl = getattr(getattr(self.model.transformer, "config", None), "_attn_implementation", None)
+        attn_impl = self.model.transformer.config._attn_implementation
         if attn_impl != "flex_attention":
             target = L
         if target > L:
@@ -436,6 +429,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             position_ids=packed_pos,
             response_tokens=flat_resp,
             packed_predict_index=predict_index,
+            kernel_options=self.replay_kernel_options,
             prompt_len=0,
             temperature=temperature,
             return_values=return_values,
@@ -475,7 +469,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
 
         lengths = [int(n) for n in segment.lengths.tolist()]
         T_max = max(lengths) if lengths else 0
-        pad_id = self.model.tokenizer.pad_token_id or 0
+        raw_pad_id = self.model.tokenizer.pad_token_id
+        pad_id = 0 if raw_pad_id is None else int(raw_pad_id)
 
         response_tokens = torch.full((batch_size, T_max), pad_id, dtype=torch.long, device=device)
         response_mask = torch.zeros((batch_size, T_max), dtype=torch.long, device=device)
@@ -521,6 +516,7 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             attention_mask=full_mask,
             position_ids=position_ids,
             response_tokens=response_tokens,
+            kernel_options=self.replay_kernel_options,
             prompt_len=prompt_len,
             temperature=temperature,
             return_values=return_values,
@@ -555,42 +551,5 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
             raise ValueError("Qwen3ARStage.replay: return_values=True but critic returned no values")
         return ReplayResult(log_probs=log_probs, values=values)
 
-    def _resolve_stop_ids(
-        self,
-        params: Optional[Qwen3ARParams],
-        sampling_params: ARSamplingParams,
-    ) -> List[int]:
-        ids: List[int] = []
-        if params is not None and params.stop_token_ids:
-            ids.extend(int(t) for t in params.stop_token_ids)
-        if sampling_params.stop_token_id is not None:
-            ids.append(int(sampling_params.stop_token_id))
-        eos = self.model.tokenizer.eos_token_id
-        if eos is not None:
-            if isinstance(eos, (list, tuple)):
-                ids.extend(int(t) for t in eos)
-            else:
-                ids.append(int(eos))
-        seen: set = set()
-        out: List[int] = []
-        for t in ids:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out
 
-
-def _pack_text_segment(
-    generated_tokens: List[List[int]],
-    per_token_logps: List[List[float]],
-    *,
-    device: torch.device,
-) -> TextSegment:
-    """Pack per-sample lists of tokens / log-probs into a varlen ``TextSegment``."""
-    return TextSegment.pack(
-        tokens=[torch.tensor(toks, dtype=torch.long, device=device) for toks in generated_tokens],
-        log_probs=[torch.tensor(lps, dtype=torch.float32, device=device) for lps in per_token_logps],
-    )
-
-
-__all__ = ["Qwen3ARParams", "Qwen3ARStage", "Qwen3ARStep"]
+__all__ = ["Qwen3ARStage", "Qwen3ARStep"]

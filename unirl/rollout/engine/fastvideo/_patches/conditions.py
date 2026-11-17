@@ -54,7 +54,7 @@ class _ForwardResultPipe:
         cached = getattr(inner, "_unirl_last_forward_batch", None) if inner is not None else None
         if isinstance(payload, dict) and "output_batch" in payload and cached is not None:
             for name in _CARRIED:
-                payload.setdefault(name, _to_cpu(getattr(cached, name, None)))
+                payload.setdefault(name, _to_cpu(getattr(cached, name)))
             inner._unirl_last_forward_batch = None
         self._connection.send(_to_cpu(payload))
 
@@ -117,7 +117,8 @@ def patch_conditions() -> None:
         if response.get("rl_data") is not None:
             kwargs["rl_data"] = response["rl_data"]
         result = ForwardBatch(**kwargs)
-        result.prompt_embeds = response.get("prompt_embeds") or []
+        prompt_embeds = response.get("prompt_embeds")
+        result.prompt_embeds = prompt_embeds if prompt_embeds is not None else []
         result.negative_prompt_embeds = response.get("negative_prompt_embeds")
         result.prompt_attention_mask = response.get("prompt_attention_mask")
         result.negative_attention_mask = response.get("negative_attention_mask")

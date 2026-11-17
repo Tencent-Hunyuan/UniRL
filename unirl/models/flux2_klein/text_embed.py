@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import List, Tuple
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, embed_with_cpu_cache
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -32,15 +33,12 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
         self.bundle = bundle
         self.max_sequence_length = int(max_sequence_length)
         self.extraction_layers = tuple(extraction_layers)
+        self._cache: OrderedDict[str, TextEmbedCondition] = OrderedDict()
 
     def embed(self, p: Texts) -> TextEmbedCondition:
-        embeds, pooled = self._encode(list(p.texts))
-        return TextEmbedCondition(
-            embeds=embeds,
-            pooled=pooled,
-        )
+        return embed_with_cpu_cache(p.texts, self._cache, self._encode, device=self.bundle.device)
 
-    def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _encode(self, prompts: list[str]) -> TextEmbedCondition:
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -104,26 +102,24 @@ class Flux2KleinTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
                 extracted.append(hidden_states[-1])
 
         prompt_embeds = torch.cat(extracted, dim=-1).to(dtype=dtype)
-        pooled = self._pool(outputs, attention_mask, dtype=dtype)
-        return prompt_embeds, pooled
-
-    @staticmethod
-    def _pool(outputs, attention_mask: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
         if hasattr(outputs, "pooler_output") and outputs.pooler_output is not None:
             pooled = outputs.pooler_output
             if pooled.shape[-1] != POOLED_DIM:
                 pooled = pooled[..., :POOLED_DIM]
-            return pooled.to(dtype=dtype)
-
-        last_hidden = outputs.hidden_states[-1]
-        seq_lens = attention_mask.sum(dim=-1, keepdim=True) - 1
-        seq_lens = seq_lens.clamp(min=0)
-        eos_hidden = torch.gather(
-            last_hidden,
-            dim=1,
-            index=seq_lens.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
-        ).squeeze(1)
-        return eos_hidden[..., :POOLED_DIM].to(dtype=dtype)
+            pooled = pooled.to(dtype=dtype)
+        else:
+            last_hidden = outputs.hidden_states[-1]
+            seq_lens = (attention_mask.sum(dim=-1, keepdim=True) - 1).clamp(min=0)
+            eos_hidden = torch.gather(
+                last_hidden,
+                dim=1,
+                index=seq_lens.unsqueeze(-1).expand(-1, -1, last_hidden.shape[-1]),
+            ).squeeze(1)
+            pooled = eos_hidden[..., :POOLED_DIM].to(dtype=dtype)
+        return TextEmbedCondition(
+            embeds=prompt_embeds,
+            pooled=pooled,
+        )
 
 
 __all__ = ["Flux2KleinTextEmbedStage"]

@@ -236,7 +236,7 @@ class FlowMatchSFT(StageAlgorithm):
         sigma, noise = self._eval_draws(x0, sample_ids)
         _, aux = self._velocity_mse(conditions, x0, generator=None, sigma=sigma, noise=noise)
         per_sample = aux["per_sample_mse"]
-        mask = getattr(segment, "loss_mask", None)
+        mask = segment.loss_mask
         if mask is not None:
             mask = mask.to(dtype=per_sample.dtype, device=per_sample.device).flatten()
             if mask.shape[0] != per_sample.shape[0]:

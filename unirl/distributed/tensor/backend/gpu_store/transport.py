@@ -144,9 +144,6 @@ class GPUStoreTransport(WorkerLocalTransport):
     def nccl_recv(self, src_rank: int, shapes: List[tuple], dtypes: List[torch.dtype]) -> List[Any]:
         return ray.get(self._tw._nccl_recv.remote(src_rank, shapes, dtypes))
 
-    def tensor_op(self, handle: Any, op: str, *op_args) -> Any:
-        return ray.get(self._tw.tensor_op.remote(handle, op, *op_args))
-
     def get_cpu(self, handle: Any) -> torch.Tensor:
         return ray.get(self._tw.get_tensor_cpu.remote(handle))
 

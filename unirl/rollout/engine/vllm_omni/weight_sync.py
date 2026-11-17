@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -19,27 +19,14 @@ class WeightSync:
         self,
         backend: Backend,
         *,
-        uses_lora: bool,
         lora_copy_transport: bool,
     ) -> None:
-        self._backend = backend
-        self._uses_lora = bool(uses_lora)
-        self._lora_copy_transport = bool(lora_copy_transport)
-        self._lora_loaded = False
-        self._weights_released = False
-        self._last_lora_name: Optional[str] = None
-        self._last_lora_tensors: Optional[Dict[str, Any]] = None
-        self._last_peft_config: Optional[dict] = None
-
-    @property
-    def lora_loaded(self) -> bool:
-        """True when a pushed adapter should be activated on generate."""
-        return self._lora_loaded
-
-    @property
-    def lora_dirty(self) -> bool:
-        """True when LoRA is in use but the adapter must be (re)pushed."""
-        return self._uses_lora and (self._weights_released or not self._lora_loaded)
+        self.backend = backend
+        self.lora_copy_transport = lora_copy_transport
+        self.lora_loaded = False
+        self.last_lora_name: Optional[str] = None
+        self.last_lora_tensors: Optional[Dict[str, torch.Tensor]] = None
+        self.last_peft_config: Optional[dict] = None
 
     def update_weights_from_ipc(
         self,
@@ -49,15 +36,14 @@ class WeightSync:
         use_shm: bool = False,
         replica_rank: Optional[int] = None,
     ) -> None:
-        self._backend.update_from_ipc(
+        self.backend.update_from_ipc(
             peft_config=peft_config,
             base_sync_done=base_sync_done,
             use_shm=use_shm,
             replica_rank=replica_rank,
         )
         if peft_config and base_sync_done:
-            self._lora_loaded = True
-            self._weights_released = False
+            self.lora_loaded = True
 
     def init_weights_update_group(
         self,
@@ -69,13 +55,13 @@ class WeightSync:
         group_name: str,
         backend: str = "nccl",
     ) -> None:
-        self._backend.init_weights_group(
-            master_address=str(master_address),
-            master_port=int(master_port),
-            rank_offset=int(rank_offset),
-            world_size=int(world_size),
-            group_name=str(group_name),
-            backend=str(backend),
+        self.backend.init_weights_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank_offset=rank_offset,
+            world_size=world_size,
+            group_name=group_name,
+            backend=backend,
         )
 
     def update_weights_from_distributed(
@@ -88,17 +74,17 @@ class WeightSync:
         target_modules: Optional[List[str]] = None,
         flush_cache: bool = True,
     ) -> None:
-        self._backend.update_from_distributed(
-            names=list(names),
-            dtypes=list(dtypes),
-            shapes=[list(s) for s in shapes],
-            group_name=str(group_name),
-            target_modules=list(target_modules) if target_modules else None,
-            flush_cache=bool(flush_cache),
+        self.backend.update_from_distributed(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            group_name=group_name,
+            target_modules=target_modules,
+            flush_cache=flush_cache,
         )
 
     def destroy_weights_update_group(self, *, group_name: str) -> None:
-        self._backend.destroy_weights_group(group_name=str(group_name))
+        self.backend.destroy_weights_group(group_name=group_name)
 
     def update_weights_from_tensor(
         self,
@@ -108,11 +94,11 @@ class WeightSync:
         load_format: Optional[str] = None,
         flush_cache: bool = True,
     ) -> None:
-        self._backend.update_from_tensor(
-            serialized_named_tensors=list(serialized_named_tensors),
-            target_modules=list(target_modules) if target_modules else None,
+        self.backend.update_from_tensor(
+            serialized_named_tensors=serialized_named_tensors,
+            target_modules=target_modules,
             load_format=load_format,
-            flush_cache=bool(flush_cache),
+            flush_cache=flush_cache,
         )
 
     def set_lora_from_tensors(
@@ -123,10 +109,11 @@ class WeightSync:
         peft_config: Optional[dict] = None,
     ) -> None:
         """Hot-swap the adapter via the zero-copy shm-handle transport."""
-        self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_handle(lora_tensors=lora_tensors, peft_config=peft_config)
-        self._lora_loaded = True
-        self._weights_released = False
+        self.last_lora_name = adapter_name
+        self.last_lora_tensors = {name: t.detach().clone() for name, t in lora_tensors.items()}
+        self.last_peft_config = {} if peft_config is None else dict(peft_config)
+        self.backend.set_lora_handle(lora_tensors=lora_tensors, peft_config=peft_config)
+        self.lora_loaded = True
 
     def set_lora_from_tensors_copy(
         self,
@@ -136,59 +123,44 @@ class WeightSync:
         peft_config: Optional[dict] = None,
     ) -> None:
         """Hot-swap the adapter via the TP>1-safe byte-copy transport."""
-        self._cache_lora(adapter_name, lora_tensors, peft_config)
-        self._backend.set_lora_copy(lora_tensors=lora_tensors, peft_config=peft_config)
-        self._lora_loaded = True
-        self._weights_released = False
-
-    def _cache_lora(self, adapter_name: str, lora_tensors: Dict[str, Any], peft_config: Optional[dict]) -> None:
-        """Clone the adapter state so a sleep/wake cycle can re-push it."""
-        self._last_lora_name = adapter_name
-        if isinstance(lora_tensors, dict):
-            self._last_lora_tensors = {
-                name: t.detach().clone() if isinstance(t, torch.Tensor) else t for name, t in lora_tensors.items()
-            }
-        else:
-            self._last_lora_tensors = lora_tensors
-        self._last_peft_config = dict(peft_config or {})
+        self.last_lora_name = adapter_name
+        self.last_lora_tensors = {name: t.detach().clone() for name, t in lora_tensors.items()}
+        self.last_peft_config = {} if peft_config is None else dict(peft_config)
+        self.backend.set_lora_copy(lora_tensors=lora_tensors, peft_config=peft_config)
+        self.lora_loaded = True
 
     def loaded_param_checksums(self, *, names: List[str]) -> dict:
-        return self._backend.param_checksums(names=list(names))
+        return self.backend.param_checksums(names=names)
 
     def loaded_lora_checksums(self, *, adapter_id: int, names: Optional[List[str]] = None) -> dict:
-        return self._backend.lora_checksums(adapter_id=adapter_id, names=names)
-
-    def mark_weights_released(self) -> None:
-        """The engine released the runtime memory — the worker-side LoRA pool"""
-        self._weights_released = True
+        return self.backend.lora_checksums(adapter_id=adapter_id, names=names)
 
     def restore_lora_after_wake(self) -> None:
         """Re-push the cached adapter after a wake (v1 parity)."""
-        if self._last_lora_tensors is None:
-            self._weights_released = False
+        if self.last_lora_tensors is None:
             return
         logger.info(
             "[LoRA-WAKE] Re-loading LoRA after sleep/wake. adapter_name=%s",
-            self._last_lora_name,
+            self.last_lora_name,
         )
         try:
-            if self._lora_copy_transport:
+            if self.lora_copy_transport:
                 self.set_lora_from_tensors_copy(
-                    self._last_lora_name,
-                    self._last_lora_tensors,
-                    peft_config=self._last_peft_config,
+                    self.last_lora_name,
+                    self.last_lora_tensors,
+                    peft_config=self.last_peft_config,
                 )
             else:
                 self.set_lora_from_tensors(
-                    self._last_lora_name,
-                    self._last_lora_tensors,
-                    peft_config=self._last_peft_config,
+                    self.last_lora_name,
+                    self.last_lora_tensors,
+                    peft_config=self.last_peft_config,
                 )
         except Exception as exc:
-            self._lora_loaded = False
+            self.lora_loaded = False
             raise RuntimeError(
                 f"[LoRA-WAKE] Failed to re-load LoRA adapter "
-                f"{self._last_lora_name!r} after sleep/wake; refusing "
+                f"{self.last_lora_name!r} after sleep/wake; refusing "
                 f"to continue serving because rollout would silently "
                 f"run the base model, drifting old/new log-probs and "
                 f"the GRPO ratio. Original error: {exc!r}"

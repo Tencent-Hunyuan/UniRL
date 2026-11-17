@@ -116,6 +116,11 @@ def inject_nft(
     """Inject dual LoRA adapters for NFT-style EMA.  Returns Shadow."""
     from peft import LoraConfig, inject_adapter_in_model
 
+    if bias != "none":
+        raise ValueError(
+            f"inject_nft: bias must be 'none', got {bias!r}; "
+            "trainable LoRA biases mutate shared base_layer.bias in place and are unsupported."
+        )
     peft_cfg = LoraConfig(
         r=int(rank),
         lora_alpha=int(alpha),
@@ -190,8 +195,7 @@ def _copy_adapter(model: nn.Module, *, src: str, dst: str) -> None:
     for m in model.modules():
         if not isinstance(m, LoraLayer):
             continue
-        for key in ("lora_A", "lora_B"):
-            bank = getattr(m, key, {})
+        for bank in (m.lora_A, m.lora_B):
             if src in bank and dst in bank:
                 for sp, dp in zip(bank[src].parameters(), bank[dst].parameters()):
                     dp.data.copy_(sp.data)
@@ -211,8 +215,7 @@ def _adapter_pairs(
     for m in model.modules():
         if not isinstance(m, LoraLayer):
             continue
-        for key in ("lora_A", "lora_B"):
-            bank = getattr(m, key, {})
+        for bank in (m.lora_A, m.lora_B):
             if default in bank and shadow in bank:
                 for sp, dp in zip(bank[default].parameters(), bank[shadow].parameters()):
                     pairs.append((sp, dp))

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from typing import List, Optional
 
 import PIL.Image
@@ -10,19 +9,6 @@ from unirl.types.primitives import Texts
 
 from .bundle import JanusProBundle
 from .conditions import JanusProARConditions
-
-
-@contextmanager
-def _temporary_system_prompt(processor, system_prompt: Optional[str]):
-    if system_prompt is None:
-        yield
-        return
-    old = processor.system_prompt
-    processor.system_prompt = system_prompt
-    try:
-        yield
-    finally:
-        processor.system_prompt = old
 
 
 class JanusProChatTemplateStage:
@@ -51,7 +37,10 @@ class JanusProChatTemplateStage:
 
         processor = self.bundle.processor
         prepares = []
-        with _temporary_system_prompt(processor, system_instruction):
+        old_system_prompt = processor.system_prompt
+        if system_instruction is not None:
+            processor.system_prompt = system_instruction
+        try:
             for text, image in zip(texts.texts, images):
                 conversation = [
                     {
@@ -67,6 +56,9 @@ class JanusProChatTemplateStage:
                         images=[image],
                     )
                 )
+        finally:
+            if system_instruction is not None:
+                processor.system_prompt = old_system_prompt
 
         batched = processor.batchify(prepares).to(self.bundle.device, dtype=self.bundle.dtype)
         expected_image_tokens = len(images) * processor.num_image_tokens

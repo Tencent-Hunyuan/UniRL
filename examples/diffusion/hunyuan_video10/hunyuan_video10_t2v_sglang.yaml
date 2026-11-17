@@ -38,6 +38,8 @@ model_config:
   logprob_precision: fp32
   shift: 5.0
   hidden_state_skip_layer: 2
+  load_text_encoder: false
+  load_vae: false
   # SGLang receives merged full weights, not an online LoRA adapter.
   use_lora: false
 

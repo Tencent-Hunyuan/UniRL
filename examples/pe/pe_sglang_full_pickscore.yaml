@@ -74,6 +74,7 @@ diffusion:
       pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,stabilityai/stable-diffusion-3.5-medium}
       model_precision: bf16
       shift: 3.0
+      load_text_encoder: false
       load_vae: false
       # SGLang diffusion rollout boots in (online) LoRA mode and wraps these
       # modules. Trainside ignores these hints (FSDPBackend.lora_cfg injects
@@ -95,6 +96,7 @@ diffusion:
     autocast_precision: bf16
     trajectory_precision: bf16
     logprob_precision: fp32
+    batch_replay_steps: true
     strategy:
       _target_: unirl.sde.kernels.FlowSDEStrategy
   backend:

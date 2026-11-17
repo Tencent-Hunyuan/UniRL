@@ -1,18 +1,21 @@
 # Configuration for the reward service.
 #
-# Every reward (except geneval, see bottom) is enabled by default and points
-# at the locally-staged weights under
+# The image rewards below are enabled by default and point at the
+# locally-staged weights under
 # /path/to/RewardModel/. Each reward group
 # owns its GPUs exclusively (resource isolation); total GPU budget =
 # sum of (num_gpus * num_replicas). With the defaults below:
 #   CLIP / PickScore / ImageReward / HPSv2 / HPSv3 / UnifiedReward → 1 GPU each (6)
 #   ocr (GOT-OCR-2.0) → 1 GPU
 #   GenEval2 (Qwen3-VL-8B, TP=2) → 2 GPUs
-# = 9 GPUs; drop entries or fractionally share GPUs to fit your card count.
+#   EditReward (Qwen2.5-VL-7B) → 1 GPU
+# = 10 GPUs; drop entries or fractionally share GPUs to fit your card count.
 #
-# geneval is commented out at the bottom: its mmdet/mmcv stack needs
-# Python 3.10 and cannot run under this service's Python-3.13 Ray cluster
-# via runtime_env (see envs/geneval.txt for the full rationale).
+# editscore, geneval, videoalign, and wise are commented out at the bottom;
+# each section explains why. geneval in particular needs Python 3.10 for its
+# mmdet/mmcv stack and cannot run under this service's Python-3.12+ Ray cluster
+# via runtime_env; configs/geneval_service.yaml hosts it on a Python 3.10 node
+# (see envs/geneval.txt for the full rationale).
 
 server:
   host: 0.0.0.0
@@ -144,13 +147,14 @@ rewards:
       extra_llm_kwargs: {}         # any other vllm.LLM(...) kwarg
 
   # GenEval2 — VQAScore via Qwen3-VL-8B-Instruct.
-  # When dataset_path is set, uses per-prompt VQA question lists from the
-  # GenEval2 JSONL dataset (Soft-TIFA scoring).  Without it, falls back to
-  # a degenerate single-question template.
+  # Soft-TIFA scoring over the prompt's vqa_list, taken from request
+  # metadata first and then the GenEval2 JSONL at dataset_path. With
+  # neither, it scores a degenerate single-question template; a prompt
+  # missing from a configured dataset_path raises unless allow_fallback.
   # Deployed with tensor_parallel_size=2 because it is the largest vLLM
   # model in this config (~17.5 GB weights + KV cache tight on a single
-  # card). This makes geneval2 own 2 GPUs; the other 6 rewards own 1
-  # GPU each → 8 GPUs total on the host.
+  # card). This makes geneval2 own 2 GPUs; the other 8 rewards own 1
+  # GPU each → 10 GPUs total on the host.
   # Same vLLM knobs as unified_reward above.
   - name: geneval2
     scorer: geneval2
@@ -197,9 +201,11 @@ rewards:
       device: cuda
 
   # ─────────────── EditReward (image editing quality) ───────────────
-  # EditReward — Qwen2.5-VL-7B multi-head reward model for instruction-guided
-  # image editing. Evaluates instruction following (dim1, 1-4) and visual
-  # quality (dim2, 1-4). Expects 2-turn history: source → edited.
+  # EditReward — Qwen2.5-VL-7B reward model for instruction-guided image
+  # editing. Column meaning follows the checkpoint config: the official
+  # uncertainty head returns [reward mean, log-sigma], so recipes consume
+  # only the first channel (sub_metric_reduce: first). Expects 2-turn
+  # history: source → edited.
   # ~14GB VRAM at bfloat16. Keep max_concurrency=1 (7B model, sequential).
   - name: editreward
     scorer: editreward
@@ -248,7 +254,8 @@ rewards:
   # carried in ScoreItem.metadata. Distinct from geneval2 (VQAScore).
   #
   # DISABLED: needs Python 3.10 (mmdet/mmcv stack); cannot run under this
-  # py3.13 Ray cluster via runtime_env. Full rationale + fixes: envs/geneval.txt.
+  # py3.12+ Ray cluster via runtime_env; use configs/geneval_service.yaml on a
+  # Python 3.10 node instead. Full rationale + fixes: envs/geneval.txt.
   #
   # - name: geneval
   #   scorer: geneval

@@ -16,10 +16,10 @@ from .base import (
     AlgorithmStepResult,
     BaseAlgorithmConfig,
     StageAlgorithm,
-    _grpo_clip_loss,
-    _prepare_ar_logp_anchor,
-    _resolve_clip_range_from_schedule,
     aggregate_token_losses,
+    grpo_clip_loss,
+    prepare_ar_logp_anchor,
+    resolve_clip_range_from_schedule,
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
@@ -92,7 +92,7 @@ class GRPO(StageAlgorithm):
         segment: "TextSegment",
     ) -> None:
         """Freeze the selected rollout- or replay-sourced old-policy anchor."""
-        _prepare_ar_logp_anchor(
+        prepare_ar_logp_anchor(
             stage=self.stage,
             conditions=conditions,
             segment=segment,
@@ -128,13 +128,13 @@ class GRPO(StageAlgorithm):
             advantages, segment.lengths, dtype=new_logp.dtype, device=new_logp.device
         )
 
-        clip_range = _resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
+        clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (
             None
             if self.clip_range_high is None
-            else _resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
+            else resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
-        loss_per_elem, ratio_metrics = _grpo_clip_loss(
+        loss_per_elem, ratio_metrics = grpo_clip_loss(
             new_logp=new_logp,
             old_logp=old_logp,
             advantages=adv_per_token,

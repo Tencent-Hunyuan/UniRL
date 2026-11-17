@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List
 
 import torch
 
-from unirl.models.types.embedding import EmbedStage
+from unirl.models.types.embedding import EmbedStage, dedup_prompts
 from unirl.types.conditions import TextEmbedCondition
 from unirl.types.primitives import Texts
 
@@ -48,14 +48,7 @@ class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
     def embed(self, p: Texts) -> TextEmbedCondition:
         """Encode prompts into a ``TextEmbedCondition``."""
-        prompt_embeds, prompt_embeds_mask = self._encode(list(p.texts))
-        return TextEmbedCondition(
-            embeds=prompt_embeds,
-            attn_mask=prompt_embeds_mask,
-            pooled=None,
-        )
-
-    def _encode(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+        prompts, inverse = dedup_prompts(p.texts)
         bundle = self.bundle
         device = bundle.device
         dtype = next(bundle.text_encoder.parameters()).dtype
@@ -97,7 +90,12 @@ class QwenImageTextEmbedStage(EmbedStage[Texts, TextEmbedCondition]):
 
         prompt_embeds = prompt_embeds[:, : self.max_sequence_length]
         prompt_embeds_mask = prompt_embeds_mask[:, : self.max_sequence_length]
-        return prompt_embeds.to(device=device, dtype=dtype), prompt_embeds_mask
+        cond = TextEmbedCondition(
+            embeds=prompt_embeds.to(device=device, dtype=dtype),
+            attn_mask=prompt_embeds_mask,
+            pooled=None,
+        )
+        return cond if inverse is None else cond.select(inverse)
 
 
 __all__ = ["QwenImageTextEmbedStage", "extract_masked_hidden"]

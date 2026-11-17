@@ -64,7 +64,22 @@ class VeOmniBackend(BaseFSDP2Backend):
     ) -> None:
         super().__init__()
         self._check_lora_exclusivity(lora_cfg, ema_lora_cfg)
-        _validate_fsdp_cfg(fsdp_cfg)
+        if fsdp_cfg.copy_engine_all_gather:
+            raise ValueError(
+                "VeOmniBackend: copy_engine_all_gather=true is unsupported; use FSDPBackend for NCCL symmetric-memory "
+                "all-gather."
+            )
+        if fsdp_cfg.expandable_segments:
+            raise ValueError("VeOmniBackend: expandable_segments=true has not been validated here; use FSDPBackend.")
+        if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "full":
+            raise ValueError(
+                f"VeOmniBackend: fsdp_mode={fsdp_cfg.fsdp_mode!r} unsupported (v1 supports 'full'; "
+                "HSDP/hybrid stays on FSDPBackend)."
+            )
+        if fsdp_cfg.cpu_offload:
+            raise ValueError("VeOmniBackend: cpu_offload=true unsupported in v1 (use FSDPBackend).")
+        if not fsdp_cfg.mixed_precision:
+            raise ValueError("VeOmniBackend: mixed_precision=false unsupported in v1 (bf16-parity mode is fixed).")
 
         from unirl.train.backend.veomni import _compat
 
@@ -84,11 +99,9 @@ class VeOmniBackend(BaseFSDP2Backend):
         from veomni.distributed.parallel_state import init_parallel_state
 
         # Fold Ulysses into the FSDP shard mesh so gradients reduce-scatter across SP ranks.
-        self._sp_size = int(getattr(fsdp_cfg, "sp_size", 1) or 1)
-        if world % self._sp_size != 0:
-            raise ValueError(f"VeOmniBackend: world_size {world} not divisible by sp_size {self._sp_size}")
+        self._sp_size = _validate_parallel_size(fsdp_cfg.sp_size, name="sp_size", world_size=world)
         # ep_size > 1 requires get_parallel_plan() for fused expert tensors.
-        self._ep_size = _validate_ep_size(getattr(fsdp_cfg, "ep_size", 1), world_size=world)
+        self._ep_size = _validate_parallel_size(fsdp_cfg.ep_size, name="ep_size", world_size=world)
         extra_parallel_kwargs = (
             {"extra_parallel_sizes": (self._ep_size,), "extra_parallel_names": ("ep",)} if self._ep_size > 1 else {}
         )
@@ -119,7 +132,7 @@ class VeOmniBackend(BaseFSDP2Backend):
             model,
             block_class_names=tuple(block_class_names),
             param_dtype=fsdp_cfg.param_dtype,
-            master_dtype=getattr(fsdp_cfg, "master_dtype", None),
+            master_dtype=fsdp_cfg.master_dtype,
             reshard_after_forward=fsdp_cfg.reshard_after_forward,
             activation_checkpointing=fsdp_cfg.activation_checkpointing,
             use_torch_compile=fsdp_cfg.use_torch_compile,
@@ -146,11 +159,6 @@ class VeOmniBackend(BaseFSDP2Backend):
         )
 
         apply_deferred_ops(model)
-
-        # Restore RoPE inv_freq after meta materialization.
-        from unirl.models.types.meta_init import recover_rope_inv_freq
-
-        recover_rope_inv_freq(model)
 
         self._finalize_construction(
             model,
@@ -226,38 +234,19 @@ class VeOmniBackend(BaseFSDP2Backend):
             )
 
 
-def _validate_fsdp_cfg(fsdp_cfg: FSDPConfig) -> None:
-    """Assert the v1-supported FSDPConfig subset (fail fast, actionably)."""
-    if fsdp_cfg.copy_engine_all_gather:
-        # TODO: wire copy-engine — zero-CTA WORLD at init, then set_symm_mem_for_comm after parallelize_model_fsdp2.
-        raise ValueError(
-            "VeOmniBackend: copy_engine_all_gather=true is unsupported; use FSDPBackend for NCCL symmetric-memory "
-            "all-gather."
-        )
-    if normalize_fsdp_mode(fsdp_cfg.fsdp_mode) != "full":
-        raise ValueError(
-            f"VeOmniBackend: fsdp_mode={fsdp_cfg.fsdp_mode!r} unsupported (v1 supports 'full'; "
-            "HSDP/hybrid stays on FSDPBackend)."
-        )
-    if fsdp_cfg.cpu_offload:
-        raise ValueError("VeOmniBackend: cpu_offload=true unsupported in v1 (use FSDPBackend).")
-    if not fsdp_cfg.mixed_precision:
-        raise ValueError("VeOmniBackend: mixed_precision=false unsupported in v1 (bf16-parity mode is fixed).")
-
-
-def _validate_ep_size(value: object, *, world_size: int) -> int:
-    """Return a valid expert-parallel degree without truncating non-integers."""
+def _validate_parallel_size(value: object, *, name: str, world_size: int) -> int:
+    """Return a valid parallel degree without truncating non-integers."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be an integer >= 1, got {value!r}")
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.{name} must be an integer >= 1, got {value!r}")
     try:
-        ep_size = int(value)
+        degree = int(value)
     except ValueError as exc:
-        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be an integer >= 1, got {value!r}") from exc
-    if ep_size < 1:
-        raise ValueError(f"VeOmniBackend: fsdp_cfg.ep_size must be >= 1, got {ep_size}")
-    if world_size % ep_size != 0:
-        raise ValueError(f"VeOmniBackend: world_size {world_size} not divisible by ep_size {ep_size}")
-    return ep_size
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.{name} must be an integer >= 1, got {value!r}") from exc
+    if degree < 1:
+        raise ValueError(f"VeOmniBackend: fsdp_cfg.{name} must be >= 1, got {degree}")
+    if world_size % degree != 0:
+        raise ValueError(f"VeOmniBackend: world_size {world_size} not divisible by {name} {degree}")
+    return degree
 
 
 __all__ = ["VeOmniBackend"]

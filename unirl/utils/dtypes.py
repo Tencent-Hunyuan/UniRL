@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import inspect
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -56,23 +55,3 @@ def canonical_torch_dtype_name(dtype: torch.dtype, *, field_name: str = "dtype")
     if name is None:
         raise ValueError(f"Unsupported {field_name}={dtype!r}; expected bf16/fp16/fp32.")
     return name
-
-
-def inject_model_dtype_kwarg(
-    *,
-    model_cls: Any,
-    model_kwargs: Dict[str, Any],
-    dtype: Optional[torch.dtype],
-) -> None:
-    """Populate the correct dtype kwarg for a model bundle constructor if supported."""
-    if dtype is None:
-        return
-    try:
-        params = inspect.signature(model_cls.__init__).parameters
-    except Exception:
-        params = {}
-
-    if "torch_dtype" in params:
-        model_kwargs["torch_dtype"] = dtype
-    elif "dtype" in params:
-        model_kwargs["dtype"] = dtype

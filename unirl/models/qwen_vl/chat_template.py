@@ -194,15 +194,15 @@ class QwenVLChatTemplateStage:
         pixel_values: List[Optional[torch.Tensor]] = []
         image_grid_thw: List[Optional[torch.Tensor]] = []
         for inp in per_sample_inputs:
-            pv = inp.get("pixel_values")
-            igt = inp.get("image_grid_thw")
+            pv = inp["pixel_values"] if "pixel_values" in inp else None
+            igt = inp["image_grid_thw"] if "image_grid_thw" in inp else None
             pixel_values.append(pv.to(device=device, dtype=dtype) if pv is not None else None)
             image_grid_thw.append(igt.to(device=device) if igt is not None else None)
 
         # Always batch-aligned lists (None per image-free row), never a collapsed
         # None: concat drops None contributors, so a collapsed value from one DP
         # shard would desync the merged list from the batch rows (and a later
-        # slice would broadcast it whole). _merge_pv/_merge_igt filter row Nones.
+        # slice would broadcast it whole). concat_optional_tensors filters row Nones.
         return QwenVLARConditions(
             prompt=TextTokenCondition(input_ids=input_ids, attention_mask=attention_mask),
             pixel_values=pixel_values,

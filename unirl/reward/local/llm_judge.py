@@ -34,16 +34,6 @@ _INCORRECT_RE = re.compile(r"\b(?:incorrect|not\s+correct|isn'?t\s+correct|wrong
 _CORRECT_RE = re.compile(r"\b(?:correct|equivalent|yes)\b")
 
 
-def _parse_verdict(content: str) -> float:
-    """Parse a judge reply into 1.0 / 0.0, robust to the 'incorrect' contains 'correct' substring trap."""
-    c = (content or "").strip().lower()
-    if _INCORRECT_RE.search(c):
-        return 0.0
-    if _CORRECT_RE.search(c):
-        return 1.0
-    return 0.0
-
-
 class LLMJudgeRewardScorer(LocalRewardBackend):
     """Reward 1.0 when an LLM judge deems the prediction equivalent to the reference answer, else 0.0."""
 
@@ -56,7 +46,6 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
         super().__init__(prompt_source=config.prompt_source)
 
     def _load_model(self) -> None:
-        self.model = "llm_judge"
         self._endpoint = os.environ.get("JUDGE_URL", self._spec.endpoint)
         self._judge_model = os.environ.get("JUDGE_MODEL", self._spec.model)
         self._api_key = os.environ.get("JUDGE_API_KEY", self._spec.api_key)
@@ -70,7 +59,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
         prompt = self._spec.prompt_template.format(
             question=question,
             answer=answer,
-            prediction=(prediction or "")[: self._spec.max_prediction_chars],
+            prediction=("" if prediction is None else prediction)[: self._spec.max_prediction_chars],
         )
         payload = {
             "model": self._judge_model,
@@ -85,8 +74,12 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
             try:
                 resp = requests.post(self._endpoint, json=payload, headers=headers, timeout=self._spec.timeout)
                 resp.raise_for_status()
-                content = str(resp.json()["choices"][0]["message"]["content"])
-                return _parse_verdict(content)
+                content = str(resp.json()["choices"][0]["message"]["content"]).strip().lower()
+                if _INCORRECT_RE.search(content):
+                    return 0.0
+                if _CORRECT_RE.search(content):
+                    return 1.0
+                return 0.0
             except Exception as exc:  # noqa: BLE001 — judge failures score 0, never crash training
                 logger.warning("LLM judge attempt %d/%d failed: %s", attempt + 1, self._spec.max_retries, exc)
         logger.warning("LLM judge failed after %d attempts; scoring 0.", self._spec.max_retries)
@@ -97,7 +90,7 @@ class LLMJudgeRewardScorer(LocalRewardBackend):
         if predictions is None:
             raise ValueError("LLMJudgeRewardScorer requires request.texts (predicted answers).")
         prompts = self.prompts(request) or [""] * len(predictions)
-        metadata_list = request.metadata or [None] * len(predictions)
+        metadata_list = [None] * len(predictions) if request.metadata is None else request.metadata
         rewards: List[float] = []
         for question, prediction, meta in zip(prompts, predictions, metadata_list):
             if meta is None or meta.get("answer") is None:

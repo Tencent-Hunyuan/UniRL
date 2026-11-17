@@ -7,8 +7,6 @@ import logging
 import torch
 from torch import Tensor, nn
 
-from unirl.train.backend.sharded_state import _maybe_dtensor_to_tensor
-
 logger = logging.getLogger(__name__)
 
 
@@ -19,8 +17,7 @@ def clip_grad_norm(model: nn.Module, max_norm: float) -> Tensor:
     _compat.ensure_installed()
     from veomni.distributed.fsdp2 import clip_grad_norm as _veomni_clip_grad_norm
 
-    result = _veomni_clip_grad_norm(model, max_norm)
-    return _maybe_dtensor_to_tensor(result)
+    return _veomni_clip_grad_norm(model, max_norm)
 
 
 def veomni_offload(model: nn.Module) -> None:

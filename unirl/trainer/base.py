@@ -120,11 +120,11 @@ class BaseTrainer:
         self.num_devices = cfg.num_devices
         if worker_max_concurrency is None:
             configured_concurrency = cfg.get("worker_max_concurrency")
-            worker_max_concurrency = 1 if configured_concurrency is None else int(configured_concurrency)
+            worker_max_concurrency = 1 if configured_concurrency is None else configured_concurrency
         self.pool = DevicePool(
             num_devices=cfg.num_devices,
-            devices_per_node=int(cfg.get("devices_per_node", 8)),
-            workers_per_device=int(cfg.get("workers_per_device", 1)),
+            devices_per_node=cfg.get("devices_per_node", 8),
+            workers_per_device=cfg.get("workers_per_device", 1),
             transport_kind=cfg.get("transport_kind", "colocate_store"),
             tq_handoff=init_transfer_queue(cfg),
             worker_max_concurrency=worker_max_concurrency,

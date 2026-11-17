@@ -39,7 +39,9 @@ class SD3Pipeline(Pipeline):
     ) -> None:
         super().__init__()
         self.bundle = bundle
-        self.text_embed = text_embed if text_embed is not None else SD3TextEmbedStage(bundle)
+        if text_embed is None and bundle.text_encoder is not None:
+            text_embed = SD3TextEmbedStage(bundle)
+        self.text_embed = text_embed
         if diffusion is None:
             diffusion = SD3DiffusionStage(
                 model=bundle,
@@ -58,8 +60,8 @@ class SD3Pipeline(Pipeline):
     @classmethod
     def latent_shape(cls, *, model_config: Any, sampling_spec: Any) -> tuple:
         """Per-sample latent shape ``(C, H_lat, W_lat)`` for driver-side noise pre-computation."""
-        height = int(sampling_spec.height)
-        width = int(sampling_spec.width)
+        height = sampling_spec.height
+        width = sampling_spec.width
         return (16, height // 8, width // 8)
 
     @classmethod
@@ -74,7 +76,7 @@ class SD3Pipeline(Pipeline):
         return cls(
             bundle=bundle,
             strategy=strategy,
-            shift=float(config.shift),
+            shift=config.shift,
             autocast_precision=config.autocast_precision,
             trajectory_precision=config.trajectory_precision,
             logprob_precision=config.logprob_precision,
@@ -93,6 +95,11 @@ class SD3Pipeline(Pipeline):
             raise ValueError(
                 f"SD3Pipeline.build_conditions: negative_text length "
                 f"{len(negatives.texts)} != text length {len(texts.texts)}"
+            )
+        if self.text_embed is None:
+            raise RuntimeError(
+                "SD3Pipeline.build_conditions: no text_embed stage "
+                "(load_text_encoder=False); trainside conditioning requires load_text_encoder=True."
             )
         text_cond = self.text_embed.embed(texts)
         if negatives is None and float(guidance_scale) > 1.0:
@@ -124,10 +131,10 @@ class SD3Pipeline(Pipeline):
                 f"got {type(texts).__name__ if texts is not None else 'None'}"
             )
 
-        if bool(params.init_same_noise) and not params.noise_group_ids:
+        if params.init_same_noise and not params.noise_group_ids:
             params = dataclasses.replace(params, noise_group_ids=list(frontier.group_ids))
 
-        sd3_conds = self.build_conditions(texts, guidance_scale=float(params.guidance_scale))
+        sd3_conds = self.build_conditions(texts, guidance_scale=params.guidance_scale)
         schedule = params.sigmas.to(self.bundle.device)
 
         initial_latents = NoiseRecipe.from_sample(sample).resolve()

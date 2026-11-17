@@ -158,7 +158,8 @@ def main() -> None:
 
     checkpoint = load_training_checkpoint(args.checkpoint)
     state_dict = checkpoint["policy_state_dict"]
-    recorded = checkpoint.get("lora_config") or {}
+    lora_config = checkpoint.get("lora_config")
+    recorded = {} if lora_config is None else lora_config
     alpha = args.lora_alpha if args.lora_alpha is not None else recorded.get("alpha")
     print(f"loaded {args.checkpoint}: {len(state_dict)} tensors, step={checkpoint.get('step')}, lora_alpha={alpha}")
 

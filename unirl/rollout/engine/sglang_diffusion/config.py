@@ -58,7 +58,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         if self.engine_kwargs is None:
             self.engine_kwargs = {}
 
-        self.model_family = str(self.model_family or "").strip().lower()
+        self.model_family = str(self.model_family).strip().lower()
         from unirl.rollout.engine.sglang_diffusion.adapters import registered_adapters
 
         valid_families = registered_adapters()
@@ -105,16 +105,16 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
         """Spell this config (+ model config + reserved ports) as ServerArgs intent."""
         intent: Dict[str, Any] = {}
 
-        intent.update(self.engine_kwargs or {})
+        intent.update(self.engine_kwargs)
 
         if model_config.pretrained_model_ckpt_path:
             intent["model_path"] = model_config.pretrained_model_ckpt_path
-        intent["num_gpus"] = int(self.num_gpus)
+        intent["num_gpus"] = self.num_gpus
         if self.tp_size is not None:
-            intent["tp_size"] = int(self.tp_size)
+            intent["tp_size"] = self.tp_size
         if self.sp_degree is not None:
-            intent["sp_degree"] = int(self.sp_degree)
-        intent["disable_autocast"] = bool(self.disable_autocast)
+            intent["sp_degree"] = self.sp_degree
+        intent["disable_autocast"] = self.disable_autocast
 
         if model_config.use_lora:
             intent.setdefault("lora_merge_mode", "dynamic")
@@ -123,7 +123,7 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
                 intent["lora_target_modules"] = list(lora_targets)
 
         if self.host is not None:
-            intent["host"] = str(self.host)
+            intent["host"] = self.host
 
         if extra:
             intent.update(extra)
@@ -141,9 +141,9 @@ class SGLangDiffusionEngineConfig(BaseEngineConfig):
             intent["master_port"] = ports.master_port
         else:
             if self.port is not None:
-                intent["port"] = int(self.port)
+                intent["port"] = self.port
             if self.scheduler_port is not None:
-                intent["scheduler_port"] = int(self.scheduler_port)
+                intent["scheduler_port"] = self.scheduler_port
 
         return intent
 

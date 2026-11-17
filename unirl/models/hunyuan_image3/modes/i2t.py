@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List
-
-import torch
+from typing import TYPE_CHECKING
 
 from unirl.models.types.ar import ARSamplingParams
 from unirl.types.conditions import ImageEmbedCondition
 from unirl.types.primitives import Images, Texts
 from unirl.types.sample import Sample
 
-from ..ar import HunyuanImage3ARParams
 from ..conditions import HunyuanImage3ARConditions, HunyuanImage3VAECondition
-from .t2t import _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
+from .t2t import _as_sample_batches, _resolve_system_prompt, _stop_tokens_for_bot_task, _tokenizer_bot_task
 
 if TYPE_CHECKING:
     from ..pipeline import HunyuanImage3Pipeline
@@ -38,36 +35,22 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
             "HunyuanImage3Pipeline.generate (i2t): expected a chained Images input in sample.conditioning(), found none"
         )
 
-    model_cfg: Dict[str, Any] = dict(sample.parts[0].control.get("ar") or {})
-    ar_params = HunyuanImage3ARParams(
-        max_tokens=ar.max_new_tokens if ar is not None else model_cfg.get("max_tokens", 2048),
-        temperature=ar.temperature if ar is not None else model_cfg.get("temperature", 0.6),
-        top_p=ar.top_p if ar is not None else model_cfg.get("top_p", 0.95),
-        top_k=ar.top_k if ar is not None else model_cfg.get("top_k", 1024),
-        bot_task=model_cfg.get("bot_task", "auto"),
-        cot_text=model_cfg.get("cot_text"),
-        system_prompt=model_cfg.get("system_prompt"),
-        use_system_prompt=model_cfg.get("use_system_prompt"),
-        stop_token_ids=model_cfg.get("stop_token_ids", []),
-        taylor_cache_interval=model_cfg.get("taylor_cache_interval"),
-        taylor_cache_order=model_cfg.get("taylor_cache_order"),
-    )
-    bot_task = str(ar_params.bot_task)
+    ar_cfg = sample.parts[0].control.get("ar", {})
+    bot_task = ar_cfg.get("bot_task", "auto")
     tok_bot_task = _tokenizer_bot_task(bot_task)
+    cot_text = ar_cfg.get("cot_text")
 
     system_prompt = _resolve_system_prompt(
-        pipeline.bundle, tok_bot_task, ar_params.use_system_prompt, ar_params.system_prompt
+        pipeline.bundle, tok_bot_task, ar_cfg.get("use_system_prompt"), ar_cfg.get("system_prompt")
     )
-    system_prompt_list = [system_prompt] * len(texts.texts) if system_prompt is not None else None
+    n_prompts = len(texts.texts)
+    system_prompt_list = [system_prompt] * n_prompts if system_prompt is not None else None
 
     vit = pipeline.vit_encode.encode_for_cond_vit(images)
 
     cond_vae_images, cond_timestep, cond_vit_images = pipeline.bundle.transformer._encode_cond_image(
         vit["joint_image_info"], cfg_factor=1
     )
-
-    def _as_sample_batches(value):
-        return list(value.split(1, dim=0)) if isinstance(value, torch.Tensor) else list(value)
 
     cond_vae_images = _as_sample_batches(cond_vae_images)
     cond_timestep = _as_sample_batches(cond_timestep)
@@ -82,7 +65,7 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         texts,
         bot_task=tok_bot_task,
         system_prompt=system_prompt_list,
-        cot_text=([ar_params.cot_text] * len(texts.texts) if ar_params.cot_text else None),
+        cot_text=[cot_text] * n_prompts if cot_text else None,
         batch_cond_image_info=vit["joint_image_info"],
     )
 
@@ -100,31 +83,8 @@ def generate(pipeline: "HunyuanImage3Pipeline", sample: Sample) -> Sample:
         tokenizer_output=mm["tokenizer_output"],
     )
 
-    stop_ids: List[int] = list(ar_params.stop_token_ids or [])
-    if not stop_ids:
-        stop_ids = _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
-    sampling_params = ARSamplingParams(
-        max_new_tokens=int(ar_params.max_tokens),
-        temperature=float(ar_params.temperature),
-        top_p=float(ar_params.top_p),
-        top_k=int(ar_params.top_k),
-        stop_token_id=stop_ids[0] if stop_ids else None,
-    )
-    ar_params_with_stops = HunyuanImage3ARParams(
-        bot_task=ar_params.bot_task,
-        max_tokens=ar_params.max_tokens,
-        temperature=ar_params.temperature,
-        top_p=ar_params.top_p,
-        top_k=ar_params.top_k,
-        stop_token_ids=stop_ids,
-        cot_text=ar_params.cot_text,
-        system_prompt=ar_params.system_prompt,
-        use_system_prompt=ar_params.use_system_prompt,
-        taylor_cache_interval=ar_params.taylor_cache_interval,
-        taylor_cache_order=ar_params.taylor_cache_order,
-    )
-
-    text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=sampling_params, params=ar_params_with_stops)
+    stop_ids = ar_cfg.get("stop_token_ids") or _stop_tokens_for_bot_task(pipeline.bundle, bot_task)
+    text_seg = pipeline.ar.autoregress(ar_conds, sampling_params=ar, stop_token_ids=stop_ids)
 
     decoded_texts = pipeline._detokenize_text_segment(text_seg)
 

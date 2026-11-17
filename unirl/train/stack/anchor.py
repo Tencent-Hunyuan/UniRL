@@ -35,15 +35,40 @@ def prepare_segment_anchors(
         micro = arranged_slice(part, order, start, end)
         algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
         for field in collected:
-            value = getattr(micro.segment, field, None)
+            value = getattr(micro.segment, field)
             if value is None:
                 raise RuntimeError(
                     f"{type(algorithm).__name__} declares anchor field {field!r} but a micro produced None."
                 )
             collected[field].append(value)
     for field, tensors in collected.items():
+        shapes = {tuple(tensor.shape[1:]) for tensor in tensors}
+        if len(shapes) != 1:
+            raise RuntimeError(
+                f"{type(algorithm).__name__} anchor field {field!r} differs in shape across micros ({sorted(shapes)}); "
+                "an anchor stored per token needs one output canvas per rollout."
+            )
         setattr(
             part.segment,
             field,
             restore_row_order(torch.cat(tensors, dim=0), order, segment=part.segment, field=field),
         )
+
+
+def prepare_part_for_training(
+    algorithm: StageAlgorithm,
+    part: Part,
+    plan: Plan,
+    *,
+    order: Optional[torch.Tensor],
+    model: torch.nn.Module,
+) -> Part:
+    """Freeze ``part``'s anchors in eval mode, run the algorithm's ``prepare_part`` hook, then restore the mode."""
+    was_training = model.training
+    model.eval()
+    try:
+        prepare_segment_anchors(algorithm, part, plan, order=order)
+        prepared = algorithm.prepare_part(part)
+    finally:
+        model.train(was_training)
+    return prepared

@@ -167,11 +167,7 @@ def _media_stat_fingerprint(uri: str) -> Dict[str, Any]:
 def _encoder_cache_is_safe(modules: Sequence[Any]) -> bool:
     has_parameters = False
     for module in modules:
-        if (
-            module is None
-            or getattr(module, "training", None) is not False
-            or not callable(getattr(module, "parameters", None))
-        ):
+        if module is None or module.training:
             return False
         for parameter in module.parameters():
             has_parameters = True
@@ -203,7 +199,7 @@ def _stage_config(stage: Any) -> Dict[str, Any]:
     if stage is None:
         return {}
     config: Dict[str, Any] = {}
-    for name, value in getattr(stage, "__dict__", {}).items():
+    for name, value in vars(stage).items():
         if name.startswith("_"):
             continue
         if isinstance(value, _SCALAR_CONFIG_TYPES):
@@ -260,7 +256,7 @@ def _media_uris(record: Record, *, role: str, modality: Optional[str] = None) ->
     """URIs of normalized media refs matching ``role`` and ``modality``."""
     return [
         ref.uri
-        for ref in record.get("media_refs", []) or []
+        for ref in record.get("media_refs", ())
         if isinstance(ref, MediaRef) and ref.role == role and (modality is None or ref.modality == modality)
     ]
 
@@ -333,7 +329,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[dict(record.get("metadata") or {}) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
         if part.batch_size != len(records):
             raise RuntimeError(
@@ -421,7 +417,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         texts = Texts(texts=[str(r["prompt"]) for r in records])
         # The data layer normalizes every manifest media entry to MediaRef, so no dict form here.
         prompt_media_rows: List[List[MediaRef]] = [
-            [ref for ref in (r.get("media_refs") or []) if isinstance(ref, MediaRef) and ref.role == "prompt"]
+            [ref for ref in r.get("media_refs", ()) if isinstance(ref, MediaRef) and ref.role == "prompt"]
             for r in records
         ]
         if any(prompt_media_rows):
@@ -504,7 +500,7 @@ class ARSupervisedTrackBuilder(SupervisedTrackBuilder):
         *,
         batch_ids: Optional[List[List[int]]] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        device = getattr(self.pipeline.bundle, "device", torch.device("cpu"))
+        device = self.pipeline.bundle.device
         eos_id = self._tokenizer.eos_token_id
         if isinstance(eos_id, (list, tuple)):
             eos_id = eos_id[0] if eos_id else None
@@ -670,7 +666,7 @@ class DiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[dict(record.get("metadata") or {}) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
 
     def _resolve_cache_encoders(
@@ -839,7 +835,7 @@ class VideoDiffusionSupervisedTrackBuilder(SupervisedTrackBuilder):
             sample_ids=_sample_ids(records),
             conditions=conditions.to_dict(),
             segment=segment,
-            metadata=[dict(record.get("metadata") or {}) for record in records],
+            metadata=[dict(record.get("metadata", ())) for record in records],
         )
 
     def _load_target_videos(self, records: Sequence[Record]) -> Videos:

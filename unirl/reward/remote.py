@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -21,28 +22,20 @@ from PIL import Image
 from unirl.config.require import require
 from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
 from unirl.types.reward import RewardRequest, RewardResponse
+from unirl.utils.media import tensor_frame_to_pil
 
 logger = logging.getLogger(__name__)
 
 
-def _pil_from_tensor(tensor: torch.Tensor) -> Image.Image:
-    """Convert a CHW float or uint8 tensor to a PIL RGB image."""
-    from torchvision.transforms.functional import to_pil_image
-
-    tensor = tensor.detach().cpu()
-    if tensor.is_floating_point():
-        tensor = tensor.clamp(0.0, 1.0)
-    return to_pil_image(tensor)
-
-
 def _encode_image_b64(
     image: Union[Image.Image, torch.Tensor],
-    image_format: str = "JPEG",
-    quality: int = 95,
+    *,
+    image_format: str,
+    quality: int,
 ) -> str:
     """Encode an image to a base64 string for the RewardService wire format."""
     if isinstance(image, torch.Tensor):
-        image = _pil_from_tensor(image)
+        image = tensor_frame_to_pil(image)
     if image.mode != "RGB":
         image = image.convert("RGB")
 
@@ -54,15 +47,9 @@ def _encode_image_b64(
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _encode_video_b64(
-    video: torch.Tensor,
-    fps: int = 8,
-) -> str:
+def _encode_video_b64(video: torch.Tensor, *, fps: int) -> str:
     """Encode a video tensor ``(C, T, H, W)`` to a base64 mp4 string."""
-    import tempfile
-
     from diffusers.utils import export_to_video
-    from PIL import Image as _PIL_Image
 
     v = video.detach().cpu()
     if v.dim() == 5:
@@ -71,19 +58,11 @@ def _encode_video_b64(
         raise ValueError(f"Expected 4D (C, T, H, W) video tensor, got shape {tuple(v.shape)}.")
 
     if v.is_floating_point():
-        v = v.clamp(0.0, 1.0)
-    frames = []
-    for t in range(v.shape[1]):
-        frame = v[:, t, :, :]
-        if frame.is_floating_point():
-            frame = (frame * 255).byte()
-        frame_np = frame.permute(1, 2, 0).numpy()
-        frames.append(_PIL_Image.fromarray(frame_np))
+        v = (v.clamp(0.0, 1.0) * 255).byte()
+    frames = [Image.fromarray(v[:, t, :, :].permute(1, 2, 0).numpy()) for t in range(v.shape[1])]
 
     tmp = tempfile.NamedTemporaryFile(prefix="reward_svc_", suffix=".mp4", delete=False)
     tmp.close()
-    import os
-
     try:
         export_to_video(frames, tmp.name, fps=fps)
         with open(tmp.name, "rb") as f:
@@ -97,37 +76,26 @@ def _encode_video_b64(
     return base64.b64encode(video_bytes).decode("ascii")
 
 
-def _optional_rank() -> Optional[int]:
-    raw = os.environ.get("RANK")
-    if raw is None:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def _payload_fingerprint(*, media_fingerprint: str, prompt: str, metadata: Any) -> str:
-    digest = hashlib.sha256()
-    digest.update(media_fingerprint.encode("ascii"))
-    digest.update(b"\0")
-    digest.update(prompt.encode("utf-8"))
-    digest.update(b"\0")
-    digest.update(json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
-    return digest.hexdigest()
-
-
 def _wire_identity(
     request: RewardRequest,
     index: int,
     *,
     required_rewards: List[str],
     expected_scorer_version: Optional[str],
-    payload_fingerprint: str,
+    media_fingerprint: str,
+    prompt: str,
+    metadata: Any,
 ) -> Dict[str, Any]:
+    digest = hashlib.sha256()
+    digest.update(media_fingerprint.encode("ascii"))
+    digest.update(b"\0")
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(json.dumps(metadata, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    payload_fingerprint = digest.hexdigest()
+
     sample_id = request.sample_ids[index] if request.sample_ids and index < len(request.sample_ids) else None
     group_id = request.group_ids[index] if request.group_ids and index < len(request.group_ids) else None
-    metadata = request.metadata[index] if request.metadata and index < len(request.metadata) else None
     policy_version = metadata.get("policy_version") if isinstance(metadata, dict) else None
     request_id = str(sample_id or uuid.uuid4())
     digest_input = json.dumps(
@@ -142,11 +110,18 @@ def _wire_identity(
         sort_keys=True,
         separators=(",", ":"),
     )
+    raw_rank = os.environ.get("RANK")
+    source_rank: Optional[int] = None
+    if raw_rank is not None:
+        try:
+            source_rank = int(raw_rank)
+        except ValueError:
+            source_rank = None
     return {
         "request_id": request_id,
         "sample_id": sample_id,
         "group_id": group_id,
-        "source_rank": _optional_rank(),
+        "source_rank": source_rank,
         "policy_version": policy_version if isinstance(policy_version, int) else None,
         "scorer_version": expected_scorer_version,
         "idempotency_key": hashlib.sha256(digest_input.encode("utf-8")).hexdigest(),
@@ -155,9 +130,6 @@ def _wire_identity(
 
 class RemoteRewardBackend(RewardBackend):
     """HTTP client backend for the remote RewardService ``POST /score`` endpoint."""
-
-    _REDUCE_STRATEGIES = {"first", "mean", "max"}
-    _AGGREGATION_METHODS = {"weighted_sum", "mean", "min", "max"}
 
     def __init__(self, *, config: "RemoteRewardSpec", base_device: str) -> None:
         del base_device
@@ -169,7 +141,11 @@ class RemoteRewardBackend(RewardBackend):
         )
         self.base_url = config.base_url.rstrip("/")
         self.required_rewards = list(config.required_rewards)
-        self.reward_weights = dict(config.reward_weights or {})
+        self.reward_weights = {} if config.reward_weights is None else dict(config.reward_weights)
+        self.monitor_rewards = set(config.monitor_rewards)
+        self.component_keys = {
+            name: f"monitor_{name}" if name in self.monitor_rewards else name for name in self.required_rewards
+        }
         self.max_retries = config.max_retries
         self.retry_delay = config.retry_delay
         self.request_batch_size = config.request_batch_size
@@ -183,20 +159,17 @@ class RemoteRewardBackend(RewardBackend):
         self.video_fps = config.video_fps
         self.input_kind = config.input_kind
 
-        self._remote_rewards_validated = False
-
         self._session = http_requests.Session()
         self._session.trust_env = False
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:
-        """Convert a UniRL request, call the remote service, and"""
+        """Convert a UniRL request, call the remote service, and parse the response."""
         start = time.time()
-        if request.is_video:
-            return self._compute_video_rewards(request, start)
-
         bs = request.batch_size
         try:
-            payload = self._build_score_payload(request)
+            payload = (
+                self._build_video_score_payload(request) if request.is_video else self._build_score_payload(request)
+            )
             raw = self._post_score_requests(payload["requests"])
             return self._parse_score_response(raw, bs, time.time() - start)
         except Exception:
@@ -210,66 +183,21 @@ class RemoteRewardBackend(RewardBackend):
                 compute_time=time.time() - start,
             )
 
-    def is_available(self) -> bool:
-        """Ping ``/health``; ``True`` iff the server is reachable."""
-        try:
-            resp = self._session.get(
-                f"{self.base_url}/health",
-                timeout=5.0,
-            )
-        except http_requests.exceptions.RequestException:
-            return False
-        if resp.status_code != 200:
-            return False
-        self._validate_required_rewards_once(resp)
-        return True
-
-    def _validate_required_rewards_once(self, health_resp: http_requests.Response) -> None:
-        """One-shot: ``raise ValueError`` if any required reward is not in the"""
-        if self._remote_rewards_validated:
-            return
-
-        try:
-            body = health_resp.json()
-        except ValueError as e:
-            raise ValueError(f"RemoteRewardBackend: /health at {self.base_url} returned non-JSON body.") from e
-
-        if not isinstance(body, dict) or not isinstance(body.get("rewards"), dict):
-            raise ValueError(
-                f"RemoteRewardBackend: /health at {self.base_url} returned unexpected shape: "
-                f"{body!r}. Expected {{'status': 'ok', 'rewards': {{<name>: [...]}}}}."
-            )
-
-        available = sorted(body["rewards"].keys())
-        available_set = set(available)
-        missing = [name for name in self.required_rewards if name not in available_set]
-        if missing:
-            raise ValueError(
-                f"RemoteRewardBackend: required_rewards={missing} not served by "
-                f"{self.base_url}; server reports available={available}. "
-                f"Check REWARD_COMPONENTS for typos "
-                f"(e.g. 'unifiedreward' vs 'unified_reward')."
-            )
-
-        logger.info(
-            "RemoteRewardBackend: %s serves rewards=%s",
-            self.base_url,
-            available,
-        )
-        self._remote_rewards_validated = True
-
     def dispose(self) -> None:
         """Close the HTTP session."""
         self._session.close()
 
     def _build_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a UniRL ``RewardRequest`` into the RewardService"""
-        images = request.images or []
+        """Convert a UniRL ``RewardRequest`` into the RewardService ``ScoreRequest``."""
+        images = [] if request.images is None else request.images
         prompts = self.prompts(request)
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
 
-        condition_images = self._get_condition_images(request)
+        prim_image = request.conditioning.get("image")
+        condition_images = (
+            None if prim_image is None else [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]
+        )
 
         for idx in range(len(images)):
             prompt = prompts[idx] if idx < len(prompts) else ""
@@ -278,9 +206,7 @@ class RemoteRewardBackend(RewardBackend):
                 image_format=self.image_format,
                 quality=self.image_quality,
             )
-            sample_metadata = None
-            if metadata_list is not None and idx < len(metadata_list):
-                sample_metadata = metadata_list[idx]
+            sample_metadata = metadata_list[idx] if metadata_list is not None and idx < len(metadata_list) else None
 
             if condition_images is not None and idx < len(condition_images):
                 condition_b64 = _encode_image_b64(
@@ -302,11 +228,9 @@ class RemoteRewardBackend(RewardBackend):
                 idx,
                 required_rewards=self.required_rewards,
                 expected_scorer_version=self.expected_scorer_version,
-                payload_fingerprint=_payload_fingerprint(
-                    media_fingerprint=media_fingerprint,
-                    prompt=prompt,
-                    metadata=sample_metadata,
-                ),
+                media_fingerprint=media_fingerprint,
+                prompt=prompt,
+                metadata=sample_metadata,
             )
             wire_requests.append(
                 {
@@ -319,36 +243,9 @@ class RemoteRewardBackend(RewardBackend):
 
         return {"protocol_version": "1", "requests": wire_requests}
 
-    def _get_condition_images(self, request: RewardRequest) -> Optional[List[Union[Image.Image, torch.Tensor]]]:
-        """Extract per-sample condition images from request conditioning."""
-        prim_image = request.conditioning.get("image")
-        if prim_image is None:
-            return None
-        from unirl.utils.media import tensor_frame_to_pil
-
-        return [tensor_frame_to_pil(image.pixels) for image in prim_image.to_list()]
-
-    def _compute_video_rewards(self, request: RewardRequest, start: float) -> RewardResponse:
-        """Send video tensors to the remote service and parse the response."""
-        bs = request.batch_size
-        try:
-            payload = self._build_video_score_payload(request)
-            raw = self._post_score_requests(payload["requests"])
-            return self._parse_score_response(raw, bs, time.time() - start)
-        except Exception:
-            if self.raise_on_failure:
-                raise
-            logger.exception("RemoteRewardBackend._compute_video_rewards failed (degraded mode)")
-            return RewardResponse(
-                rewards=[0.0] * bs,
-                successes=[False] * bs,
-                errors=["RemoteRewardBackend video failure (see logs)"] * bs,
-                compute_time=time.time() - start,
-            )
-
     def _build_video_score_payload(self, request: RewardRequest) -> Dict[str, Any]:
-        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``"""
-        videos = request.videos or []
+        """Convert a video ``RewardRequest`` into the RewardService ``ScoreRequest``."""
+        videos = [] if request.videos is None else request.videos
         prompts = self.prompts(request)
         metadata_list = request.metadata
         wire_requests: List[Dict[str, Any]] = []
@@ -356,19 +253,15 @@ class RemoteRewardBackend(RewardBackend):
         for idx in range(len(videos)):
             prompt = prompts[idx] if idx < len(prompts) else ""
             video_b64 = _encode_video_b64(videos[idx], fps=self.video_fps)
-            sample_metadata = None
-            if metadata_list is not None and idx < len(metadata_list):
-                sample_metadata = metadata_list[idx]
+            sample_metadata = metadata_list[idx] if metadata_list is not None and idx < len(metadata_list) else None
             identity = _wire_identity(
                 request,
                 idx,
                 required_rewards=self.required_rewards,
                 expected_scorer_version=self.expected_scorer_version,
-                payload_fingerprint=_payload_fingerprint(
-                    media_fingerprint=hashlib.sha256(video_b64.encode("ascii")).hexdigest(),
-                    prompt=prompt,
-                    metadata=sample_metadata,
-                ),
+                media_fingerprint=hashlib.sha256(video_b64.encode("ascii")).hexdigest(),
+                prompt=prompt,
+                metadata=sample_metadata,
             )
             wire_requests.append(
                 {
@@ -384,7 +277,7 @@ class RemoteRewardBackend(RewardBackend):
     def _post_score_requests(self, wire_requests: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not wire_requests:
             return {"protocol_version": "1", "results": [], "errors": []}
-        request_batch_size = self.request_batch_size or len(wire_requests)
+        request_batch_size = len(wire_requests) if self.request_batch_size is None else self.request_batch_size
         merged_results: List[Dict[str, Dict[str, float]]] = []
         merged_errors: List[Dict[str, str]] = []
 
@@ -394,9 +287,12 @@ class RemoteRewardBackend(RewardBackend):
             response_version = raw.get("protocol_version")
             if response_version is not None and response_version != "1":
                 raise ValueError(f"RewardService protocol_version={response_version!r}, expected '1'")
-            results = list(raw.get("results") or [])
-            errors = list(raw.get("errors") or [])
-            identities = list(raw.get("identities") or [])
+            raw_results = raw.get("results")
+            results = [] if raw_results is None else list(raw_results)
+            raw_errors = raw.get("errors")
+            errors = [] if raw_errors is None else list(raw_errors)
+            raw_identities = raw.get("identities")
+            identities = [] if raw_identities is None else list(raw_identities)
             if len(results) > len(chunk) or len(errors) > len(chunk):
                 raise ValueError(
                     f"RewardService returned more rows than requested for chunk {start}: "
@@ -455,7 +351,7 @@ class RemoteRewardBackend(RewardBackend):
                     self.max_retries,
                 )
             except http_requests.exceptions.RequestException as e:
-                response = getattr(e, "response", None)
+                response = e.response
                 if response is not None and 400 <= response.status_code < 500 and response.status_code != 429:
                     raise
                 last_exc = e
@@ -477,53 +373,60 @@ class RemoteRewardBackend(RewardBackend):
         batch_size: int,
         compute_time: float,
     ) -> RewardResponse:
-        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL"""
-        results: List[Dict[str, Dict[str, float]]] = raw.get("results", [])
-        errors_list: List[Dict[str, str]] = raw.get("errors", [])
+        """Convert the RewardService ``ScoreResponse`` JSON into a UniRL ``RewardResponse``."""
+        results: List[Dict[str, Dict[str, float]]] = raw["results"]
+        errors_list: List[Dict[str, str]] = raw["errors"]
 
-        while len(results) < batch_size:
-            results.append({})
-        while len(errors_list) < batch_size:
-            errors_list.append({})
-
-        component_rewards: Dict[str, List[float]] = {name: [] for name in self.required_rewards}
+        component_rewards: Dict[str, List[float]] = {key: [] for key in self.component_keys.values()}
         aggregated_rewards: List[float] = []
         successes: List[bool] = []
         sample_errors: List[Optional[str]] = []
 
         for i in range(batch_size):
-            sample_result = results[i]
-            sample_errors_dict = errors_list[i]
+            sample_result = results[i] if i < len(results) else {}
+            sample_errors_dict = errors_list[i] if i < len(errors_list) else {}
 
             scores: List[float] = []
             weights: List[float] = []
             error_parts: List[str] = []
 
             for reward_name in self.required_rewards:
+                component_key = self.component_keys[reward_name]
                 if reward_name in sample_result:
                     sub_metrics = sample_result[reward_name]
                     non_finite = self._first_non_finite(sub_metrics)
                     if non_finite is not None:
                         # Reject non-finite scores before they poison group normalization.
                         metric_name, bad_value = non_finite
-                        component_rewards[reward_name].append(0.0)
+                        component_rewards[component_key].append(0.0)
                         error_parts.append(
                             f"{reward_name}: non-finite value {bad_value!r} for sub-metric {metric_name!r}"
                         )
                         continue
                     score = self._reduce_sub_metrics(sub_metrics)
-                    component_rewards[reward_name].append(score)
+                    component_rewards[component_key].append(score)
+                    if reward_name in self.monitor_rewards:
+                        continue
                     scores.append(score)
                     weights.append(self.reward_weights.get(reward_name, 1.0))
                 else:
-                    component_rewards[reward_name].append(0.0)
+                    component_rewards[component_key].append(0.0)
                     if reward_name in sample_errors_dict:
                         error_parts.append(f"{reward_name}: {sample_errors_dict[reward_name]}")
                     else:
                         error_parts.append(f"{reward_name}: missing from server response without error")
 
             if scores:
-                aggregated_rewards.append(self._aggregate_scores(scores, weights))
+                if self.aggregation_method == "weighted_sum":
+                    total_w = sum(weights)
+                    agg = sum(s * w for s, w in zip(scores, weights)) / total_w if total_w > 0 else 0.0
+                elif self.aggregation_method == "mean":
+                    agg = sum(scores) / len(scores)
+                elif self.aggregation_method == "min":
+                    agg = min(scores)
+                else:
+                    agg = max(scores)
+                aggregated_rewards.append(agg)
                 successes.append(len(error_parts) == 0)
             else:
                 aggregated_rewards.append(0.0)
@@ -538,19 +441,6 @@ class RemoteRewardBackend(RewardBackend):
             errors=sample_errors,
             compute_time=compute_time,
         )
-
-    def _aggregate_scores(self, scores: List[float], weights: List[float]) -> float:
-        """Aggregate per-reward scores for one sample."""
-        if not scores:
-            return 0.0
-        if self.aggregation_method == "weighted_sum":
-            total_w = sum(weights)
-            return sum(s * w for s, w in zip(scores, weights)) / total_w if total_w > 0 else 0.0
-        if self.aggregation_method == "mean":
-            return sum(scores) / len(scores)
-        if self.aggregation_method == "min":
-            return min(scores)
-        return max(scores)
 
     @staticmethod
     def _first_non_finite(sub_metrics: Dict[str, float]) -> Optional[Tuple[str, Any]]:
@@ -569,12 +459,12 @@ class RemoteRewardBackend(RewardBackend):
         """Collapse a reward's sub-metric dict into a single float."""
         if not sub_metrics:
             raise ValueError("RewardService returned an empty sub-metric mapping")
-        values = list(sub_metrics.values())
+        values = [float(v) for v in sub_metrics.values()]
         if self.sub_metric_reduce == "first":
-            return float(values[0])
+            return values[0]
         if self.sub_metric_reduce == "mean":
-            return float(sum(values) / len(values))
-        return float(max(values))
+            return sum(values) / len(values)
+        return max(values)
 
 
 @dataclass
@@ -584,6 +474,7 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
     base_url: str = ""
     required_rewards: Tuple[str, ...] = ()
     reward_weights: Optional[Dict[str, float]] = None
+    monitor_rewards: Tuple[str, ...] = ()
     batch_size: int = 8
     timeout: float = 300.0
     max_retries: int = 3
@@ -610,6 +501,26 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
         require(
             len(self.required_rewards) > 0,
             "RemoteRewardSpec.required_rewards must be non-empty",
+        )
+        require(
+            set(self.monitor_rewards) <= set(self.required_rewards),
+            f"RemoteRewardSpec.monitor_rewards must be a subset of required_rewards; "
+            f"got {self.monitor_rewards!r} vs {self.required_rewards!r}",
+        )
+        colliding = {f"monitor_{name}" for name in self.monitor_rewards} & set(self.required_rewards)
+        require(
+            not colliding,
+            f"RemoteRewardSpec.required_rewards must not contain {sorted(colliding)!r}; "
+            f"monitor_rewards report as monitor_<name>",
+        )
+        require(
+            not set(self.required_rewards) <= set(self.monitor_rewards),
+            "RemoteRewardSpec.monitor_rewards must leave at least one reward that trains",
+        )
+        weighted_monitors = set(self.monitor_rewards) & set(self.reward_weights or ())
+        require(
+            not weighted_monitors,
+            f"RemoteRewardSpec.reward_weights must not name monitor_rewards; got {sorted(weighted_monitors)!r}",
         )
         require(
             self.max_retries >= 1,

@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import torch
+
 from unirl.models.types.pipeline import Pipeline
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
@@ -58,13 +60,24 @@ class PEPipeline(Pipeline):
         from unirl.sde.runtime import FlowMatchSchedulePolicy
 
         return FlowMatchSchedulePolicy.from_pretrained(
-            getattr(diff.bundle, "pretrained_path", None),
-            shift=float(diff.shift),
+            diff.bundle.pretrained_path,
+            shift=diff.shift,
         )
 
     def generate(self, sample: Sample) -> Sample:
         """Run the PE serial flow over the pre-forked request ``Sample``."""
-        input_part, ar_shell, diff_shell = self._unpack_request(sample)
+        if not sample.parts or not sample.parts[0].is_root:
+            raise ValueError("PEPipeline.generate: requires a root input Part at parts[0]")
+        if len(sample.parts) != 3:
+            raise ValueError(
+                "PEPipeline.generate: requires exactly [input, ar_shell, diffusion_shell]; "
+                f"got {len(sample.parts)} Parts."
+            )
+        input_part, ar_shell, diff_shell = sample.parts
+        if not isinstance(ar_shell.sampling_params, ARSamplingParams):
+            raise ValueError("PEPipeline.generate: requires an AR gen-shell Part (ARSamplingParams)")
+        if not isinstance(diff_shell.sampling_params, DiffusionSamplingParams):
+            raise ValueError("PEPipeline.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)")
 
         P = len(input_part.sample_ids)
         if P == 0:
@@ -86,9 +99,10 @@ class PEPipeline(Pipeline):
         if M < 1:
             raise ValueError(f"PEPipeline.generate: diffusion branch M={M} must be >= 1")
 
+        source = input_part.primitives.get("image")
         ar_input = Part.input(
             sample_ids=list(input_part.sample_ids),
-            primitives={"text": prompts},
+            primitives={"text": prompts} if source is None else {"text": prompts, "image": source},
             control=ar_child_control(input_part.control, system_instruction=self.pe_instruction),
         )
         ar_out = self.llm_pipeline.generate(Sample(parts=[ar_input, ar_shell]))
@@ -104,10 +118,30 @@ class PEPipeline(Pipeline):
                 f"(expected {P * N}, got {len(rewritten.texts) if isinstance(rewritten, Texts) else 'None'})"
             )
 
-        rewritten = self._extract_pe(rewritten, prompts, N)
+        if self.pe_marker:
+            cleaned_texts, stats = postprocess_pe_texts(
+                rewritten.texts,
+                user_prompts=prompts.texts,
+                samples_per_prompt=N,
+                marker=self.pe_marker,
+                max_chars=self.pe_max_chars,
+            )
+            if any(stats.values()):
+                logger.info(
+                    "PEPipeline: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
+                    self.pe_marker,
+                    stats["empty"],
+                    len(rewritten.texts),
+                    stats["truncated"],
+                    stats["fallback"],
+                )
+            rewritten = Texts(texts=cleaned_texts)
         ar_part = ar_part.fill(primitives={"text": rewritten})
 
-        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives={"text": rewritten})
+        pe_primitives = {"text": rewritten}
+        if source is not None:
+            pe_primitives["image"] = source.select(torch.arange(P).repeat_interleave(N))  # [P*N]
+        pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives=pe_primitives)
         diff_child_shell = pe_input.fork(
             M,
             sampling_params=diff_shell.sampling_params,
@@ -132,45 +166,6 @@ class PEPipeline(Pipeline):
             parts=[input_part, ar_part, diffusion_part],
             reward_compute_s=sample.reward_compute_s,
         )
-
-    @staticmethod
-    def _unpack_request(sample: Sample) -> tuple:
-        """Resolve the pre-forked ``[input, ar_shell, diff_shell]`` request."""
-        if not sample.parts or not sample.parts[0].is_root:
-            raise ValueError("PEPipeline.generate: requires a root input Part at parts[0]")
-        if len(sample.parts) != 3:
-            raise ValueError(
-                "PEPipeline.generate: requires exactly [input, ar_shell, diffusion_shell]; "
-                f"got {len(sample.parts)} Parts."
-            )
-        input_part, ar_shell, diff_shell = sample.parts
-        if not isinstance(ar_shell.sampling_params, ARSamplingParams):
-            raise ValueError("PEPipeline.generate: requires an AR gen-shell Part (ARSamplingParams)")
-        if not isinstance(diff_shell.sampling_params, DiffusionSamplingParams):
-            raise ValueError("PEPipeline.generate: requires a diffusion gen-shell Part (DiffusionSamplingParams)")
-        return input_part, ar_shell, diff_shell
-
-    def _extract_pe(self, pe_texts: Texts, user_prompts: Texts, samples_per_prompt: int) -> Texts:
-        """Optional marker-based PE extraction; off-format outputs fall back to the original user prompt."""
-        if not self.pe_marker:
-            return pe_texts
-        cleaned_texts, stats = postprocess_pe_texts(
-            pe_texts.texts,
-            user_prompts=user_prompts.texts,
-            samples_per_prompt=samples_per_prompt,
-            marker=self.pe_marker,
-            max_chars=self.pe_max_chars,
-        )
-        if any(stats.values()):
-            logger.info(
-                "PEPipeline: PE-extract — marker=%r, %d/%d empty, %d truncated, %d fallback_to_original",
-                self.pe_marker,
-                stats["empty"],
-                len(pe_texts.texts),
-                stats["truncated"],
-                stats["fallback"],
-            )
-        return Texts(texts=cleaned_texts)
 
 
 __all__ = ["PEPipeline"]

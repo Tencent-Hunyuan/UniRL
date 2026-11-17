@@ -23,6 +23,7 @@ num_rollouts: 200
 worker_max_concurrency: 10
 per_worker_inflight: 4 # per-slot trajectory cap (2 slots x 4 covers the 8 concurrent tasks)
 stop: ["</tool_call>"]
+mask_overflow_loss: false # true: overflow trajectories keep their baseline share but get no gradient
 
 sampling:
   _target_: unirl.types.sampling.ARSamplingParams
@@ -93,6 +94,11 @@ rollout:
       pretrained_model_ckpt_path: ${oc.env:QWEN3_INSTRUCT_PATH,Qwen/Qwen3-4B-Instruct}
       tp_size: 1
       concurrency: 8
+      context_length: 40960 # Qwen3-4B window, also passed to the server; each turn is clamped to what is left
+      # Make this colocated engine's sleep() actually free GPU (KV + weights→CPU);
+      # without both it is a silent no-op that reports success and frees nothing.
+      enable_memory_saver: true
+      enable_weights_cpu_backup: true
       # The deep-research framing — verbatim from AReaL's tongyi_deepresearch
       # SYSTEM_PROMPT, adapted for UniRL: the <tools> JSON block is dropped because
       # the tool SCHEMAS are auto-injected into the chat template from the env.
@@ -109,7 +115,9 @@ rollout:
         enable_thinking: false
         # `tools` is auto-injected from the env's tool_schemas() at engine build.
       engine_kwargs:
-        mem_fraction_static: 0.3
+        # Ceiling is set by the wake window, not the rollout phase: sleep/wake straddles
+        # the train step, so 0.45 peaks at 86% of an H20 and 0.6 OOMs in resume().
+        mem_fraction_static: 0.4
         skip_server_warmup: true
         attention_backend: triton
         disable_cuda_graph: false
@@ -118,6 +126,9 @@ rollout:
     env:
       _target_: unirl.rollout.env.tool_environment.ToolEnvironment
       max_turns: 8 # keep == config.max_turns
+      # 8 turns x 2048 generated leaves ~24k of the 40960 window for prompt + observations;
+      # visit falls back to raw page text when the summarizer is down, which is ~90k chars.
+      max_observation_chars: 12000
       tools:
         - _target_: unirl.rollout.env.tools.search.SearchTool
           top_k: 10
@@ -170,6 +181,7 @@ data_source:
   args:
     run:
       data_path: ${oc.env:DATA_PATH} # ASearcher jsonl: {"prompt": ..., "metadata": {"answer": ...}}
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,null}
       seed: 42
     algorithm:
       prompts_per_rollout: ${batch_size}

@@ -63,6 +63,24 @@ and raises if it's `None` — it doesn't compute σ at generate time. Diffusion
 pipelines also implement `latent_shape()` so the trainer can author the
 byte-identical `x_T` recipe.
 
+### Grouped diffusion replay
+
+`BatchedStepReplayMixin` (`types/batched_replay.py`) unifies serial and
+step-major batched (`[S * B, ...]`) SDE replay. Single-stream image and video
+stages call `replay_steps` (supplying model-specific arguments through
+`batched_step_kwargs`), while joint video/audio stages (`LTX-2`, `MiniMax-H3`)
+call `replay_joint_av_steps` to group aligned video and audio trajectories
+together. When batching multiple steps (`S > 1`), conditions are concatenated in
+step-major order (`type(conditions).concat([conditions] * S)`), and log-probs
+(`[B, S]`) and transition means (`[B, S, *latent]`) are restored to step-second
+order before the algorithm computes its loss.
+
+Grouped replay is an opt-in dense-batch path (`pipeline.batch_replay_steps`,
+default `false`) gated on `len(target) > 1` and stateless `SDEStrategy`
+implementations, retaining the serial fallback when disabled or for single-step
+slices. Because changing forward batch geometry is not bit-identical to rollout,
+the algorithm guard requires `old_logp_source: replay`.
+
 **Extending it:** a new model is a new `unirl/models/<model>/` with
 `config.py` / `bundle.py` / `diffusion.py`|`ar.py` / `conditions.py` / `pipeline.py`
 mirroring an existing one — there is no registry, models are selected purely by
@@ -102,6 +120,34 @@ it is the authoritative bundle / pipeline / stage / conditions contract.
   wrapper's state-dict hooks strip it). Any match between module params and
   checkpoint keys goes through `canonical_param_name`, exported beside the
   deferred-op pair in `types/post_materialize.py`.
+- **Init-computed non-persistent buffers keep their construction dtype through meta-init.**
+  `build_meta_init_transformer` instantiates under `torch.set_default_dtype(dtype)`
+  (matching `from_pretrained`), `finalize_meta_init` and `veomni_parallelize` cast
+  parameters without overwriting non-persistent buffers, and `restore_init_state`
+  restores each buffer's captured dtype (including `DTensor` shards). Buffers
+  created with an explicit `dtype=torch.float32` (such as RoPE `inv_freq` /
+  `original_inv_freq`) therefore stay in float32 under a BF16 model or VeOmni
+  master, avoiding position-dependent RoPE angle drift against rollout engines.
+- **`BagelDiffusionStage` packs `batch_replay_steps` across Navit varlen sequences (no-CFG only).**
+  Unlike `BatchedStepReplayMixin`'s dense `[S * B]` batching, Bagel's MoT forward is
+  `B=1` varlen-packed, so `pipeline.batch_replay_steps: true` repeats the sample's KV
+  context across `S` `cu_seqlens` segments and sets `split_sequences=True` on
+  `Bagel._forward_flow` so per-sequence Linear/MLP projections (`apply_by_sequence` /
+  `_apply_selected_by_sequence`) keep the serial BF16 reduction boundaries. It raises
+  unless `guidance_scale == 1.0` and `cfg_img_scale == 1.0`, and requires
+  `old_logp_source: replay`.
+- **Qwen2.5-VL replay takes image placeholders from the prompt only.** A sampled
+  `<|image_pad|>` in the response is a text action, as it is during rollout. Stock
+  `Qwen2_5_VLModel.forward` counts placeholders over the whole `input_ids`
+  (`get_placeholder_mask`) and `get_rope_index` opens one image group per
+  placeholder run, so both raise on such a response. `QwenVLARStage` installs
+  `_prompt_image_forward` on the transformer: given `image_mask`, it scatters the
+  image features at that mask and calls the stock forward with `inputs_embeds`.
+  The scatter runs inside `forward` because the root `fully_shard` group (which
+  holds the token embedding) is only unsharded there. On a `transformers` bump,
+  check that the stock forward still skips `get_placeholder_mask` when
+  `pixel_values` is `None`. `DELETE-WHEN`: stock `get_rope_index` and
+  `get_placeholder_mask` accept a caller-supplied image mask.
 
 
 ## Conversation composition
@@ -160,7 +206,7 @@ external engines with a UniRL adapter (see
 |---|---|---|---|---|---|---|---|
 | [`sd3/`](sd3/) | `stabilityai/stable-diffusion-3.5-medium` | Text → Image | `train_diffusion`, `train_sft`, `train_pe` (image side) | trainside, sglang_diffusion, vllm_omni | [`sd3_trainside`](../../examples/diffusion/sd3/sd3_trainside.yaml), [`sd3_nft_sglang`](../../examples/diffusion/sd3/sd3_nft_sglang.yaml), [`sd3_vllmomni`](../../examples/diffusion/sd3/sd3_vllmomni.yaml), [`sft/sd3_sft_lora`](../../examples/sft/sd3_sft_lora.yaml) | `sd3_dancegrpo_hpsv3*`, `sd3_nft_reward_service`, `sd3_opd_multi_teacher`: scorer-dependent | ✅ |
 | [`qwen_image/`](qwen_image/) | `Qwen/Qwen-Image` | Text → Image | `train_diffusion` | trainside, sglang_diffusion, vllm_omni | [`qwen_image_trainside`](../../examples/diffusion/qwen_image/qwen_image_trainside.yaml), [`qwen_image_sglang`](../../examples/diffusion/qwen_image/qwen_image_sglang.yaml), [`qwen_image_grpo_vllmomni`](../../examples/diffusion/qwen_image/qwen_image_grpo_vllmomni.yaml) | — | ✅ |
-| [`qwen_image_edit_plus/`](qwen_image_edit_plus/) | `Qwen/Qwen-Image-Edit-2511` | Text + Image → Image | `train_diffusion` | trainside, sglang_diffusion | [`qwen_image_edit_plus_nft`](../../examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft.yaml), [`qwen_image_edit_plus_flowgrpo_sglang`](../../examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_flowgrpo_sglang.yaml) | engine-specific (no vllm_omni adapter); `*_managed_editscore`: scorer-dependent | ✅ |
+| [`qwen_image_edit_plus/`](qwen_image_edit_plus/) | `Qwen/Qwen-Image-Edit-2511` | Text + Image → Image | `train_diffusion`, `train_pe` (editor side) | trainside, sglang_diffusion | [`qwen_image_edit_plus_nft`](../../examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft.yaml), [`qwen_image_edit_plus_flowgrpo_sglang`](../../examples/diffusion/qwen_image_edit_plus/qwen_image_edit_plus_flowgrpo_sglang.yaml) | engine-specific (no vllm_omni adapter); `*_managed_editscore`: scorer-dependent | ✅ |
 | [`flux2_klein/`](flux2_klein/) | `black-forest-labs/FLUX.2-klein-base-4B` / `-9B` | Text → Image; Text + Image → Image | `train_diffusion` | trainside, sglang_diffusion | [`flux2_klein_trainside`](../../examples/diffusion/flux2_klein/flux2_klein_trainside.yaml), [`flux2_klein_sglang`](../../examples/diffusion/flux2_klein/flux2_klein_sglang.yaml), [`flux2_klein_4b_editreward`](../../examples/diffusion/flux2_klein/flux2_klein_4b_editreward.yaml) | engine-specific; edit (`*_editreward*`) recipes: scorer-dependent | ✅ |
 | [`z_image/`](z_image/) | `Tongyi-MAI/Z-Image` | Text → Image | `train_diffusion` | trainside, sglang_diffusion | [`z_image_trainside`](../../examples/diffusion/z_image/z_image_trainside.yaml), [`z_image_sglang_full_tensor`](../../examples/diffusion/z_image/z_image_sglang_full_tensor.yaml) | engine-specific | ✅ |
 | [`boogu_image/`](boogu_image/) | `Boogu/Boogu-Image-0.1-Base` | Text → Image | `train_diffusion` | trainside | [`boogu_image_trainside`](../../examples/diffusion/boogu_image/boogu_image_trainside.yaml) | engine-specific (trainside only) | ✅ |
@@ -173,14 +219,14 @@ external engines with a UniRL adapter (see
 
 | Package | Model (recipe default) | Modality | Entrypoints | Engines with a recipe | Recipes | Restrictions | Status |
 |---|---|---|---|---|---|---|---|
-| [`wan21/`](wan21/) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion`, `train_sft` | trainside, sglang_diffusion, fastvideo | [`wan21_t2v`](../../examples/diffusion/wan21/wan21_t2v.yaml), [`wan21_i2v`](../../examples/diffusion/wan21/wan21_i2v.yaml), [`wan21_t2v_sglang`](../../examples/diffusion/wan21/wan21_t2v_sglang.yaml), [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`sft/wan21_t2v_ucf101_full`](../../examples/sft/wan21_t2v_ucf101_full.yaml) | `wan21_t2v_videoalign_dancegrpo`: scorer-dependent; fastvideo needs the `[fastvideo]` extra | ✅ |
+| [`wan21/`](wan21/) | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion`, `train_sft` | trainside, sglang_diffusion, fastvideo | [`wan21_t2v`](../../examples/diffusion/wan21/wan21_t2v.yaml), [`wan21_i2v`](../../examples/diffusion/wan21/wan21_i2v.yaml), [`wan21_t2v_sglang`](../../examples/diffusion/wan21/wan21_t2v_sglang.yaml), [`wan21_t2v_dancegrpo_fastvideo`](../../examples/diffusion/wan21/wan21_t2v_dancegrpo_fastvideo.yaml), [`sft/wan21_t2v_ucf101_full`](../../examples/sft/wan21_t2v_ucf101_full.yaml) | `wan21_t2v_videoalign_dancegrpo`: scorer-dependent; fastvideo needs `$FASTVIDEO_PATH` | ✅ |
 | [`wan22/`](wan22/) | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` (I2V) | Text → Video; Image → Video | `train_diffusion` | trainside, sglang_diffusion, fastvideo | [`wan22_t2v_14b`](../../examples/diffusion/wan22/wan22_t2v_14b.yaml), [`wan22_i2v`](../../examples/diffusion/wan22/wan22_i2v.yaml), [`wan22_t2v_14b_sglang`](../../examples/diffusion/wan22/wan22_t2v_14b_sglang.yaml), [`wan22_t2v_14b_dancegrpo_fastvideo`](../../examples/diffusion/wan22/wan22_t2v_14b_dancegrpo_fastvideo.yaml) | extends `wan21/` (dual-expert) | ✅ |
 | [`wan22_v2v/`](wan22_v2v/) | `PRETRAINED_MODEL` → `Wan-AI/Wan2.2-T2V-A14B-Diffusers` (V2V pipeline over `wan22/`) | Video → Video | `train_diffusion` | trainside | [`wan22_v2v_14b`](../../examples/diffusion/wan22_v2v/wan22_v2v_14b.yaml) | engine-specific (trainside only); checkpoint-path-required (default is a cluster path); `videoclipdelta` scorer | ✅ |
 | [`hunyuan_video10/`](hunyuan_video10/) | `hunyuanvideo-community/HunyuanVideo` | Text → Video | `train_diffusion` | trainside, sglang_diffusion | [`hunyuan_video10_t2v_trainside`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_trainside.yaml), [`hunyuan_video10_t2v_sglang`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_sglang.yaml) | engine-specific | ✅ |
 | [`hunyuan_video15/`](hunyuan_video15/) | `hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v` | Text → Video | `train_diffusion` | trainside, vllm_omni | [`hunyuan_video15_t2v_dancegrpo_trainside`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_dancegrpo_trainside.yaml), [`hunyuan_video15_t2v_vllmomni_colocate`](../../examples/diffusion/hunyuan_video15/hunyuan_video15_t2v_vllmomni_colocate.yaml) | engine-specific (no sglang_diffusion adapter) | ✅ |
 | [`ltx2/`](ltx2/) | `Lightricks/LTX-2` | Text → Video | `train_diffusion` | trainside, sglang_diffusion | [`ltx2_t2v_trainside`](../../examples/diffusion/ltx2/ltx2_t2v_trainside.yaml), [`ltx2_t2v_sglang_loramerge`](../../examples/diffusion/ltx2/ltx2_t2v_sglang_loramerge.yaml) | engine-specific; I2V is in the config but has no recipe (not claimed) | ✅ |
 | [`ltx2/`](ltx2/) | `dg845/LTX-2.3-Diffusers` | Text → Audio + Video | `train_diffusion` | trainside | [`ltx2_3_t2av_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_trainside.yaml), [`ltx2_3_t2av_audioreward_trainside`](../../examples/diffusion/ltx2/ltx2_3_t2av_audioreward_trainside.yaml) | engine-specific (trainside only); `*_audioreward*`: `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
-| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml) | engine-specific (trainside only — no vllm_omni adapter on `main`); checkpoint-path-required; 768px short edge only (minimum 768×768 × 124 frames), 1 node × 8 GPUs minimum; reward is `t2av_composite` (`videopickscore` + `clap`), `imagebind` opt-in (scorer-dependent) | ✅ |
+| [`minimax_h3/`](minimax_h3/) | `PRETRAINED_MODEL` (no default) → MiniMax-H3 (33B dense) Hub id or local snapshot | Text → Video + Audio | `train_diffusion` | trainside | [`minimax_h3_t2va_trainside`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_trainside.yaml), [`minimax_h3_t2va_nft`](../../examples/diffusion/minimax_h3/minimax_h3_t2va_nft.yaml) | engine-specific (trainside only — no vllm_omni adapter on `main`); checkpoint-path-required; canvas axes multiples of 32 within 1:4–4:1 and a 768×1344 area cap, 124 frames minimum (`17n + 5`), 1 node × 8 GPUs minimum; reward is `t2av_composite` (`imagebind` mode `all` + `clap`; ImageBind is CC-BY-NC-SA, scorer-dependent) | ✅ |
 
 ### Unified and multimodal generators
 
@@ -198,15 +244,15 @@ external engines with a UniRL adapter (see
 | [`qwen3/`](qwen3/) | `Qwen/Qwen3-4B-Base` (`Qwen/Qwen3-4B-Instruct` in deep research, `Qwen/Qwen3-0.6B` in PE); `vllm` recipe: `QWEN3_MOE_PATH` → Qwen3-30B-A3B | Text → Text | `train_ar`, `train_async_ar`, `train_agentic`, `train_pe` (rewriter side), `train_sft` | sglang, vllm, agentic (over sglang), trainside (PE recipes only) | [`qwen3_grpo_4b_base_dapo_sglang`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang.yaml), [`qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4`](../../examples/ar/qwen3_moe_grpo_30b_a3b_gsm8k_fsdp_vllm_tp4.yaml), [`qwen3_grpo_4b_base_dapo_sglang_async`](../../examples/ar/qwen3_grpo_4b_base_dapo_sglang_async.yaml), [`deep_research_search_judge`](../../examples/deep_research/deep_research_search_judge.yaml), [`sft/qwen3_sft`](../../examples/sft/qwen3_sft.yaml) | `vllm` recipe: 30B-A3B only, checkpoint-path-required (native IPC weight sync accepts `model_type == qwen3_moe`); agentic recipe: scorer-dependent (`llm_judge` posts to an OpenAI-compatible `$JUDGE_URL`) | ✅ |
 | [`qwen3_moe/`](qwen3_moe/) | `QWEN3_MOE_PATH` (no default) → Qwen3-30B-A3B, stacked for VeOmni EP | Text → Text | `train_ar` (through the `qwen3/` pipeline) | sglang | [`qwen3_moe_grpo_30b_a3b_veomni_ep_sglang`](../../examples/ar/qwen3_moe_grpo_30b_a3b_veomni_ep_sglang.yaml) | bundle-only: `bundle.py` only, no pipeline / stage / conditions — the recipe builds `Qwen3Pipeline.from_bundle` on it for VeOmni expert parallelism; checkpoint-path-required | 🧩 |
 | [`qwen3_5/`](qwen3_5/) | `tiny-random/qwen3.5` (smoke); real runs: `QWEN3_5_PATH` → Qwen3.5-9B, `QWEN3_5_MOE_PATH` (no default) → Qwen3.5-35B-A3B | Text → Text; Text + Image → Text | `train_ar` | sglang | [`qwen3_5_grpo_9b_base_dapo_sglang`](../../examples/ar/qwen3_5_grpo_9b_base_dapo_sglang.yaml), [`qwen3_5_grpo_9b_geo3k_mc_sglang`](../../examples/ar/qwen3_5_grpo_9b_geo3k_mc_sglang.yaml), [`qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang`](../../examples/ar/qwen3_5_moe_grpo_35b_a3b_base_dapo_sglang.yaml) | engine-specific (sglang only); checkpoint-path-required (9B recipes default to `tiny-random/qwen3.5`, a 4-layer smoke-test model; MoE recipes have no default); no SFT recipe; hybrid-attention fast path needs `flash-linear-attention` from the `[sglang]` extra | ✅ |
-| [`qwen_vl/`](qwen_vl/) | `Qwen/Qwen2.5-VL-7B-Instruct` | Text + Image → Text | `train_ar`, `train_sft` | trainside, sglang | [`qwen_vl_grpo_geo3k_mc_4x8`](../../examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml), [`qwen_vl_grpo_geo3k_mc_sglang_4x8`](../../examples/ar/qwen_vl_grpo_geo3k_mc_sglang_4x8.yaml), [`sft/qwen_vl_sft`](../../examples/sft/qwen_vl_sft.yaml) | package targets Qwen2.5-VL (not Qwen3-VL); RL recipes: multi-node (4×8) | ✅ |
+| [`qwen_vl/`](qwen_vl/) | `Qwen/Qwen2.5-VL-7B-Instruct` | Text + Image → Text | `train_ar`, `train_sft`, `train_pe` (image-aware rewriter side) | trainside, sglang | [`qwen_vl_grpo_geo3k_mc_4x8`](../../examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml), [`qwen_vl_grpo_geo3k_mc_sglang_4x8`](../../examples/ar/qwen_vl_grpo_geo3k_mc_sglang_4x8.yaml), [`sft/qwen_vl_sft`](../../examples/sft/qwen_vl_sft.yaml) | package targets Qwen2.5-VL (not Qwen3-VL); RL recipes: multi-node (4×8) | ✅ |
 | [`qwen3_omni/`](qwen3_omni/) | `QWEN3_OMNI_PATH` (placeholder default) → Qwen3-Omni-30B-A3B-Instruct (Thinker) | Text / Image / Audio / Video → Text | `train_ar`, `train_sft` | vllm_omni | [`qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4`](../../examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4.yaml), [`qwen3_omni_audio_dcase_gspo_lora_vllm_omni_1x4`](../../examples/ar/qwen3_omni_audio_dcase_gspo_lora_vllm_omni_1x4.yaml), [`sft/qwen3_omni_audio_sft_lora`](../../examples/sft/qwen3_omni_audio_sft_lora.yaml) | engine-specific (vllm_omni only, TP must divide the audio tower's 20 heads); LoRA-only; checkpoint-path-required | ✅ |
-| [`cosmos3/`](cosmos3/) | `nvidia/Cosmos3-Nano` | Video (+ action) prediction | `train_sft` | — (`Cosmos3Pipeline.generate` is unimplemented) | [`sft/cosmos3_droid100_videopred`](../../examples/sft/cosmos3_droid100_videopred.yaml), [`sft/cosmos3_droid100_action_bc`](../../examples/sft/cosmos3_droid100_action_bc.yaml) | SFT-only; dataset-dependent ([`datasets/droid100/`](../../datasets/droid100/README.md)); see [`cosmos3/README.md`](cosmos3/README.md) | 🧪 |
+| [`cosmos3/`](cosmos3/) | `nvidia/Cosmos3-Nano` | Video (+ action) prediction; Text → Image (generation only) | `train_sft` | — (`Cosmos3Pipeline.generate` samples text-to-image; replay is unimplemented) | [`sft/cosmos3_droid100_videopred`](../../examples/sft/cosmos3_droid100_videopred.yaml), [`sft/cosmos3_droid100_action_bc`](../../examples/sft/cosmos3_droid100_action_bc.yaml) | SFT-only; dataset-dependent ([`datasets/droid100/`](../../datasets/droid100/README.md)); see [`cosmos3/README.md`](cosmos3/README.md) | 🧪 |
 
 ### Composed pipelines and workflows
 
 | Package | Composes | Modality | Entrypoints | Engines with a recipe | Recipes | Restrictions | Status |
 |---|---|---|---|---|---|---|---|
-| [`pe/`](pe/) | `qwen3/` (rewriter, `Qwen/Qwen3-0.6B`) + `sd3/` (image) | Text → Text → Image | `train_pe` | trainside, composed (sglang + sglang_diffusion) | [`pe_trainside_pickscore`](../../examples/pe/pe_trainside_pickscore.yaml), [`pe_sglang_full_pickscore`](../../examples/pe/pe_sglang_full_pickscore.yaml) | `pe_sglang_full_wise`: scorer-dependent | 🔗 |
+| [`pe/`](pe/) | `qwen3/` (rewriter, `Qwen/Qwen3-0.6B`) + `sd3/` (image); image editing: `qwen_vl/` (rewriter) + `qwen_image_edit_plus/` (frozen editor) | Text → Text → Image; Text + Image → Text → Image (trainside only) | `train_pe` | trainside, composed (sglang + sglang_diffusion) | [`pe_trainside_pickscore`](../../examples/pe/pe_trainside_pickscore.yaml), [`pe_sglang_full_pickscore`](../../examples/pe/pe_sglang_full_pickscore.yaml), [`pe_it2i_trainside_editreward`](../../examples/pe/pe_it2i_trainside_editreward.yaml) | `pe_sglang_full_wise`: scorer-dependent | 🔗 |
 | — (`examples/deep_research/`) | `qwen3/` + [`agentic`](../rollout/engine/agentic/) engine over sglang | Multi-turn tool use | `train_agentic` | agentic (sglang) | [`deep_research_search_judge`](../../examples/deep_research/deep_research_search_judge.yaml) | a workflow, not a model; scorer-dependent (`llm_judge`) | 🔗 |
 
 **Not supported (no package):** the `sglang_diffusion` adapter registry also exposes

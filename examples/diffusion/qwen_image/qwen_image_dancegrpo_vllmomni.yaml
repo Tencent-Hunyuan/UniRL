@@ -52,6 +52,7 @@ pipeline:
   trajectory_precision: bf16
   logprob_precision: fp32
   max_sequence_length: 512
+  batch_replay_steps: true
   # DanceGRPO: Dance SDE kernel (the one algorithmic difference from FlowGRPO).
   strategy:
     _target_: unirl.sde.kernels.DanceSDEStrategy
