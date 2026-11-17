@@ -4,6 +4,7 @@ from .aesthetic import AestheticRewardScorer
 from .base import LocalRewardBackend
 from .clap import CLAPRewardScorer
 from .clip import ClipRewardScorer
+from .composite import CompositeRewardScorer
 from .geneval2 import GenEval2RewardScorer
 from .hpsv2 import HPSv2RewardScorer
 from .hpsv3 import HPSv3RewardScorer
@@ -15,7 +16,6 @@ from .ocr import OCRRewardScorer
 from .per_domain import PerDomainRewardScorer
 from .pickscore import PickScoreRewardScorer
 from .registry import available_builtin_reward_models, resolve_builtin_reward_scorer_class
-from .t2av_composite import T2AVCompositeScorer
 from .video import VideoRewardScorer
 from .video_clip_delta import VideoCLIPDeltaScorer
 from .video_pickscore import VideoPickScoreScorer
@@ -26,6 +26,7 @@ __all__ = [
     "LocalRewardBackend",
     "CLAPRewardScorer",
     "ClipRewardScorer",
+    "CompositeRewardScorer",
     "GenEval2RewardScorer",
     "HPSv2RewardScorer",
     "HPSv3RewardScorer",
@@ -36,7 +37,6 @@ __all__ = [
     "OCRRewardScorer",
     "PerDomainRewardScorer",
     "PickScoreRewardScorer",
-    "T2AVCompositeScorer",
     "VideoCLIPDeltaScorer",
     "VideoAlignRewardScorer",
     "VideoPickScoreScorer",

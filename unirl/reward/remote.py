@@ -21,6 +21,7 @@ from PIL import Image
 
 from unirl.config.require import require
 from unirl.reward.base import PromptRewardComponentSpec, RewardBackend
+from unirl.reward.panel import aggregate_panel, monitor_key, validate_panel
 from unirl.types.reward import RewardRequest, RewardResponse
 from unirl.utils.media import tensor_frame_to_pil
 
@@ -140,11 +141,11 @@ class RemoteRewardBackend(RewardBackend):
             prompt_source=config.prompt_source,
         )
         self.base_url = config.base_url.rstrip("/")
-        self.required_rewards = list(config.required_rewards)
         self.reward_weights = {} if config.reward_weights is None else dict(config.reward_weights)
         self.monitor_rewards = set(config.monitor_rewards)
+        self.wire_rewards = [*config.required_rewards, *config.monitor_rewards]
         self.component_keys = {
-            name: f"monitor_{name}" if name in self.monitor_rewards else name for name in self.required_rewards
+            name: monitor_key(name) if name in self.monitor_rewards else name for name in self.wire_rewards
         }
         self.max_retries = config.max_retries
         self.retry_delay = config.retry_delay
@@ -226,7 +227,7 @@ class RemoteRewardBackend(RewardBackend):
             identity = _wire_identity(
                 request,
                 idx,
-                required_rewards=self.required_rewards,
+                required_rewards=self.wire_rewards,
                 expected_scorer_version=self.expected_scorer_version,
                 media_fingerprint=media_fingerprint,
                 prompt=prompt,
@@ -235,7 +236,7 @@ class RemoteRewardBackend(RewardBackend):
             wire_requests.append(
                 {
                     "history": history,
-                    "required_rewards": list(self.required_rewards),
+                    "required_rewards": list(self.wire_rewards),
                     "metadata": sample_metadata,
                     **identity,
                 }
@@ -257,7 +258,7 @@ class RemoteRewardBackend(RewardBackend):
             identity = _wire_identity(
                 request,
                 idx,
-                required_rewards=self.required_rewards,
+                required_rewards=self.wire_rewards,
                 expected_scorer_version=self.expected_scorer_version,
                 media_fingerprint=hashlib.sha256(video_b64.encode("ascii")).hexdigest(),
                 prompt=prompt,
@@ -266,7 +267,7 @@ class RemoteRewardBackend(RewardBackend):
             wire_requests.append(
                 {
                     "history": [{"text": prompt, "video_b64": video_b64}],
-                    "required_rewards": list(self.required_rewards),
+                    "required_rewards": list(self.wire_rewards),
                     "metadata": sample_metadata,
                     **identity,
                 }
@@ -390,7 +391,7 @@ class RemoteRewardBackend(RewardBackend):
             weights: List[float] = []
             error_parts: List[str] = []
 
-            for reward_name in self.required_rewards:
+            for reward_name in self.wire_rewards:
                 component_key = self.component_keys[reward_name]
                 if reward_name in sample_result:
                     sub_metrics = sample_result[reward_name]
@@ -417,16 +418,7 @@ class RemoteRewardBackend(RewardBackend):
                         error_parts.append(f"{reward_name}: missing from server response without error")
 
             if scores:
-                if self.aggregation_method == "weighted_sum":
-                    total_w = sum(weights)
-                    agg = sum(s * w for s, w in zip(scores, weights)) / total_w if total_w > 0 else 0.0
-                elif self.aggregation_method == "mean":
-                    agg = sum(scores) / len(scores)
-                elif self.aggregation_method == "min":
-                    agg = min(scores)
-                else:
-                    agg = max(scores)
-                aggregated_rewards.append(agg)
+                aggregated_rewards.append(aggregate_panel(scores, weights, self.aggregation_method))
                 successes.append(len(error_parts) == 0)
             else:
                 aggregated_rewards.append(0.0)
@@ -498,29 +490,12 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
             bool(str(self.base_url).strip()),
             "RemoteRewardSpec.base_url must be non-empty",
         )
-        require(
-            len(self.required_rewards) > 0,
-            "RemoteRewardSpec.required_rewards must be non-empty",
-        )
-        require(
-            set(self.monitor_rewards) <= set(self.required_rewards),
-            f"RemoteRewardSpec.monitor_rewards must be a subset of required_rewards; "
-            f"got {self.monitor_rewards!r} vs {self.required_rewards!r}",
-        )
-        colliding = {f"monitor_{name}" for name in self.monitor_rewards} & set(self.required_rewards)
-        require(
-            not colliding,
-            f"RemoteRewardSpec.required_rewards must not contain {sorted(colliding)!r}; "
-            f"monitor_rewards report as monitor_<name>",
-        )
-        require(
-            not set(self.required_rewards) <= set(self.monitor_rewards),
-            "RemoteRewardSpec.monitor_rewards must leave at least one reward that trains",
-        )
-        weighted_monitors = set(self.monitor_rewards) & set(self.reward_weights or ())
-        require(
-            not weighted_monitors,
-            f"RemoteRewardSpec.reward_weights must not name monitor_rewards; got {sorted(weighted_monitors)!r}",
+        validate_panel(
+            "RemoteRewardSpec",
+            training=self.required_rewards,
+            monitors=self.monitor_rewards,
+            weighted=self.reward_weights or (),
+            aggregation_method=self.aggregation_method,
         )
         require(
             self.max_retries >= 1,
@@ -537,11 +512,6 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
         require(
             self.sub_metric_reduce in {"first", "mean", "max"},
             f"RemoteRewardSpec.sub_metric_reduce must be one of first/mean/max; got {self.sub_metric_reduce!r}",
-        )
-        require(
-            self.aggregation_method in {"weighted_sum", "mean", "min", "max"},
-            f"RemoteRewardSpec.aggregation_method must be one of "
-            f"weighted_sum/mean/min/max; got {self.aggregation_method!r}",
         )
         require(
             self.input_kind in {"image", "video"},

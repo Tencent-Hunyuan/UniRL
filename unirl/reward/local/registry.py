@@ -23,7 +23,7 @@ _BUILTIN_REGISTRY: Dict[str, Tuple[str, str, str]] = {
     "mc_exact_match": ("unirl.reward.local.mc_exact_match", "MCExactMatchRewardScorer", "MCExactMatchSpec"),
     "clap": ("unirl.reward.local.clap", "CLAPRewardScorer", "CLAPSpec"),
     "imagebind": ("unirl.reward.local.imagebind", "ImageBindRewardScorer", "ImageBindSpec"),
-    "t2av_composite": ("unirl.reward.local.t2av_composite", "T2AVCompositeScorer", "T2AVCompositeSpec"),
+    "composite": ("unirl.reward.local.composite", "CompositeRewardScorer", "CompositeRewardSpec"),
     "per_domain": ("unirl.reward.local.per_domain", "PerDomainRewardScorer", "PerDomainSpec"),
 }
 

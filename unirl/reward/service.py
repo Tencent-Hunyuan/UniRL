@@ -37,7 +37,7 @@ class RewardService(Remote):
                 f"RewardService: backend {type(backend).__name__} gives prompt-to-video alignment no positive "
                 "weight, so a policy trained on it can raise the score without following the prompt "
                 "(imagebind mode='audio_video' collapses both streams together). Use imagebind "
-                "mode='text_video' or 'all', or a T2AVCompositeScorer with a prompt-video term; score it "
+                "mode='text_video' or 'all', or a CompositeRewardScorer with a prompt-video term; score it "
                 "under eval_rewards to measure it without training on it; or set "
                 "require_prompt_video: false to train on it anyway."
             )
