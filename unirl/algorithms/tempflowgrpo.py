@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from typing import Any, Optional, Type
@@ -82,8 +83,8 @@ class TempFlowGRPO(PerSampleStepGRPO):
                 f"TempFlowGRPO: branch_steps_per_rollout must be a positive integer or None; got {branch_steps_per_rollout!r}."
             )
         self.weight_scale = float(weight_scale)
-        if not self.weight_scale > 0.0:
-            raise ValueError(f"TempFlowGRPO: weight_scale must be > 0; got {weight_scale!r}.")
+        if not math.isfinite(self.weight_scale) or not self.weight_scale > 0.0:
+            raise ValueError(f"TempFlowGRPO: weight_scale must be finite and > 0; got {weight_scale!r}.")
         if not params.eta > 0.0:
             raise ValueError("TempFlowGRPO requires params.eta > 0 on branch steps.")
 

@@ -81,6 +81,7 @@ class TrainStack(BaseTrainStack):
         do_optimizer_step: bool = True,
         loss_weight: float = 1.0,
         prior_backward: bool = False,
+        finalize_results: bool = True,
     ) -> TrainStepResult:
         """Run the micro ranges of a single update; step unless mid-window."""
         if part.advantages is None and self.algorithm.requires_advantages:
@@ -131,11 +132,13 @@ class TrainStack(BaseTrainStack):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            total_loss += result.loss * loss_scales[i]
+            micro_loss = result.loss.double() if isinstance(result.loss, torch.Tensor) else result.loss
+            total_loss += micro_loss * loss_scales[i]
             has_backward = has_backward or result.has_backward
 
-        aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
-            [r.metrics for r in micro_results if r.metrics]
+        deferred = isinstance(total_loss, torch.Tensor)
+        aggregated_metrics: Mapping[str, object] = (
+            {} if deferred else aggregate_numeric_metrics([r.metrics for r in micro_results if r.metrics])
         )
 
         window_backward = prior_backward or has_backward
@@ -173,12 +176,13 @@ class TrainStack(BaseTrainStack):
                 "cuda_reserved_gb": torch.cuda.memory_reserved() / 2**30,
             }
 
-        (global_loss_sum,) = self._all_reduce_sums([total_loss])
-        total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
+        if not deferred:
+            (global_loss_sum,) = self._all_reduce_sums([total_loss])
+            total_loss = global_loss_sum / self.fsdp_backend.gradient_average_world_size()
         if global_weight is not None:
             aggregated_metrics = {**aggregated_metrics, "global_loss_weight": global_weight}
 
-        return TrainStepResult(
+        result = TrainStepResult(
             loss=total_loss,
             grad_norm=grad_norm,
             lr=self._current_lr(),
@@ -187,6 +191,32 @@ class TrainStack(BaseTrainStack):
             metrics=aggregated_metrics,
             optimizer_updates=1 if has_backward and math.isfinite(grad_norm) else 0,
         )
+        return self._finalize_tensor_results([result])[0] if deferred and finalize_results else result
+
+    def _finalize_tensor_results(self, results: List[TrainStepResult]) -> List[TrainStepResult]:
+        """Materialize detached micro losses and metrics in one batch after the optimizer boundary."""
+        from torch.utils._pytree import tree_flatten, tree_unflatten
+
+        pending = [r for r in results if isinstance(r.loss, torch.Tensor)]
+        if not pending:
+            return results
+        payloads = [(r.loss, [(m.loss, dict(m.metrics)) for m in r.micros]) for r in pending]
+        leaves, spec = tree_flatten(payloads)
+        tensors = [v for v in leaves if isinstance(v, torch.Tensor)]
+        device = tensors[0].device
+        values = iter(torch.stack([v.detach().to(device=device, dtype=torch.float64) for v in tensors]).cpu().tolist())
+        payloads = tree_unflatten([next(values) if isinstance(v, torch.Tensor) else v for v in leaves], spec)
+        global_losses = iter(self._all_reduce_sums([loss for loss, _ in payloads]))
+        finalized = iter(
+            replace(
+                result,
+                loss=next(global_losses) / self.fsdp_backend.gradient_average_world_size(),
+                micros=[replace(m, loss=loss, metrics=metrics) for m, (loss, metrics) in zip(result.micros, micros)],
+                metrics={**aggregate_numeric_metrics([metrics for _, metrics in micros]), **result.metrics},
+            )
+            for result, (_, micros) in zip(pending, payloads)
+        )
+        return [next(finalized) if isinstance(r.loss, torch.Tensor) else r for r in results]
 
     def _all_reduce_sums(self, values: List[float]) -> List[float]:
         """SUM scalars over the backend's FSDP mesh (no-op single-rank)."""
@@ -292,9 +322,11 @@ class TrainStack(BaseTrainStack):
                 do_optimizer_step=(w == m - 1),
                 loss_weight=1.0 / m,
                 prior_backward=prior_backward,
+                finalize_results=False,
             )
             prior_backward = prior_backward or result.has_backward
             results.append(result)
+        results = self._finalize_tensor_results(results)
         # The window is one optimizer step: its grad_norm is the stepping call's.
         window = replace(aggregate_update_results(results), grad_norm=results[-1].grad_norm)
         return self._guard_first_update_ratio(window)

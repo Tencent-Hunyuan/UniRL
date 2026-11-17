@@ -89,14 +89,12 @@ class PerSampleStepGRPO(FlowGRPO):
             raise ValueError(f"{name} requires segment.sde_index_per_sample; the rollout was not split per step.")
         if segment.sde_indices is None or segment.sde_indices.numel() == 0:
             raise ValueError(f"{name} requires segment.sde_indices to be non-empty.")
-        target_steps = segment.sde_indices.tolist()
 
         typed_conds = typed_conditions(conditions, self.conditions_cls)
         replay_result = self.stage.replay(
             typed_conds,
             segment=segment,
             params=self.params,
-            step_indices=target_steps,
         )
         new_logp = replay_result.log_probs
         # Each sample took its one stochastic step at its own index, so slot 0 holds its logp.
@@ -129,14 +127,13 @@ class PerSampleStepGRPO(FlowGRPO):
             "adv_abs_max": adv_raw.abs().max(),
             **ratio_metrics,
         }
-        metric_values = torch.stack([value.float() for value in metric_tensors.values()]).cpu().tolist()
-        metrics: Dict[str, Any] = dict(zip(metric_tensors, metric_values))
+        metrics: Dict[str, Any] = {key: value.detach().float() for key, value in metric_tensors.items()}
         metrics["clip_range"] = clip_range
 
         return AlgorithmStepResult(
             loss=metrics["policy_loss"],
             metrics=metrics,
-            num_steps_or_tokens=len(target_steps),
+            num_steps_or_tokens=1,
             has_backward=True,
         )
 
