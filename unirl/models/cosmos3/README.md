@@ -140,6 +140,11 @@ Evaluation runs every `eval_interval` rollouts on `EVAL_DATA_PATH` (an image man
 `DATA_PATH`; the PickScore prompt lists have no images) with deterministic sampling
 (`eval_eta` defaults to 0) and the same reward.
 
+Scope: the recipe is smoke-tested only (8 prompts x 8 samples, 3 rollouts, 4x H100). The
+default scale, the periodic evaluation and a reward trend are not validated. Middle-frame
+PickScore had a within-group standard deviation of 2e-3 to 4e-3 (two prompts, four samples
+each, 9 frames), so it is a smoke baseline, not evidence of video RL gains.
+
 The two SDE steps per rollout are drawn from steps 10-12 of 16 (sigma 0.750, 0.694, 0.625 at
 shift 5). That is the sigma band of the text-to-image recipe (0.75 to 0.58 at shift 3)
 re-derived for the shift-5 grid, not a setting tuned for video.
