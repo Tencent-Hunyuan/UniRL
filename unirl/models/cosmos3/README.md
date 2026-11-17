@@ -1,10 +1,9 @@
-# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image generation
+# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image RL
 
 > **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
-> `Cosmos3Pipeline.generate` samples single-frame text-to-image. Trajectory replay is not
-> implemented: `Cosmos3DiffusionStage.replay` and `predict_noise_at_step` raise, so no RL
-> recipe ships yet.
+> `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the single-frame
+> text-to-image FlowGRPO recipes `examples/diffusion/cosmos3/cosmos3_{nano,super}_trainside.yaml`.
 
 ## What it is
 
@@ -40,16 +39,17 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
 
 - **Uniform `master_precision` storage**: upcasting only trainable params would mix
   bf16/fp32 inside every MoT layer (the und stream is frozen), which FSDP2 rejects.
-- **The shipped recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
+- **The SFT recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
   `mixed_precision: false`): torch 2.10/cu128 on H20 rejects every bf16 `cublasGemmEx`,
   and `bundle.py` scopes further cuBLAS workarounds (contiguous mRoPE, 2-D-GEMM
   DomainAwareLinear, non-MATH SDPA, frozen-DTensor `full_tensor()` linears) to that
   runtime via `_needs_h20_cu128_workaround()`. Newer CUDA stacks may switch back to
   fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
-  (`_keep_in_fp32_modules = ["time_embedder"]`). The shipped full-fp32 recipes satisfy
-  this trivially. A future bf16 mixed-precision recipe must land an fp32 exemption for it
-  (e.g. its own FSDP group with an fp32 gather/reduce policy) together with that recipe.
+  (`_keep_in_fp32_modules = ["time_embedder"]`). The full-fp32 SFT recipes satisfy
+  this trivially. The bf16 RL recipe `cosmos3_nano_trainside` keeps it out of every FSDP
+  group with `root_wrap: false` (see Gotchas); it is validated on H100 with torch 2.13/cu130,
+  not on H20. Any other bf16 mixed-precision recipe needs its own fp32 exemption.
   Without one the outcome depends on the diffusers version: 0.39 casts only *after* the
   embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul;
   0.40 casts the sinusoid to the embedder's parameter dtype first, so the embedder
@@ -62,7 +62,7 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   tolerates. Do not "align" training to it: training σ are logit-normal draws that
   never land on the inference grid anyway, so flooring only quantizes the signal and
   biases the σ↔conditioning map by an average of −0.5 timestep units.
-- **`meta_init_transformer: true`** (both recipes) builds the 16B transformer on the meta
+- **`meta_init_transformer: true`** (both SFT recipes) builds the 16B transformer on the meta
   device and lets the backend load sharded weights after wrapping — the eager path would
   put the full ~64 GB fp32 model on every rank before sharding. The sharded loader reads
   local `*.safetensors` only, so the shared meta-init resolver downloads and validates
@@ -104,10 +104,32 @@ inference see the same canvas. Manifest media entries use `role="target"` with
 defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
 loops over samples, because the transformer takes one packed sequence per call, and
 `Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence` with no condition frame.
-Latents are `[B, 48, 1, H/16, W/16]` for `nvidia/Cosmos3-Nano`. The sigma schedule comes
+Latents are `[B, 48, 1, H/16, W/16]` for both checkpoints. The sigma schedule comes
 from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
 stored in `trajectory_precision` between steps.
+
+`Cosmos3DiffusionStage.replay` recomputes the SDE log-probs with gradients, one sample and
+one step per packed forward (two with CFG), feeding the stored latents back through the
+same `step_with_logp` call as rollout. `predict_noise_at_step` is the same forward without
+the solver step.
+
+## Cosmos3-Super
+
+`nvidia/Cosmos3-Super` (64.0B parameters, 64 layers, hidden size 5120, 128 GB in bf16) is
+Nano at a larger size: its transformer config differs from Nano's only in `hidden_size`,
+`intermediate_size`, `num_attention_heads` and `num_hidden_layers`, and its VAE, scheduler,
+tokenizer and `model_index.json` equal Nano's. `cosmos3_super_trainside.yaml` inherits
+`cosmos3_nano_trainside` and overrides only the checkpoint, run name and tags.
+
+- **`fsdp_mode: no_shard` needs about 166 GiB per GPU.** Each rank holds the full bf16 base
+  (119 GiB). Measured on B200 (179 GiB) with the recipe's two SDE steps per backward: 161
+  GiB allocated per GPU, 166 GiB in `nvidia-smi` with PickScore. On one card without FSDP,
+  replay with gradients peaks at 140 GiB with one SDE step per backward and 158 GiB with
+  two, so an H200 (141 GB) or an 80 GB card does not fit `no_shard` training.
+  `fsdp_mode: full` on smaller cards is not validated.
+- **Scope.** The recipe is smoke-tested only (4 prompts x 8 samples, 3 rollouts, 2x B200,
+  torch 2.13 / cu130). The default scale, a reward trend and H20 are not validated.
 
 ## Gotchas
 
@@ -137,6 +159,11 @@ stored in `trajectory_precision` between steps.
   `Cosmos3DiffusionStage.diffuse` raises if the stored dtype is not fp32. That check reads
   the stored parameter, so it does not catch an FSDP `mp_policy` that gathers the embedder
   in bf16 for the forward (see Precision & loading).
+- **The RL recipe needs `root_wrap: false`.**
+  `time_embedder`, `proj_in` and `proj_out` live outside the decoder layers; a root shard
+  group would gather them in `param_dtype` (bf16) and the timestep MLP would run in bf16
+  silently. Every LoRA target (`add_{q,k,v}_proj`, `to_add_out`) is inside a
+  `Cosmos3VLTextMoTDecoderLayer`, so no trainable parameter is left outside the wrap.
 - The und-param regexes are anchored with trailing `\.` on purpose: `to_out` must not
   swallow `to_add_out`, and `norm.` must not swallow `norm_moe_gen.`. Touch
   `_UND_PARAM_PATTERNS` only with the freeze-count log line as your regression check.
@@ -161,7 +188,8 @@ stored in `trajectory_precision` between steps.
   diffusers would be silently overridden by the stale copy. Re-verify the frozen bodies
   against the installed diffusers before extending the fingerprints on a version bump.
 - The H20 SDPA wrapper repeats kv heads before dispatch: Cosmos3 attention is GQA
-  (32 q / 8 kv heads), the fused Flash/Efficient kernels require equal head counts, and
+  (32 q / 8 kv heads on Nano, 64 / 8 on Super), the fused Flash/Efficient kernels require
+  equal head counts, and
   the MATH fallback is exactly the strided-batched GEMM that is broken on H20+cu128.
 - Eval loss is noised velocity MSE at a per-sample deterministic (σ, ε) draw
   (`unirl.algorithms.sft.sample_eval_seed`) — comparable across runs, but not a

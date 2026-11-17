@@ -101,7 +101,8 @@ rollout engine, and restriction per model — in
 | Qwen3.5 (9B / 35B-A3B) | VLM AR | Text / Text + Image → Text | [`qwen3_5_grpo_9b_base_dapo_sglang`](examples/ar/qwen3_5_grpo_9b_base_dapo_sglang.yaml) | ✅ sglang only |
 | Qwen2.5-VL | VLM AR | Text + Image → Text | [`qwen_vl_grpo_geo3k_mc_4x8`](examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml) | ✅ |
 | Qwen3-Omni Thinker | Omni-modality AR | Text / Image / Audio / Video → Text | [`qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4`](examples/ar/qwen3_omni_video_r1_gspo_lora_vllm_omni_1x4.yaml) | ✅ vllm_omni only |
-| Cosmos3-Nano | World model | Video (+ action) prediction | [`sft/cosmos3_droid100_videopred`](examples/sft/cosmos3_droid100_videopred.yaml) | 🧪 SFT-only |
+| Cosmos3-Nano | World model | Video (+ action) prediction; Text → Image | [`sft/cosmos3_droid100_videopred`](examples/sft/cosmos3_droid100_videopred.yaml), [`cosmos3_nano_trainside`](examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml) | ✅ trainside only |
+| Cosmos3-Super | World model | Text → Image | [`cosmos3_super_trainside`](examples/diffusion/cosmos3/cosmos3_super_trainside.yaml) | ✅ trainside only |
 | Prompt-Enhancer | LLM + diffusion (composed) | Text → Text → Image; Text + Image → Text → Image | [`pe_trainside_pickscore`](examples/pe/pe_trainside_pickscore.yaml), [`pe_it2i_trainside_editreward`](examples/pe/pe_it2i_trainside_editreward.yaml) | 🔗 composed |
 
 </div>
