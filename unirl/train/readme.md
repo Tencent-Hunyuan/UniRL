@@ -91,7 +91,7 @@ an unmatched selection raises.
 `veomni_parallelize` applies the same `save_on_cpu(pin_memory=True)` context to
 each selected block's forward, outside its optional checkpoint call. It keeps
 the existing module hierarchy, EP parameter groups, and weight names intact.
-This path works with the pinned `veomni==0.1.11`; it does not use newer VeOmni
+This path works with the pinned `veomni==0.1.12`; it does not use newer VeOmni
 async-offload APIs. `ac_wrap_order` applies only to `FSDPBackend`.
 
 CPU memory and CPU–GPU transfers replace GPU storage. Without checkpointing,
