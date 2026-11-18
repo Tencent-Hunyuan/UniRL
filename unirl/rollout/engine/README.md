@@ -61,6 +61,11 @@ pipe, so vLLM's imports stay out of the Worker process.
 
 ## Gotchas
 
+- **`eta: 0` selects ODE sampling even with nonempty trajectory indices.**
+  ART requests every state through `sde_indices` for dense storage. SGLang sends
+  an empty stochastic-step selector to its worker while retaining the requested
+  storage positions; vLLM-Omni captures all states but executes Euler transitions
+  without log-probabilities. Positive-eta SDE selection is unchanged.
 - **`__init__.py` must import nothing.** Importing an engine config must not pull
   SGLang, vLLM, or FastVideo; `make_engine` imports the backend lazily.
 - **Port reservation is a hint, not a contract** — the sockets are closed

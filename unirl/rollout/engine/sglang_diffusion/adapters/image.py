@@ -88,7 +88,7 @@ class ImageAdapter(ModelAdapter):
         kwargs["rollout"] = True
         kwargs["rollout_return_dit_trajectory"] = True
         kwargs["return_trajectory_latents"] = True
-        if is_forward_process(sde_indices):
+        if diffusion.eta == 0 or is_forward_process(sde_indices):
             kwargs["rollout_sde_type"] = "ode"
             kwargs["rollout_noise_level"] = diffusion.eta
             kwargs["rollout_log_prob_no_const"] = True
@@ -144,7 +144,7 @@ class ImageAdapter(ModelAdapter):
 
         num_steps = diffusion.num_inference_steps
         sde_indices = sorted(diffusion.sde_indices) if diffusion.sde_indices is not None else None
-        emit_native_logprob = not is_forward_process(sde_indices)
+        emit_native_logprob = diffusion.eta > 0 and not is_forward_process(sde_indices)
 
         segment = self.build_segment(
             sample,
