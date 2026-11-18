@@ -116,6 +116,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: hunyuan_video10
+    sampling: ${sampling}
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
     forward_batch_size: 1

@@ -66,11 +66,9 @@ class HunyuanVideo10Adapter(VideoAdapter):
 
     def boot_kwargs(self) -> Dict[str, Any]:
         """Convert sampling guidance to Hunyuan checkpoint units unless explicitly overridden."""
-        return {
-            "embedded_cfg_scale": self.cfg.engine_kwargs.get(
-                "embedded_cfg_scale", self.cfg.sampling.guidance_scale * 1000.0
-            )
-        }
+        if "embedded_cfg_scale" in self.cfg.engine_kwargs:
+            return {}
+        return {"embedded_cfg_scale": self.cfg.sampling.guidance_scale * 1000.0}
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Keep HunyuanVideo-1.0's LLaMA and pooled-CLIP streams separate."""
