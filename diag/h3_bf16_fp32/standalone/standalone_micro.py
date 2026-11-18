@@ -26,6 +26,10 @@ CASES = {"fp32_b8": (True, 8), "fp32_b1": (True, 1),
          "bf16_b8": (False, 8), "bf16_b1": (False, 1)}
 PAIRS = [("fp32_b8", "fp32_b1"), ("bf16_b8", "bf16_b1"),
          ("bf16_b8", "fp32_b8"), ("bf16_b1", "fp32_b1")]
+# --rounding-control：fp32 计算 + LoRA master 先舍入到 bf16 再升回 fp32，拆开 adapter 舍入与计算精度
+ROUNDING_CASES = {"fp32_b8": (True, 8), "fp32r_b8": (True, 8), "bf16_b8": (False, 8)}
+ROUNDING_PAIRS = [("fp32r_b8", "fp32_b8"), ("bf16_b8", "fp32r_b8"), ("bf16_b8", "fp32_b8")]
+ROUNDED_LORA = {"fp32r_b8"}
 BATCH_KEYS = {"hidden_states", "audio_hidden_states", "encoder_hidden_states"}
 LORA_TARGETS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "ff.net.0.proj", "ff.net.2")
 GIB = 2**30
@@ -575,12 +579,13 @@ class Experiment:
                 raise ValueError(f"block {i}: 缺少待测权重")
             self.grad_names.append(names)
 
-    def cast(self, prefix, module, fp32):
+    def cast(self, prefix, module, fp32, rounded=False):
         for name, p in module.named_parameters():
             key = f"{prefix}.{name}" if prefix else name
             dtype = torch.float32 if fp32 else self.shipped[key]
             if key in self.masters:
-                p.data = self.masters[key].to(device=p.device, dtype=dtype)
+                master = self.masters[key].to(torch.bfloat16) if rounded else self.masters[key]
+                p.data = master.to(device=p.device, dtype=dtype)
             elif p.dtype != dtype:
                 p.data = p.data.to(dtype)
         for name, submodule in module.named_modules():
@@ -627,6 +632,7 @@ class Experiment:
         self.reset_memory()
         started = time.perf_counter()
         fp32, micro = CASES[case]
+        rounded = case in ROUNDED_LORA
         self.check_memory(f"{case}:forward_begin")
         # 非当前 block 保持原存储精度；在进入 block 时才升精度，计算后无损恢复。
         for i, block in enumerate(self.blocks):
@@ -650,7 +656,7 @@ class Experiment:
                     raise ValueError("vendor block 接口改变")
                 self.check_memory(f"{case}:forward:{i}:before")
                 release_active()
-                self.cast(f"transformer_blocks.{i}", module, fp32)
+                self.cast(f"transformer_blocks.{i}", module, fp32, rounded)
                 current["active"] = i
                 if i == 0:
                     current["block0_dtypes"] = dict(Counter(str(p.dtype) for p in module.parameters()))
@@ -771,7 +777,7 @@ class Experiment:
         fp32, micro = CASES[case]
         block, device = self.blocks[index], self.block_devices[index]
         self.check_memory(f"{case}:reverse:{index}:before")
-        self.cast(f"transformer_blocks.{index}", block, fp32)
+        self.cast(f"transformer_blocks.{index}", block, fp32, case in ROUNDED_LORA)
         named = dict(block.named_parameters())
         params = [named[n] for n in self.grad_names[index]]
         summed, dxs = {}, []
@@ -847,13 +853,16 @@ class Experiment:
         gs = self.cotangents["bf16_b8"] if self.loss_api is not None else [
             g.to(o) for g, o in zip(self.dump["out_grads"], self.outputs["bf16_b8"])]
         check_capture_identity(self.out, "bf16-b8-cotangent-check", gs, self.dump["out_grads"], self.root)
-        probe_index = self.locate()
-        probe_hidden = self.hidden("fp32_b8", probe_index)
-        probe_context = self.contexts["fp32_b8"][0]
-        save(self.out / "probe-input.pt", {"block": probe_index, "hidden": cpu(probe_hidden),
-                                           "context": probe_context})
-        probe_block(self, vendor, probe_index, probe_hidden, probe_context)
-        del probe_hidden
+        # 舍入对照没有 B1 case，跳过 B8/B1 差异定位与单层探针
+        probe_index = None
+        if "bf16_b1" in CASES:
+            probe_index = self.locate()
+            probe_hidden = self.hidden("fp32_b8", probe_index)
+            probe_context = self.contexts["fp32_b8"][0]
+            save(self.out / "probe-input.pt", {"block": probe_index, "hidden": cpu(probe_hidden),
+                                               "context": probe_context})
+            probe_block(self, vendor, probe_index, probe_hidden, probe_context)
+            del probe_hidden
         summaries = []
         for index in reversed(range(len(self.blocks))):
             results = {case: self.reverse_case(case, index) for case in CASES}
@@ -903,7 +912,7 @@ class Experiment:
                 value for row in summaries if row["block"] < 3
                 for name, value in row["comparisons"][f"{a}_vs_{b}"]["gradients"].items()
                 if ".lora_" in name) for a, b in PAIRS}})
-        (self.out / "DONE").write_text("four cases and comparisons complete\n")
+        (self.out / "DONE").write_text(f"{len(CASES)} cases and comparisons complete\n")
         return summaries
 
 
@@ -1125,7 +1134,12 @@ def main():
     parser.add_argument("--reference-output", choices=("recompute", "captured"), default="recompute")
     parser.add_argument("--groups", choices=("first", "all"), default="first")
     parser.add_argument("--replay-inputs", action="store_true")
+    parser.add_argument("--rounding-control", action="store_true")
     args = parser.parse_args()
+    if args.rounding_control:
+        CASES.clear()
+        CASES.update(ROUNDING_CASES)
+        PAIRS[:] = ROUNDING_PAIRS
     if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
         raise RuntimeError("完整模型要求恰好 8 张已授权、空闲的可见 CUDA 卡；CPU 验证用 cpu_validate.py")
     if args.live_checkpoint and args.lora_alpha is None:

@@ -73,6 +73,18 @@ Numbers we got:
 
 Back-propagated signal, bf16 against fp32: 0.997 at block 49, about 0.92 at block 35, 0.60 at block 30, 0.15–0.26 from block 25 down to block 0.
 
+### A2b. LoRA-rounding control
+
+Adds `--rounding-control`. Runs three batch-8 cases on the same inputs and cotangent: fp32, fp32 with the LoRA masters rounded to bf16 and upcast (`fp32r_b8`), and bf16. The batch-1 cases and the block-0 probe are skipped.
+
+| Comparison (gradient of blocks 0–2) | Cosine | Relative L2 |
+|---|---|---|
+| fp32 rounded LoRA vs fp32 (adapter rounding only) | 0.9988 | 0.055 |
+| bf16 vs fp32 rounded LoRA (compute precision only) | 0.113 | 1.150 |
+| bf16 vs fp32 | 0.111 | 1.142 |
+
+Adapter rounding gives a relative error of at most 0.001 in blocks 36–49 and about 0.05 in blocks 0–20; compute precision gives 1.1 in the shallow blocks. Per block: `results/data/rounding_control_grad_per_block.csv`.
+
 ### A3. Optional: each case computes its own cotangent from the loss
 
 Adds `--cotangent loss --reference-output recompute --groups all --replay-inputs`. Each case rebuilds the Flash-GRPO loss (policy term plus KL, beta 0.004) from its own output. This needs a capture that also stores the loss inputs (see A5) and imports the SDE and loss functions from this branch.
