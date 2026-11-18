@@ -1,6 +1,6 @@
 # How to reproduce the bf16 vs fp32 gradient comparison
 
-There are two ways to reproduce the numbers in the PR description. Only the first one can be run outside our setup.
+Part A reproduces the gradient numbers in the PR description and can be run outside our setup. Part B is the fixed-batch replay that captured the micro-batch used by part A; it is tied to our run.
 
 | | A. Standalone script | B. Fixed-batch replay |
 |---|---|---|
@@ -8,7 +8,7 @@ There are two ways to reproduce the numbers in the PR description. Only the firs
 | Needs our training run | no | yes: the run directory, the reward service, the prompt list |
 | Inputs | H3 weights, one captured micro-batch (145 MB), the step-20 LoRA | the saved 192-row batch and the step-20 LoRA, both produced by step B1 |
 | Produces | per-block forward error and back-propagated signal, gradients of blocks 0–2 | the full 600-tensor LoRA gradient of the 192-row batch |
-| Figure in `results/` | figure 2 | figure 1 |
+| Figure in `results/` | figure 1 | – |
 | Time on our host | 71 min | 13 min (8 rows per forward) to 39 min (1 row per forward) per variant |
 
 The captured micro-batch and the step-20 LoRA are not in this branch. We can share both on request.
@@ -36,7 +36,7 @@ python diag/h3_bf16_fp32/standalone/cpu_validate.py \
 
 Expected: exit code 0, and fp32 batch-8 vs batch-1 gradient cosine of 1 up to rounding. `--out` must be a new directory.
 
-### A2. GPU run with a fixed cotangent (this produced figure 2)
+### A2. GPU run with a fixed cotangent (this produced figure 1)
 
 Four cases on the same 8 captured rows: fp32 and bf16, each as one batch of 8 and as 8 batches of 1. Every case starts the backward pass from the same captured gradient at the model output.
 
@@ -162,16 +162,9 @@ CHECKUP_OUT_NAME=V2m8 CHECKUP_SPLITS=full python -u tools/replay.py --variant V2
 python tools/cmp_micro.py V2m8/full V2/full V3/full V1/full V1m1/full
 ```
 
-`chain.py` is the wrapper we used to run B1 and B2 in sequence with a time limit. Every replay loads the same saved batch and the same LoRA, uses `old_logp = new_logp.detach()` and checks afterwards that no parameter changed. Gradients are written to `gradients/<name>/<split>/rank{0..7}.pt`; B4 writes `results/micro-compare.json`. The files we obtained are in `results/data/grad_compare_raw/`.
+`chain.py` is the wrapper we used to run B1 and B2 in sequence with a time limit. Every replay loads the same saved batch and the same LoRA, uses `old_logp = new_logp.detach()` and checks afterwards that no parameter changed. Gradients are written to `gradients/<name>/<split>/rank{0..7}.pt`; B4 writes `results/micro-compare.json`.
 
-Numbers we got (cosine of the 600 LoRA gradients against V3, 192 rows):
-
-| Setting | Folder | Cosine vs fp32 | Blocks 0 / 1 / 2 |
-|---|---|---|---|
-| bf16, speed-ups off, 1 row per forward | `V2` | 0.480 | 0.91 / 0.45 / 0.26 |
-| bf16, speed-ups off, 8 rows per forward | `V2m8` | 0.037 | −0.43 / 0.04 / 0.02 |
-| bf16, as trained, 1 row per forward | `V1m1` | 0.131 | see `results/data/grad_cos_per_block.csv` |
-| bf16, as trained, 8 rows per forward | `V1` | 0.028 | see `results/data/grad_cos_per_block.csv` |
+In this replay each precision computes the Flash-GRPO loss from its own forward output, so the bf16 and fp32 backward passes do not start from the same cotangent. Its cosines therefore do not measure the accuracy of the backward pass and are not reported; use part A for that.
 
 ## What these steps do not cover
 

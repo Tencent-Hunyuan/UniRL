@@ -1,5 +1,0 @@
-setting,cosine_vs_fp32,norm_ratio_vs_fp32
-"bf16, speed-ups off, 1 row per forward",0.4796667607598108,0.9927796994327427
-"bf16, speed-ups off, 8 rows per forward",0.03712447036038868,0.7160671462080228
-"bf16, as trained, 1 row per forward",0.13086000426079553,0.613723053263798
-"bf16, as trained, 8 rows per forward",0.02845244251379483,0.7562532340115536
