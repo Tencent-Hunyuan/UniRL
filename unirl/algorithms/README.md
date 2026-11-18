@@ -197,6 +197,23 @@ Standalone callers must invoke `validate_part(part)` before `prepare_segment` an
 and keep the shared schedule/indices unchanged throughout that rollout.
 SD3 and the dense HunyuanVideo/Wan stages share the same prediction interface.
 
+Video recipes preserve their FlowGRPO baseline's model, LoRA, batch geometry,
+reward, resolution, frame count, and optimizer. They change the algorithm,
+select every ODE state, and set `eta: 0`; the reference mask still uses nu 0.8.
+
+| Recipe | GPUs | LoRA rank / alpha | Video dimensions | Rollout steps | Train microbatch |
+|---|---:|---:|---|---:|---:|
+| [`hunyuan_video10_t2v_art_trainside`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_art_trainside.yaml) | 8 | 64 / 256 | 1280 × 720, 5 frames | 10 | 1 |
+| [`hunyuan_video10_t2v_art_sglang`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_art_sglang.yaml) | 8 | 64 / 256 | 1280 × 720, 5 frames | 10 | 1 |
+| [`wan21_i2v_art`](../../examples/diffusion/wan21/wan21_i2v_art.yaml) | 8 | 64 / 128 | 1280 × 720, 9 frames | 14 | 1 |
+
+Set `PRETRAINED_MODEL` and `DATA_PATH` before using
+`bash examples/run_experiment_single_node.sh diffusion/hunyuan_video10/hunyuan_video10_t2v_art_trainside`.
+Wan I2V requires a dataset with input-image conditioning, as in `wan21_i2v`.
+SGLang uses the baseline's merged-LoRA weight sync and populated training
+conditions; the algorithm recomputes anchors with the train-side model.
+These dimensions are frame counts, not video durations in seconds.
+
 `prepare_part` groups scalar advantages by sample lineage, using the same
 default parent layer as `Part.compute_advantages` (`group_layer` overrides it).
 The group size must match `params.samples_per_prompt`. Train workers exchange
