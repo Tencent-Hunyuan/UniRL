@@ -1,0 +1,266 @@
+"""Cosmos3 text-to-image diffusion: per-step packed forward with CFG and the rollout stage (README.md)."""
+
+from __future__ import annotations
+
+from typing import Any, List, Optional, Set, Tuple
+
+import torch
+
+from unirl.config.require import require
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.replay_result import ReplayResult
+from unirl.sde.kernels import StepStrategy
+from unirl.types.conditions import TextTokenCondition
+from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
+from unirl.types.segments.latent import LatentSegment
+from unirl.utils.dtypes import parse_torch_dtype
+
+from .bundle import Cosmos3Bundle
+from .conditions import Cosmos3Conditions
+from .packing import pack_joint_sequence
+
+
+class Cosmos3DiffusionStep(DiffusionStep[Cosmos3Bundle, Cosmos3Conditions]):
+    """Per-step Cosmos3 kernel: one packed forward per CFG branch (README # Gotchas)."""
+
+    def __init__(self, pipe: Any) -> None:
+        self.pipe = pipe
+
+    def _velocity(
+        self, model: Cosmos3Bundle, text: TextTokenCondition, sample: torch.Tensor, timestep: torch.Tensor
+    ) -> torch.Tensor:
+        """One packed forward for one prompt; ``timestep`` is a 0-d fp32 ``sigma * 1000``."""
+        kwargs, meta = pack_joint_sequence(
+            self.pipe,
+            input_ids=text.input_ids[0][text.attention_mask[0].bool()].tolist(),
+            vision_tokens=sample,
+            condition_frame_indexes=(),
+            vision_fps=model.config.fps,
+            device=sample.device,
+            compute_dtype=model.dtype,
+        )
+        kwargs["vision_timesteps"] = timestep.expand(meta["num_noisy_vision_tokens"])
+        preds_vision = model.transformer(**kwargs)[0]  # [0] is vision on the 0.39 tuple and the 0.40 output object
+        return preds_vision[0].reshape(sample.shape)
+
+    def predict_noise(
+        self,
+        model: Cosmos3Bundle,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        conditions: Cosmos3Conditions,
+        *,
+        guidance_scale: float,
+    ) -> torch.Tensor:
+        """Guided velocity ``[1, C, 1, H, W]`` for one sample at fp32 scalar ``sigma``."""
+        require(conditions.text is not None, "Cosmos3DiffusionStep.predict_noise: conditions.text is None")
+        require(
+            sample.ndim == 5 and sample.shape[0] == 1 and sample.shape[2] == 1,
+            f"Cosmos3DiffusionStep.predict_noise: expected sample [1, C, 1, H, W], got {tuple(sample.shape)}",
+        )
+        timestep = sigma.to(device=sample.device, dtype=torch.float32).reshape(())
+        timestep = timestep * self.pipe.scheduler.config.num_train_timesteps
+        cond = self._velocity(model, conditions.text, sample, timestep)
+        if guidance_scale == 1.0:
+            return cond
+        require(
+            conditions.negative_text is not None,
+            "Cosmos3DiffusionStep.predict_noise: guidance_scale != 1 requires conditions.negative_text",
+        )
+        uncond = self._velocity(model, conditions.negative_text, sample, timestep)
+        return uncond + guidance_scale * (cond - uncond)
+
+    def forward(
+        self,
+        *,
+        strategy: StepStrategy,
+        noise_pred: torch.Tensor,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        prev_sample: Optional[torch.Tensor] = None,
+        sigma_max: float = 0.99,
+        eta: float = 1.0,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Run one transition given a precomputed ``noise_pred``."""
+        return strategy.denoise(
+            noise_pred=noise_pred,
+            sample=sample,
+            sigma=sigma,
+            sigma_next=sigma_next,
+            eta=eta,
+            prev_sample=prev_sample,
+            sigma_max=sigma_max,
+            step_index=step_index,
+        )
+
+    def step(
+        self,
+        model: Cosmos3Bundle,
+        conditions: Cosmos3Conditions,
+        *,
+        strategy: StepStrategy,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        sigma_next: torch.Tensor,
+        guidance_scale: float,
+        prev_sample: Optional[torch.Tensor] = None,
+        sigma_max: float = 0.99,
+        eta: float = 1.0,
+        step_index: int = 0,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Model forward plus transition for one sample."""
+        noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
+        return self.forward(
+            strategy=strategy,
+            noise_pred=noise_pred,
+            sample=sample,
+            sigma=sigma,
+            sigma_next=sigma_next,
+            prev_sample=prev_sample,
+            sigma_max=sigma_max,
+            eta=eta,
+            step_index=step_index,
+        )
+
+    step_with_logp = step
+
+
+class Cosmos3DiffusionStage(DiffusionStage[Cosmos3Conditions]):
+    """Cosmos3 single-frame rollout stage; samples run one at a time (packed single-sample interface)."""
+
+    def __init__(
+        self,
+        *,
+        model: Cosmos3Bundle,
+        step: Cosmos3DiffusionStep,
+        strategy: StepStrategy,
+        trajectory_precision: str,
+        logprob_precision: str,
+    ) -> None:
+        self.model = model
+        self.step = step
+        self.strategy = strategy
+        self.trajectory_dtype = parse_torch_dtype(trajectory_precision, field_name="trajectory_precision")
+        self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="logprob_precision")
+
+    def diffuse(
+        self,
+        conditions: Cosmos3Conditions,
+        *,
+        schedule: torch.Tensor,
+        params: DiffusionSamplingParams,
+        initial_latents: Optional[torch.Tensor] = None,
+    ) -> LatentSegment:
+        """Sample ``B`` single-frame latents; ``LatentSegment.latents`` is ``[B, K, C, 1, H_lat, W_lat]``."""
+        from unirl.sde.noise import generate_latents
+
+        require(
+            params.num_frames == 1, f"Cosmos3DiffusionStage: only num_frames=1 is supported, got {params.num_frames}"
+        )
+        time_embedder_dtype = next(self.model.transformer.time_embedder.parameters()).dtype
+        require(
+            time_embedder_dtype == torch.float32,
+            f"Cosmos3DiffusionStage.diffuse: time_embedder is stored as {time_embedder_dtype}, expected fp32 "
+            "(README # Gotchas)",
+        )
+        device = torch.device(self.model.device)
+        batch_size = conditions.batch_size
+        total_steps = params.num_inference_steps
+        require(
+            schedule.shape[0] == total_steps + 1,
+            f"Cosmos3DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={total_steps + 1}",
+        )
+        schedule = schedule.to(device)
+        vae_config = self.model.vae.config
+        scale = vae_config.scale_factor_spatial
+        expected = (vae_config.z_dim, 1, params.height // scale, params.width // scale)
+        if initial_latents is None:
+            initial_latents = generate_latents(
+                batch_size=batch_size,
+                latent_shape=expected,
+                device=device,
+                dtype=self.trajectory_dtype,
+                init_same_noise=params.init_same_noise,
+                samples_per_prompt=params.samples_per_prompt,
+                noise_group_ids=params.noise_group_ids,
+                base_seed=params.seed,
+            )
+        require(
+            tuple(initial_latents.shape) == (batch_size, *expected),
+            f"Cosmos3DiffusionStage.diffuse: initial_latents {tuple(initial_latents.shape)} != {(batch_size, *expected)}",
+        )
+
+        sde_set: Set[int] = set(params.sde_indices or ())
+        require(
+            not sde_set or params.eta > 0.0,
+            "Cosmos3DiffusionStage.diffuse: sde_indices are non-empty but eta=0, so no log-probs would be emitted",
+        )
+        needed = set(compute_trajectory_positions(sde_set, total_steps))
+        needed.add(total_steps)
+        sigma_max = schedule[1].float()
+
+        segments: List[LatentSegment] = []
+        for sample_idx in range(batch_size):
+            single = conditions.slice(sample_idx, sample_idx + 1)
+            self.strategy.init_schedule(schedule)
+            state = initial_latents[sample_idx : sample_idx + 1].to(device=device, dtype=self.trajectory_dtype)
+            stored: List[Tuple[int, torch.Tensor]] = [(0, state)] if 0 in needed else []
+            log_probs: List[torch.Tensor] = []
+            for index in range(total_steps):
+                with torch.no_grad():
+                    state, log_prob, _ = self.step.step_with_logp(
+                        self.model,
+                        single,
+                        strategy=self.strategy,
+                        sample=state,
+                        sigma=schedule[index],
+                        sigma_next=schedule[index + 1],
+                        guidance_scale=params.guidance_scale,
+                        sigma_max=sigma_max,
+                        eta=params.eta if index in sde_set else 0.0,
+                        step_index=index,
+                    )
+                state = state.to(dtype=self.trajectory_dtype)
+                if index + 1 in needed:
+                    stored.append((index + 1, state))
+                if log_prob is not None:
+                    log_probs.append(log_prob.to(dtype=self.logprob_dtype))
+            segments.append(
+                LatentSegment(
+                    latents=torch.stack([value for _, value in stored], dim=1),
+                    sigmas=schedule,
+                    indices=torch.tensor([index for index, _ in stored], dtype=torch.long, device=device),
+                    sde_logp=torch.stack(log_probs, dim=1) if log_probs else None,
+                    sde_indices=torch.tensor(sorted(sde_set), dtype=torch.long, device=device) if sde_set else None,
+                )
+            )
+        return segments[0] if len(segments) == 1 else LatentSegment.concat(segments)
+
+    def replay(
+        self,
+        conditions: Cosmos3Conditions,
+        *,
+        segment: LatentSegment,
+        params: DiffusionSamplingParams,
+        step_indices: Optional[List[int]] = None,
+    ) -> ReplayResult:
+        raise NotImplementedError("Cosmos3DiffusionStage.replay is not implemented yet (generation only).")
+
+    def predict_noise_at_step(
+        self,
+        conditions: Cosmos3Conditions,
+        *,
+        sample: torch.Tensor,
+        sigma: torch.Tensor,
+        params: DiffusionSamplingParams,
+    ) -> torch.Tensor:
+        raise NotImplementedError("Cosmos3DiffusionStage.predict_noise_at_step is not implemented yet.")
+
+    def trainable_module(self) -> torch.nn.Module:
+        """Return the transformer the diffusion forward runs on."""
+        return self.model.transformer
+
+
+__all__ = ["Cosmos3DiffusionStage", "Cosmos3DiffusionStep"]

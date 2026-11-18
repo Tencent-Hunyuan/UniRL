@@ -256,6 +256,17 @@ use LoRA adapter mode. Formats and export live in
   the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
   `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
   `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
+- **Training hot paths ban Class A host-device syncs.** Never call `.item()`,
+  `.cpu()`, `.tolist()`, `.numpy()`, `bool(tensor)`, or CUDA `nonzero()` inside
+  micro-batch forward/backward or per-layer loops. Accumulate GPU scalar metrics via
+  `torch.stack` and transfer once at end-of-step; `optimizer_step`'s single
+  non-finite `grad_norm` check and VeOmni EP `split_sizes` host conversion stay
+  within Class B budget (`<= 1` per boundary).
+- **Backend-specific operators live in their owning backend or `models/<family>/`.**
+  Keep `FSDPBackend` (`backend/fsdp/`) and `VeOmniBackend` (`backend/veomni/`) behind
+  the `BaseFSDP2Backend` contract (`backend/base_backend.py`) so `TrainStack` and
+  `algorithms/` remain backend-agnostic; never copy legacy cross-layer coupling from
+  `models/{hunyuan_image3,qwen3_moe,qwen3_5}` or `models/cosmos3`.
 
 ## Profiling → Perfetto
 
