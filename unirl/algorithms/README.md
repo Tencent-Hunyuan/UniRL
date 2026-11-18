@@ -191,17 +191,18 @@ Set `stack.num_updates_per_batch: 2` and sync weights every rollout. Every
 visited state plus the final endpoint must be present in `LatentSegment`;
 sparse trajectories, packed latents, and joint audio/video predictions raise.
 The stack calls `validate_part` once on the full shard before any anchor
-forward; numeric schedule and dense-index checks belong there. Anchor and
+forward and exchanges validation failures so all ranks fail together; numeric schedule and dense-index checks belong there. Anchor and
 training micros repeat metadata-only shape checks without device scalar reads.
-Standalone callers must invoke `validate_part(part)` before `prepare_segment`
+Standalone callers must invoke `validate_part(part)` before `prepare_segment` and `prepare_part`
 and keep the shared schedule/indices unchanged throughout that rollout.
 SD3 and the dense HunyuanVideo/Wan stages share the same prediction interface.
 
 `prepare_part` groups scalar advantages by sample lineage, using the same
 default parent layer as `Part.compute_advantages` (`group_layer` overrides it).
 The group size must match `params.samples_per_prompt`. Train workers exchange
-only sample IDs, group labels, and shapes, then tensor-reduce endpoint sufficient
-statistics one group at a time. A prompt may span DP shards; replicated SP/TP
+only sample IDs, group labels, and shapes, then compute intact groups locally. Only split groups tensor-reduce endpoint
+statistics, centered on a shared endpoint to preserve exact zero covariance
+for identical endpoints. A final scalar reduction determines global activity. A prompt may span DP shards; replicated SP/TP
 rows count once by sample identity. No trajectory or endpoint tensor is gathered
 to the driver. All train ranks participate in identical group order; endpoints
 must share a dense latent shape. The temporary reduction buffer holds two
@@ -215,7 +216,12 @@ skips both optimizer steps, including AdamW momentum and weight decay. A locally
 inactive shard still runs backward when any other shard has guidance.
 `art_guidance` is row-aligned;
 `art_old_predictions` is frozen by the stack over the exact planned microbatches
-for both updates before either optimizer step. Anchors are stored on CPU.
+for both updates before either optimizer step. Anchors are stored on CPU;
+each microbatch's predictions are stacked on the GPU before one host transfer,
+then transferred back together for replay. This temporarily holds one
+microbatch's full anchor trajectory on the GPU. Metrics are transferred together
+after the microbatch's backward passes. Skipped disjoint updates do not advance
+the checkpointed optimizer counter.
 Both prediction passes keep the transformer in training mode, including during
 the stack's eval-mode anchor hook, and temporarily disable only PyTorch dropout
 modules. This preserves training-gated activation checkpointing and prevents
