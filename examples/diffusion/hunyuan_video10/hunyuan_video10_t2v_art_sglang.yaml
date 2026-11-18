@@ -109,7 +109,6 @@ rollout:
     tp_size: 1
     local_mode: true
     engine_kwargs:
-      embedded_cfg_scale: ${sampling.guidance_scale}
       flow_shift: ${model_config.shift}
   model_config: ${model_config}
   strategy: ${strategy}
