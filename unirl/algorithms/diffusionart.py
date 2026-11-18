@@ -88,9 +88,9 @@ class DiffusionART(StageAlgorithm):
             raise ValueError("DiffusionART requires a stage with predict_noise_at_step.")
         if not isinstance(getattr(self.stage, "strategy", None), FlowSDEStrategy):
             raise ValueError("DiffusionART requires FlowSDEStrategy for its scheduler-reference mask.")
-        if float(params.eta) != 0 or float(params.guidance_scale) != 1:
+        if params.eta != 0 or params.guidance_scale != 1:
             raise ValueError("DiffusionART requires ODE sampling eta=0 and guidance_scale=1.")
-        if int(params.samples_per_prompt) < 2:
+        if params.samples_per_prompt < 2:
             raise ValueError("DiffusionART requires samples_per_prompt >= 2 for full-group covariance.")
         if not math.isfinite(reference_nu) or reference_nu <= 0:
             raise ValueError("DiffusionART reference_nu must be finite and positive.")
@@ -130,6 +130,21 @@ class DiffusionART(StageAlgorithm):
 
     def validate_part(self, part: Part) -> None:
         """Validate schedule values once before any anchor forward; see README.md for standalone use."""
+        error = None
+        try:
+            self._validate_local_part(part)
+        except (ValueError, TypeError) as exc:
+            error = str(exc)
+        errors = [error]
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            errors = [None] * dist.get_world_size()
+            dist.all_gather_object(errors, error)
+        for rank, message in enumerate(errors):
+            if message is not None:
+                raise ValueError(f"DiffusionART shard {rank}: {message}")
+
+    def _validate_local_part(self, part: Part) -> None:
+        """Collect local contract failures before the rank-synchronous preflight boundary."""
         self._validate_segment_shape(part.segment)
         sigmas = part.segment.sigmas
         if not torch.isfinite(sigmas).all():
@@ -141,6 +156,22 @@ class DiffusionART(StageAlgorithm):
             raise ValueError(
                 "DiffusionART requires all T+1 trajectory states; configure dense trajectory storage at eta=0."
             )
+        x = part.segment.latents[:, -1]
+        if part.advantages is None or part.advantages.shape != (x.shape[0],) or len(part.sample_ids) != x.shape[0]:
+            raise ValueError("DiffusionART requires scalar advantages and sample_ids aligned with every endpoint.")
+        if not torch.isfinite(x).all() or not torch.isfinite(part.advantages).all():
+            raise ValueError("DiffusionART requires finite endpoints and advantages.")
+        if any(not isinstance(sid, str) or not sid for sid in part.sample_ids):
+            raise ValueError("DiffusionART requires nonempty string sample_ids.")
+        layer = self.config.group_layer
+        if layer is None:
+            layer = max(part.sample_ids[0].count("/") - 1, 0)
+        for sid in part.sample_ids:
+            ancestor_id(sid, layer)
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            ri = getattr(self.backend, "rank_info", None)
+            if ri is None or ri.world_size != dist.get_world_size():
+                raise ValueError("DiffusionART covariance requires backend RankInfo for the train process group.")
 
     @contextmanager
     def _prediction_mode(self):
@@ -187,18 +218,14 @@ class DiffusionART(StageAlgorithm):
         conditions = typed_conditions(conditions, self.conditions_cls)
         with self._prediction_mode():
             segment.art_old_predictions = torch.stack(
-                [self._predict(conditions, segment, step).detach().cpu() for step in range(steps)], dim=1
-            )
+                [self._predict(conditions, segment, step).detach() for step in range(steps)], dim=1
+            ).cpu()
 
     @torch.no_grad()
     def prepare_part(self, part: Part) -> Part:
         self._validate_segment_shape(part.segment)
         x = part.segment.latents[:, -1].detach().float()
-        if part.advantages is None or part.advantages.shape != (x.shape[0],) or len(part.sample_ids) != x.shape[0]:
-            raise ValueError("DiffusionART requires scalar advantages and sample_ids aligned with every endpoint.")
         adv = part.advantages.detach().to(x)
-        if not torch.isfinite(x).all() or not torch.isfinite(adv).all():
-            raise ValueError("DiffusionART requires finite endpoints and advantages.")
         layer = self.config.group_layer
         if layer is None:
             layer = max(part.sample_ids[0].count("/") - 1, 0)
@@ -206,10 +233,6 @@ class DiffusionART(StageAlgorithm):
         distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if distributed else 0
         ri = getattr(self.backend, "rank_info", None)
-        if distributed and (ri is None or ri.world_size != dist.get_world_size()):
-            raise ValueError(
-                "DiffusionART distributed covariance requires backend RankInfo for the train process group."
-            )
         local = (part.sample_ids, labels, tuple(x.shape[1:]), ri.dp_rank if ri is not None else 0)
         metadata = [local]
         if distributed:
@@ -228,23 +251,36 @@ class DiffusionART(StageAlgorithm):
                 else:
                     owners[sid] = (owner, dp_rank, label)
                     groups.setdefault(label, []).append(sid)
-        expected = int(self.params.samples_per_prompt)
+        expected = self.params.samples_per_prompt
         if any(len(ids) != expected for ids in groups.values()):
             raise ValueError(f"DiffusionART needs complete groups of samples_per_prompt={expected} across train ranks.")
         guidance = torch.zeros_like(x)
         active = x.new_zeros((), dtype=torch.bool)
         for label in sorted(groups):
             rows = [i for i, name in enumerate(labels) if name == label]
-            owned = [i for i in rows if owners[part.sample_ids[i]][0] == rank]
+            group_owners = {owners[sid][0] for sid in groups[label]}
+            split = len(group_owners) > 1
+            if not split and not rows:
+                continue
+            owned = [i for i in rows if owners[part.sample_ids[i]][0] == rank] if split else rows
+            reference = x.new_zeros(x.shape[1:])
+            if split:
+                first = groups[label][0]
+                source = owners[first][0]
+                if rank == source:
+                    reference.copy_(x[part.sample_ids.index(first)])
+                dist.broadcast(reference, src=source)
+            else:
+                reference = x[rows[0]]
             moments = x.new_zeros((2, x[0].numel() + 2))
             extrema = x.new_full((2,), -torch.inf)
             if owned:
-                values, rewards = x[owned].flatten(1), adv[owned]
+                values, rewards = (x[owned] - reference).flatten(1), adv[owned]
                 moments[0, :-2] = (values * rewards[:, None]).sum(0)
                 moments[1, :-2] = values.sum(0)
                 moments[0, -2:] = torch.stack((rewards.sum(), rewards.new_tensor(len(owned))))
                 extrema = torch.stack((rewards.max(), -rewards.min()))
-            if distributed:
+            if split:
                 dist.all_reduce(moments)
                 dist.all_reduce(extrema, op=dist.ReduceOp.MAX)
             count = moments[0, -1]
@@ -256,6 +292,8 @@ class DiffusionART(StageAlgorithm):
             if rows:
                 guidance[rows] = direction
         part.segment.art_guidance = guidance
+        if distributed:
+            dist.all_reduce(active, op=dist.ReduceOp.MAX)
         self._has_global_guidance = bool(active)
         return part
 
@@ -276,6 +314,7 @@ class DiffusionART(StageAlgorithm):
                 has_backward=False,
             )
         conditions = typed_conditions(conditions, self.conditions_cls)
+        old_predictions = segment.art_old_predictions.to(device=segment.latents.device, dtype=torch.float32)
         metrics, total = {}, segment.latents.new_zeros((), dtype=torch.float32)
         with self._prediction_mode():
             for start in range(0, steps, self.config.timestep_chunk_size):
@@ -284,7 +323,7 @@ class DiffusionART(StageAlgorithm):
                     new = self._predict(conditions, segment, step)
                     loss, diagnostics = art_velocity_loss(
                         new,
-                        segment.art_old_predictions[:, step],
+                        old_predictions[:, step],
                         segment.art_guidance,
                         sigma=segment.sigmas[step].to(new.device).float(),
                         sigma_next=segment.sigmas[step + 1].to(new.device).float(),
@@ -301,10 +340,10 @@ class DiffusionART(StageAlgorithm):
                 chunk_loss = torch.stack(losses).sum() / steps
                 total += chunk_loss.detach()
                 (chunk_loss * loss_scale).backward()
-        total = float(total)
+        total, *values = torch.stack([total, *metrics.values()]).tolist()
         return AlgorithmStepResult(
             loss=total,
-            metrics={"policy_loss": total, **{name: float(value) for name, value in metrics.items()}},
+            metrics={"policy_loss": total, **dict(zip(metrics, values))},
             num_steps_or_tokens=steps,
             has_backward=True,
         )

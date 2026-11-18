@@ -644,6 +644,8 @@ class UniRLWandBLogger:
         per_update = results.per_update
         if len(per_update) > 1:
             for metrics in per_update:
+                if not metrics["optimizer_updates"]:
+                    continue
                 self._optimizer_step += 1
                 self.log_step(self._optimizer_step, dict(metrics))
         elif results.has_backward:
