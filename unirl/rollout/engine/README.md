@@ -114,7 +114,12 @@ pipe, so vLLM's imports stay out of the Worker process.
   Qwen-Image-Edit SGLang server fails to move its transformer to CPU, so the
   composed engine leaves it on the GPU and sleeps only the AR child. Both
   children then share the GPU for the whole run; the image-editing PE recipe
-  peaks near 111 GB on one device.
+  peaks near 110 GB on one device. `PETrainer` wakes the AR child before the
+  trainer offloads, so the cache left by the last backward is still on the GPU
+  at that moment. The recipe empties it after every train step but the first
+  (`logging.memory.empty_cache_at: [ar_train]`; the monitor wraps the phases
+  once the first step returns); without that, about 5% of
+  rollouts in a 300-rollout run spiked 12-31 GB higher, up to 142.6 GB.
 - **Explicit vLLM-Omni AR seeds use one call per sample.** HI3 and Qwen3-Omni
   derive each request's seed from `ARSamplingParams.seed` and the AR Part's
   `sample_id`, using the same `derive_sampling_seed` mapping as SGLang. In
