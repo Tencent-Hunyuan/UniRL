@@ -213,32 +213,31 @@ Wan I2V requires a dataset with input-image conditioning, as in `wan21_i2v`.
 The 8-GPU Wan ART recipe enables activation checkpointing. With checkpointing disabled,
 the 720p run exhausted device memory during training before its first optimizer update.
 SGLang uses the baseline's merged-LoRA weight sync and populated training
-conditions; the algorithm recomputes anchors with the train-side model.
+conditions. It uses the train-side fallback described below.
 These dimensions are frame counts, not video durations in seconds.
 
 `prepare_part` groups scalar advantages by sample lineage, using the same
 default parent layer as `Part.compute_advantages` (`group_layer` overrides it).
 The group size must match `params.samples_per_prompt`. Train workers exchange
-only sample IDs, group labels, and shapes, then compute intact groups locally. Only split groups tensor-reduce endpoint
-statistics, centered on a shared endpoint to preserve exact zero covariance
-for identical endpoints. A final scalar reduction determines global activity. A prompt may span DP shards; replicated SP/TP
-rows count once by sample identity. No trajectory or endpoint tensor is gathered
-to the driver. All train ranks participate in identical group order; endpoints
-must share a dense latent shape. The temporary reduction buffer holds two
-latent-sized moments per group, independent of the global number of groups.
+sample metadata and compute intact groups locally. For groups spanning DP shards,
+they reduce centered endpoint and reward moments in FP64. SP/TP replicas count
+once per sample. Each optimizer update receives half of each prompt's samples,
+and each DP rank has the same number of rows in both updates. This requires an
+even group size and an even local row count.
 
 Guidance is the per-prompt reward/endpoint covariance divided by its RMS.
-Centered, positively scaled scalar advantages give the same direction as raw
-rewards. Constant advantages and exactly zero covariance produce zero guidance
-and zero loss, including after the first update. A globally zero-guidance rollout
+The precision guard compares the covariance norm to the product of the centered
+endpoint and reward norms scaled by the input precision. Unresolved groups
+receive zero guidance and contribute zero loss. A globally zero-guidance rollout
 skips both optimizer steps, including AdamW momentum and weight decay. A locally
 inactive shard still runs backward when any other shard has guidance.
-`art_guidance` is row-aligned;
-`art_old_predictions` is frozen by the stack over the exact planned microbatches
-for both updates before either optimizer step. Anchors are stored on CPU;
-each microbatch's predictions are stacked on the GPU before one host transfer,
-then transferred back together for replay. This temporarily holds one
-microbatch's full anchor trajectory on the GPU. Metrics are transferred together
+`art_guidance` stays aligned with each sample. The first update uses its own
+detached velocity as the old prediction. The second update needs velocities
+from before that optimizer step. Native SD3, HunyuanVideo and Wan ART recipes
+cache scheduler-input velocities during rollout in host memory
+(`cache_art_old_predictions: true`). Engines without this field replay only
+the second update's microbatches before the first optimizer step. Training
+transfers cached velocities to the device per microbatch. Metrics are transferred together
 after the microbatch's backward passes. Skipped disjoint updates do not advance
 the checkpointed optimizer counter.
 Both prediction passes keep the transformer in training mode, including during

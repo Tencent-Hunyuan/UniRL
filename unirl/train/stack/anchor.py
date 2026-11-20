@@ -90,6 +90,9 @@ def prepare_part_for_training(
     model: torch.nn.Module,
 ) -> Part:
     """Freeze ``part``'s anchors in eval mode, run the algorithm's ``prepare_part`` hook, then restore the mode."""
+    if algorithm.first_update_self_anchor:
+        # A fallback buffer covers only update B and belongs to this particular plan.
+        part = replace(part, segment=replace(part.segment))
     was_training = model.training
     model.eval()
     try:
