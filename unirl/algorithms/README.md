@@ -210,6 +210,8 @@ select every ODE state, and set `eta: 0`; the reference mask still uses nu 0.8.
 Set `PRETRAINED_MODEL` and `DATA_PATH` before using
 `bash examples/run_experiment_single_node.sh diffusion/hunyuan_video10/hunyuan_video10_t2v_art_trainside`.
 Wan I2V requires a dataset with input-image conditioning, as in `wan21_i2v`.
+The 8-GPU Wan ART recipe enables activation checkpointing. With checkpointing disabled,
+the 720p run exhausted device memory during training before its first optimizer update.
 SGLang uses the baseline's merged-LoRA weight sync and populated training
 conditions; the algorithm recomputes anchors with the train-side model.
 These dimensions are frame counts, not video durations in seconds.

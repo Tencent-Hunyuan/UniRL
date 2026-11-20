@@ -151,8 +151,9 @@ class DiffusionART(StageAlgorithm):
             raise ValueError("DiffusionART requires a finite sigma schedule.")
         if not ((sigmas[:-1] > sigmas[1:]).all() and sigmas[0] <= 1 and sigmas[-1] == 0):
             raise ValueError("DiffusionART requires strictly decreasing sigmas in [0, 1], ending at 0.")
-        expected = torch.arange(sigmas.numel(), device=sigmas.device)
-        if not torch.equal(part.segment.indices.to(expected), expected):
+        indices = part.segment.indices
+        expected = torch.arange(sigmas.numel(), device=indices.device)
+        if indices.dtype != torch.long or not torch.equal(indices, expected):
             raise ValueError(
                 "DiffusionART requires all T+1 trajectory states; configure dense trajectory storage at eta=0."
             )
