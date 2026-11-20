@@ -56,6 +56,7 @@ class PairwiseRewardBackend(RewardBackend):
     """Assign complementary comparison labels to complete groups, preserving the input row order."""
 
     requires_complete_groups = True
+    supports_truncation_penalty = False
 
     def __init__(self, judge: PairwiseJudge, group_size: int, batch_size: int = 8, seed: int = 0) -> None:
         if not isinstance(group_size, int) or group_size < 2 or group_size % 2:
