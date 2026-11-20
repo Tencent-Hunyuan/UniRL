@@ -612,6 +612,8 @@ class UniRLWandBLogger:
         per_update = results.per_update
         if len(per_update) > 1:
             for metrics in per_update:
+                if not metrics["optimizer_updates"]:
+                    continue
                 self._optimizer_step += 1
                 self.log_step(self._optimizer_step, dict(metrics))
         elif results.has_backward:
@@ -621,7 +623,7 @@ class UniRLWandBLogger:
     def log_progress(
         self,
         rollout_id: int,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
         mean_reward: float,
         *,
@@ -664,9 +666,9 @@ class UniRLWandBLogger:
             body = _fmt(results)
         suffix = ("  " + " ".join(f"{k}={v}" for k, v in extra.items())) if extra else ""
         log.info(
-            "rollout %d/%d  reward=%.4f  %s%s",
+            "rollout %d/%s  reward=%.4f  %s%s",
             rollout_id + 1,
-            num_rollouts,
+            num_rollouts if num_rollouts is not None else "unlimited",
             mean_reward,
             body,
             suffix,

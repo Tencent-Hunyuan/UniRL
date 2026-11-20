@@ -146,20 +146,12 @@ class FlowMatchSDEDiscreteScheduler(FlowMatchEulerDiscreteScheduler):
         sigma_max = self.sigmas[1]
         dt = sigma_prev - sigma
 
-        if self._sde_indices_set is None or len(self._sde_indices_set) == 0:
+        if self._eta == 0 or not self._sde_indices_set:
             step_is_sde = False
         else:
             step_is_sde = int(sigma_idx) in self._sde_indices_set
 
         if step_is_sde:
-            # Clamp sigma denominators and reject eta=0 in SDE steps.
-            if float(self._eta) <= 0.0:
-                raise RuntimeError(
-                    f"FlowMatchSDEDiscreteScheduler.step: step_index={int(sigma_idx)} "
-                    f"is in _sde_indices_set but scheduler eta={self._eta!r}; "
-                    f"eta must be > 0 for SDE steps. Check pipeline "
-                    f"_ensure_scheduler_for_eta + driver sde_indices wiring."
-                )
             std_dev_t = torch.sqrt(sigma / (1 - torch.where(sigma == 1, sigma_max, sigma))) * self._eta
             prev_sample_mean = (
                 sample_f32 * (1 + std_dev_t**2 / (2 * sigma) * dt)

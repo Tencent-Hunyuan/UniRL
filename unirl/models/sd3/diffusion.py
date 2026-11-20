@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from functools import partial
 from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
 
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, RolloutPredictionCache
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import StepStrategy
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
@@ -132,9 +133,12 @@ class SD3DiffusionStep(DiffusionStep[SD3Bundle, SD3Conditions]):
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
+        prediction_cache: Optional[RolloutPredictionCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
+        if prediction_cache is not None:
+            prediction_cache.store(step_index, noise_pred)
         return self.forward(
             strategy=strategy,
             noise_pred=noise_pred,
@@ -274,13 +278,19 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         )
         sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
 
+        prediction_cache = (
+            RolloutPredictionCache(T) if params.cache_art_old_predictions and len(needed) == T + 1 else None
+        )
+        rollout_step = self.step.step_with_logp
+        if prediction_cache is not None:
+            rollout_step = partial(self.step.step, prediction_cache=prediction_cache)
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = self.step.step_with_logp(
+                new_latents, log_prob, _ = rollout_step(
                     self.model,
                     conditions,
                     strategy=self.strategy,
@@ -310,6 +320,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
 
         return LatentSegment(
             latents=latents_stacked,
+            art_old_predictions=prediction_cache.finish() if prediction_cache is not None else None,
             sigmas=schedule,
             indices=indices_tensor,
             sde_logp=sde_logp,

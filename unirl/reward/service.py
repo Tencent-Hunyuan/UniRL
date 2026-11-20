@@ -89,6 +89,18 @@ class RewardService(Remote):
         if not frontier.primitives:
             raise ValueError("RewardService.score_and_attach: frontier Part has no generated primitives to score.")
 
+        # Hitting max_new_tokens means truncated text, but fixed-length AR media
+        # reaches that length by construction and must keep its reward.
+        sampling_params = frontier.sampling_params
+        apply_truncation = (
+            self.truncated_reward != "keep"
+            and isinstance(sampling_params, ARSamplingParams)
+            and not sampling_params.emits_fixed_length
+            and frontier.segment is not None
+        )
+        if apply_truncation and not getattr(self.backend, "supports_truncation_penalty", True):
+            raise ValueError("Pairwise rewards on variable-length AR outputs require reward.truncated_reward: keep.")
+
         original_prompt: Optional[Texts] = None
         generation_prompt: Optional[Texts] = None
         conditioning: Dict[str, PrimitiveValue] = {}
@@ -134,15 +146,7 @@ class RewardService(Remote):
 
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
 
-        # Hitting max_new_tokens means truncated text, but fixed-length AR media
-        # reaches that length by construction and must keep its reward.
-        sampling_params = frontier.sampling_params
-        if (
-            self.truncated_reward != "keep"
-            and isinstance(sampling_params, ARSamplingParams)
-            and not sampling_params.emits_fixed_length
-            and frontier.segment is not None
-        ):
+        if apply_truncation:
             seg_lengths = frontier.segment.lengths
             if seg_lengths is not None and seg_lengths.numel() == rewards.numel():
                 seg_lengths = seg_lengths.to(rewards.device).float()
@@ -160,7 +164,12 @@ class RewardService(Remote):
             name: torch.tensor(values, dtype=torch.float32)
             for name, values in reward_response.component_rewards.items()
         }
-        scored = replace(frontier, rewards=rewards, component_rewards=component_rewards)
+        scored = replace(
+            frontier,
+            rewards=rewards,
+            component_rewards=component_rewards,
+            has_pairwise_labels=reward_response.has_pairwise_labels,
+        )
         return sample.with_parts([*sample.parts[:-1], scored])
 
     # Broadcast, not scatter: every reward worker holds its own copy of the

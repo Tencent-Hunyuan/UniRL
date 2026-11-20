@@ -26,6 +26,8 @@ _EXPORTS = (
     ("BagelFlowUniGRPO", "bagel_flow_unigrpo"),
     ("FlowGRPO", "flowgrpo"),
     ("FlowGRPOConfig", "flowgrpo"),
+    ("DiffusionART", "diffusionart"),
+    ("DiffusionARTConfig", "diffusionart"),
     ("DiffusionNFT", "diffusionnft"),
     ("DiffusionNFTConfig", "diffusionnft"),
     ("DiffusionOPD", "diffusionopd"),

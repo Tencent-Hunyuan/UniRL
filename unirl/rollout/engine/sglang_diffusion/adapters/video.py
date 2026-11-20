@@ -64,6 +64,12 @@ class MochiAdapter(ImageAdapter):
 class HunyuanVideo10Adapter(VideoAdapter):
     """HunyuanVideo-1.0 T2V with video output and dual text conditions."""
 
+    def boot_kwargs(self) -> Dict[str, Any]:
+        """Convert sampling guidance to Hunyuan checkpoint units unless explicitly overridden."""
+        if "embedded_cfg_scale" in self.cfg.engine_kwargs:
+            return {}
+        return {"embedded_cfg_scale": self.cfg.sampling.guidance_scale * 1000.0}
+
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:
         """Keep HunyuanVideo-1.0's LLaMA and pooled-CLIP streams separate."""
         require(bool(results), "HunyuanVideo-1.0: cannot build conditions from empty results")

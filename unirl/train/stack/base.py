@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
+from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
@@ -86,6 +87,13 @@ class BaseTrainStack(Remote):
                 raise ValueError(f"{owner}.{name} must be an int >= 1; got {value!r}.")
         if isinstance(max_grad_norm, bool) or not isinstance(max_grad_norm, (int, float)) or not max_grad_norm > 0.0:
             raise ValueError(f"{owner}.max_grad_norm must be a number > 0; got {max_grad_norm!r}.")
+        for algorithm in algorithms:
+            required = algorithm.required_num_updates
+            if required is not None and num_updates_per_batch != required:
+                raise ValueError(
+                    f"{type(algorithm).__name__} requires num_updates_per_batch={required} "
+                    f"disjoint updates; got {num_updates_per_batch}."
+                )
         if num_updates_per_batch > 1:
             for algorithm in algorithms:
                 if not algorithm.supports_multi_update:
@@ -106,7 +114,11 @@ class BaseTrainStack(Remote):
     def _align_track_inputs(self, part: Part) -> None:
         """Move the segment, conditions, and advantages to the training device; media payloads stay on the host."""
         device = self.fsdp_backend._device
-        if part.segment is not None:
+        if isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None:
+            cached = part.segment.art_old_predictions
+            part.segment = replace(part.segment, art_old_predictions=None).to_device(device)
+            part.segment.art_old_predictions = cached.cpu()
+        elif part.segment is not None:
             part.segment = part.segment.to_device(device)
         part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
         if part.advantages is not None:

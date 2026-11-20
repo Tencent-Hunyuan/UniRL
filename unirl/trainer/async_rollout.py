@@ -12,7 +12,7 @@ from unirl.rollout.manager import (
     required_worker_concurrency,
     validate_worker_inflight,
 )
-from unirl.trainer.base import unwrap_replicated_int
+from unirl.trainer.base import score_generated_sample, unwrap_replicated_int
 from unirl.types.sample import Sample
 from unirl.types.sampling import total_samples_per_prompt
 
@@ -262,7 +262,7 @@ class AsyncRolloutTrainerMixin:
                 batches_since_sync=self._batches_since_sync + 1,
             )
 
-        scored = self.reward.score_and_attach(completed)
+        scored = score_generated_sample(self.reward, completed)
         self._drop_decoded(scored, rollout_id=rollout_id)
 
         if not self._refill_before_score:

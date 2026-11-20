@@ -75,6 +75,7 @@ class Part(Batch):
     output_version: Optional[int] = shared_field(default=None)
     harness_status: Optional[str] = shared_field(default=None)
     init_noise_group_ids: List[str] = concat_field(default_factory=list)
+    has_pairwise_labels: bool = shared_field(default=False)
 
     def __post_init__(self) -> None:
         expected_batch = len(self.sample_ids)

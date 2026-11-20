@@ -13,7 +13,7 @@ import torch
 from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.anchor import prepare_part_for_training, validate_anchor_contract
+from unirl.train.stack.anchor import first_update_part, prepare_part_for_training, validate_anchor_contract
 from unirl.train.stack.base import BaseTrainStack, TrainStepResult, aggregate_update_results
 from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
@@ -254,6 +254,8 @@ class TrainStack(BaseTrainStack):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
+            prompt_groups=self.algorithm.update_prompt_groups,
+            dp_rank=self.rank_info.dp_rank if self.rank_info is not None else 0,
         )
         from unirl.utils.profiling import profile_mode
 
@@ -329,9 +331,12 @@ class TrainStack(BaseTrainStack):
 
         scope_update = profile_mode() == "one-update"
         results = []
-        for micros in plans:
+        for index, micros in enumerate(plans):
             cm = maybe_profile_update(self, self.fsdp_backend._rank) if scope_update else nullcontext()
             with cm:
-                results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
+                update_part = first_update_part(self.algorithm, part) if index == 0 else part
+                results.append(
+                    self._run_update(update_part, micros=micros, order=order, training_progress=training_progress)
+                )
         results[0] = self._guard_first_update_ratio(results[0])
         return aggregate_update_results(results, include_per_update=True)

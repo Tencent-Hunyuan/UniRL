@@ -43,6 +43,11 @@ class PerDomainRewardScorer(RewardBackend):
                     f"PerDomainRewardScorer: scorers[{domain!r}] is {type(scorer).__name__}, not a "
                     "RewardBackend — each entry needs its own `_target_` for Hydra to instantiate."
                 )
+            if getattr(scorer, "requires_complete_groups", False):
+                raise ValueError(
+                    f"PerDomainRewardScorer routes individual rows and cannot preserve full prompt groups for "
+                    f"scorer {domain!r}. Configure the group scorer directly as the reward backend."
+                )
         self._scorers: Dict[str, RewardBackend] = dict(config.scorers)
 
     def compute_rewards(self, request: RewardRequest) -> RewardResponse:

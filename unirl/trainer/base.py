@@ -13,11 +13,41 @@ from unirl.distributed.group.device_pool import DevicePool
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
+from unirl.types.segments import LatentSegment
 
 logger = logging.getLogger(__name__)
 
 # Bound exception-path flushes so wedged workers cannot mask the primary error.
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
+
+
+def score_generated_sample(reward: Any, sample: Sample) -> Sample:
+    """Score generated primitives while keeping cached latent trajectories on their original transport handles."""
+    cached_parts = {
+        i: part
+        for i, part in enumerate(sample.parts)
+        if isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None
+    }
+    if not cached_parts:
+        return reward.score_and_attach(sample)
+
+    request = sample.with_parts(
+        [replace(part, segment=None) if i in cached_parts else part for i, part in enumerate(sample.parts)]
+    )
+    scored = reward.score_and_attach(request)
+    if len(scored.parts) != len(sample.parts):
+        raise ValueError("Reward scoring changed the sample lineage.")
+    parts = list(scored.parts)
+    for i, original in cached_parts.items():
+        result = parts[i]
+        segment = original.segment
+        if result.sample_ids != original.sample_ids:
+            rows = {sid: row for row, sid in enumerate(original.sample_ids)}
+            if rows.keys() != set(result.sample_ids):
+                raise ValueError("Reward scoring changed the set of cached trajectory rows.")
+            segment = segment.select([rows[sid] for sid in result.sample_ids])
+        parts[i] = replace(result, segment=segment)
+    return scored.with_parts(parts)
 
 
 def prepare_input_sample(
@@ -308,7 +338,7 @@ class BaseTrainer:
     def maybe_save_checkpoint(
         self,
         rollout_id: int,
-        num_rollouts: int,
+        num_rollouts: Optional[int],
         *,
         save_interval: int,
         save_dir: Optional[str],
@@ -318,12 +348,17 @@ class BaseTrainer:
         if save_interval <= 0:
             return
         step = rollout_id + 1
-        if step % save_interval != 0 and step < num_rollouts:
+        if step % save_interval != 0 and (num_rollouts is None or step < num_rollouts):
             return
         self._prepare_for_save()
         base_dir = os.path.abspath(save_dir) if save_dir else os.path.join(os.getcwd(), "checkpoints")
         path = os.path.join(base_dir, f"checkpoint-{step}")
-        logger.info("Saving checkpoint at rollout %d/%d -> %s", step, num_rollouts, path)
+        logger.info(
+            "Saving checkpoint at rollout %d/%s -> %s",
+            step,
+            num_rollouts if num_rollouts is not None else "unlimited",
+            path,
+        )
         if self._memory_monitor is not None:
             self._memory_monitor.boundary("ckpt_save:begin", self.backend)
         self.backend.save(path, step=step, mode=save_mode)
@@ -334,7 +369,7 @@ class BaseTrainer:
         with open(trainer_state_tmp, "w") as f:
             json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
         os.replace(trainer_state_tmp, trainer_state_path)
-        if step >= num_rollouts:
+        if num_rollouts is not None and step >= num_rollouts:
             self._wait_for_checkpoints()
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
