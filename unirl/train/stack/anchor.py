@@ -14,9 +14,9 @@ from unirl.types.sample import Part
 
 def first_update_part(algorithm: StageAlgorithm, part: Part) -> Part:
     """Reuse the current prediction as the first ART anchor without gathering cached velocities."""
-    if not algorithm.first_update_self_anchor:
+    if not algorithm.first_update_self_anchor or not part.segment.art_self_anchor:
         return part
-    return replace(part, segment=replace(part.segment, art_old_predictions=None, art_self_anchor=True))
+    return replace(part, segment=replace(part.segment, art_old_predictions=None))
 
 
 def validate_anchor_contract(algorithm: StageAlgorithm) -> None:
@@ -51,6 +51,7 @@ def prepare_segment_anchors(
             else:
                 anchors.index_copy_(0, order[start:end].to(anchors.device), predictions)
         part.segment.art_old_predictions = anchors
+        part.segment.art_self_anchor = True
         return
     micro_slices = [r for update in plan for r in update]
     if not algorithm.recomputes_anchor or len(micro_slices) == 1:
