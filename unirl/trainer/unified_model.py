@@ -18,7 +18,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.distributed.tensor.ref import map_tree
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, score_generated_sample
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.primitives import Images, Texts
@@ -404,7 +404,7 @@ class UnifiedModelTrainer(BaseTrainer):
         ar_idx = sample.gen_part_index(ARSamplingParams)
         img_idx = sample.gen_part_index(DiffusionSamplingParams)
 
-        sample = self.reward.score_and_attach(sample)
+        sample = score_generated_sample(self.reward, sample)
         img_part = sample.parts[img_idx]
         if img_part.rewards is not None:
             img_part.rewards = hydrate(img_part.rewards)
@@ -581,7 +581,7 @@ class UnifiedModelTrainer(BaseTrainer):
                     for eng in self.ar_rollouts + self.dit_rollouts:
                         eng.sleep()
             for name, reward in scorers:
-                scored = reward.score_and_attach(generated)
+                scored = score_generated_sample(reward, generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)

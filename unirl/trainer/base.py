@@ -13,11 +13,41 @@ from unirl.distributed.group.device_pool import DevicePool
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
+from unirl.types.segments import LatentSegment
 
 logger = logging.getLogger(__name__)
 
 # Bound exception-path flushes so wedged workers cannot mask the primary error.
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
+
+
+def score_generated_sample(reward: Any, sample: Sample) -> Sample:
+    """Score generated primitives while keeping cached latent trajectories on their original transport handles."""
+    cached_parts = {
+        i: part
+        for i, part in enumerate(sample.parts)
+        if isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None
+    }
+    if not cached_parts:
+        return reward.score_and_attach(sample)
+
+    request = sample.with_parts(
+        [replace(part, segment=None) if i in cached_parts else part for i, part in enumerate(sample.parts)]
+    )
+    scored = reward.score_and_attach(request)
+    if len(scored.parts) != len(sample.parts):
+        raise ValueError("Reward scoring changed the sample lineage.")
+    parts = list(scored.parts)
+    for i, original in cached_parts.items():
+        result = parts[i]
+        segment = original.segment
+        if result.sample_ids != original.sample_ids:
+            rows = {sid: row for row, sid in enumerate(original.sample_ids)}
+            if rows.keys() != set(result.sample_ids):
+                raise ValueError("Reward scoring changed the set of cached trajectory rows.")
+            segment = segment.select([rows[sid] for sid in result.sample_ids])
+        parts[i] = replace(result, segment=segment)
+    return scored.with_parts(parts)
 
 
 def prepare_input_sample(
