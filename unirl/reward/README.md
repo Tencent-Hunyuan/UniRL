@@ -170,6 +170,8 @@ This judge supports text-to-image generation without conditioning media.
 For a pointwise model such as PickScore, set `reward.backend.judge` to the following
 mapping in place of the HTTP judge. `ScalarComparisonJudge` scores each candidate
 independently and compares the two finite scores. Equal scores yield a tie.
+For variable-length AR text, set `reward.truncated_reward: keep`. Scoring rejects
+per-candidate truncation penalties because they can change a winner or break a tie.
 
 ```yaml
 judge:
@@ -184,7 +186,9 @@ judge:
 Each candidate enters exactly one comparison within its parent prompt. A winner
 receives 1, a loser 0, and both candidates in a tie receive 0.5. DiffusionART
 uses these labels in its usual covariance. The mean label is always 0.5 over a
-complete group. Use a separate `eval_rewards` scorer to measure absolute quality.
+complete group. To measure absolute quality, add a separate scalar scorer under
+`eval_rewards` and set a positive `eval_interval` (for example, `eval_interval: 20`).
+The default interval of zero disables periodic evaluation and its extra scorers.
 
 ### Managed image scorers
 
