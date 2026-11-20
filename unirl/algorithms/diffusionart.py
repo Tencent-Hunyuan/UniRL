@@ -175,7 +175,8 @@ class DiffusionART(StageAlgorithm):
                 raise ValueError(
                     "ART rollout velocities must be floating [B,T,*latent], aligned with trajectory states."
                 )
-            if not torch.isfinite(cached).all():
+            lo, hi = torch.aminmax(cached)
+            if not (torch.isfinite(lo) & torch.isfinite(hi)):
                 raise ValueError("ART rollout velocities must be finite.")
         x = part.segment.latents[:, -1]
         if part.advantages is None or part.advantages.shape != (x.shape[0],) or len(part.sample_ids) != x.shape[0]:
