@@ -186,7 +186,9 @@ judge:
 Each candidate enters exactly one comparison within its parent prompt. A winner
 receives 1, a loser 0, and both candidates in a tie receive 0.5. DiffusionART
 uses these labels in its usual covariance. The mean label is always 0.5 over a
-complete group. To measure absolute quality, add a separate scalar scorer under
+complete group. The scorer marks the rewards as pairwise so ART can keep tied
+rows at the old velocity whenever the rollout contains a decisive comparison.
+To measure absolute quality, add a separate scalar scorer under
 `eval_rewards` and set a positive `eval_interval` (for example, `eval_interval: 20`).
 The default interval of zero disables periodic evaluation and its extra scorers.
 

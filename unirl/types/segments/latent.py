@@ -32,6 +32,7 @@ class LatentSegment(Segment):
     log_probs: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     loss_mask: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
     aux_latents: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)
+    art_restore_anchor: Optional[torch.Tensor] = field(kind=FieldKind.CONCAT, default=None)  # [B] bool
 
     def as_condition(self) -> Optional[Condition]:
         """Promote the *final* step's latent into an ``ImageLatentCondition``."""

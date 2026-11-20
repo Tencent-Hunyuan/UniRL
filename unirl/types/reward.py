@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import torch
 from PIL import Image
 
-from unirl.distributed.tensor.batch import Batch, concat_field, max_field
+from unirl.distributed.tensor.batch import Batch, concat_field, max_field, shared_field
 from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 
 PromptSource = Literal["original", "generation"]
@@ -120,6 +120,7 @@ class RewardResponse(Batch):
     successes: List[bool] = concat_field(default_factory=list)
     errors: List[Optional[str]] = concat_field(default_factory=list)
     compute_time: float = max_field(default=0.0)
+    has_pairwise_labels: bool = shared_field(default=False)
 
     @property
     def batch_size(self) -> int:

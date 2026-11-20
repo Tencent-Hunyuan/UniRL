@@ -108,6 +108,7 @@ class PairwiseRewardBackend(RewardBackend):
                 rewards[left], rewards[right] = float(label), 1.0 - float(label)
         return RewardResponse(
             rewards=rewards,
+            has_pairwise_labels=True,
             successes=[True] * len(rewards),
             errors=[None] * len(rewards),
             compute_time=time.perf_counter() - started,
