@@ -9,6 +9,7 @@ from typing import Callable, Dict, Iterator, List
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.tensor import DTensor
 from torch.nn.parameter import Parameter
 
@@ -17,6 +18,19 @@ from unirl.distributed.local import local_view
 logger = logging.getLogger(__name__)
 
 StateDict = Dict[str, object]
+
+
+class SparseAdamWLoadPlanner(DefaultLoadPlanner):
+    """Keep strict DCP reads for all fields except wholly absent legacy AdamW parameter states."""
+
+    def set_up_planner(self, state_dict, metadata, is_coordinator=False) -> None:
+        optim_state = state_dict["optim"]["state"]
+        stored = {
+            path[2] for path in metadata.planner_data.values() if len(path) > 2 and path[:2] == ("optim", "state")
+        }
+        for name in optim_state.keys() - stored:
+            del optim_state[name]
+        super().set_up_planner(state_dict, metadata, is_coordinator)
 
 
 def _current_rank() -> int:
@@ -98,21 +112,23 @@ def load_optimizer_state_dict(
     optimizer: torch.optim.Optimizer,
     state_dict: StateDict,
     *,
+    full_state_dict: bool = True,
     broadcast_from_rank0: bool = True,
 ) -> None:
-    """Load a full optimizer state dict and reshard it into ``optimizer``."""
+    """Restore optimizer state into ``optimizer``."""
     from torch.distributed.checkpoint.state_dict import StateDictOptions, set_optimizer_state_dict
 
     options = StateDictOptions(
-        full_state_dict=True,
+        full_state_dict=full_state_dict,
         broadcast_from_rank0=broadcast_from_rank0,
         cpu_offload=False,
     )
     if isinstance(optimizer, torch.optim.AdamW) and "state" in state_dict:
         # Sparse checkpoints list never-updated params without state; a step-0 entry is dropped back to lazy init.
+        state = state_dict["state"]
         for group in state_dict["param_groups"]:
-            for name in group["params"]:
-                state_dict["state"].setdefault(name, {"step": torch.tensor(0.0)})
+            for name in set(group["params"]) - state.keys():
+                state[name] = {"step": torch.tensor(0.0)}
     set_optimizer_state_dict(model, optimizer, optim_state_dict=state_dict, options=options)
     if isinstance(optimizer, torch.optim.AdamW):
         for param in [p for p, entry in optimizer.state.items() if float(entry["step"]) == 0]:
@@ -167,6 +183,7 @@ def trainable_params(model: nn.Module) -> Iterator[Parameter]:
 
 
 __all__ = [
+    "SparseAdamWLoadPlanner",
     "StateDict",
     "gather_state_dict",
     "load_model_state_dict",
