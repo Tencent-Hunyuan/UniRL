@@ -32,9 +32,10 @@ class DiffusionARTConfig(BaseAlgorithmConfig):
     kl_mask_threshold: float = 1e-5
     timestep_chunk_size: int = 1
     group_layer: Optional[int] = None
+    restore_zero_signal: bool = False
 
 
-def art_velocity_loss(new, old, guidance, *, sigma, sigma_next, reference_nu, kl_mask_threshold):
+def art_velocity_loss(new, old, guidance, *, sigma, sigma_next, reference_nu, kl_mask_threshold, restore_anchor=None):
     """Return loss and detached diagnostics per row ``[B]`` from velocities ``[B, *latent]``."""
     new = new.float()
     old, guidance = old.detach().to(new), guidance.detach().to(new)
@@ -50,7 +51,10 @@ def art_velocity_loss(new, old, guidance, *, sigma, sigma_next, reference_nu, kl
     active = guidance.flatten(1).ne(0).any(1)
     masked = active & (kl >= kl_mask_threshold) & (alignment > 0)
     loss = sigma * residual.square().flatten(1).mean(1)
-    return torch.where(active & ~masked, loss, 0.0), {
+    keep = active & ~masked
+    if restore_anchor is not None:
+        keep |= restore_anchor & ~active
+    return torch.where(keep, loss, 0.0), {
         "mask_fraction": masked.float().mean(),
         "zero_signal_fraction": (~active).float().mean(),
         "prediction_drift_mse": drift_mse.mean(),
@@ -82,6 +86,7 @@ class DiffusionART(StageAlgorithm):
         kl_mask_threshold: float = 1e-5,
         timestep_chunk_size: int = 1,
         group_layer: Optional[int] = None,
+        restore_zero_signal: bool = False,
     ) -> None:
         super().__init__()
         self.stage = stage if stage is not None else getattr(pipeline, stage_attr, None)
@@ -107,8 +112,13 @@ class DiffusionART(StageAlgorithm):
         if backend is not None and getattr(backend, "ema", None) is not None:
             raise ValueError("DiffusionART is EMA-free; remove ema_cfg and ema_lora_cfg from the backend.")
         self.params, self.backend, self.conditions_cls = params, backend, conditions_cls
-        self.config = DiffusionARTConfig(reference_nu, kl_mask_threshold, timestep_chunk_size, group_layer)
+        if not isinstance(restore_zero_signal, bool):
+            raise ValueError("DiffusionART restore_zero_signal must be a boolean.")
+        self.config = DiffusionARTConfig(
+            reference_nu, kl_mask_threshold, timestep_chunk_size, group_layer, restore_zero_signal
+        )
         self._has_global_guidance = None
+        self._train_rollout = False
 
     @property
     def update_prompt_groups(self) -> tuple[int, Optional[int]]:
@@ -181,6 +191,8 @@ class DiffusionART(StageAlgorithm):
         x = part.segment.latents[:, -1]
         if part.advantages is None or part.advantages.shape != (x.shape[0],) or len(part.sample_ids) != x.shape[0]:
             raise ValueError("DiffusionART requires scalar advantages and sample_ids aligned with every endpoint.")
+        if part.has_pairwise_labels and (part.rewards is None or part.rewards.shape != part.advantages.shape):
+            raise ValueError("DiffusionART requires row-aligned rewards for pairwise labels.")
         if not torch.isfinite(x).all() or not torch.isfinite(part.advantages).all():
             raise ValueError("DiffusionART requires finite endpoints and advantages.")
         if any(not isinstance(sid, str) or not sid for sid in part.sample_ids):
@@ -258,13 +270,22 @@ class DiffusionART(StageAlgorithm):
         input_eps = max(
             torch.finfo(t.dtype).eps for t in (part.segment.latents, part.advantages, x) if t.is_floating_point()
         )
-        local = (part.sample_ids, labels, tuple(x.shape[1:]), ri.dp_rank if ri is not None else 0, input_eps)
+        local = (
+            part.sample_ids,
+            labels,
+            tuple(x.shape[1:]),
+            ri.dp_rank if ri is not None else 0,
+            input_eps,
+            part.has_pairwise_labels,
+        )
         metadata = [local]
         if distributed:
             metadata = [None] * dist.get_world_size()
             dist.all_gather_object(metadata, local)
         owners, groups = {}, {}
-        for owner, (ids, names, shape, dp_rank, _) in enumerate(metadata):
+        for owner, (ids, names, shape, dp_rank, _, pairwise) in enumerate(metadata):
+            if pairwise != part.has_pairwise_labels:
+                raise ValueError("DiffusionART train shards must agree on the reward label type.")
             if shape != tuple(x.shape[1:]):
                 raise ValueError("DiffusionART DP reduction requires the same dense latent shape on all train ranks.")
             if len(set(ids)) != len(ids):
@@ -317,10 +338,26 @@ class DiffusionART(StageAlgorithm):
             direction = (numerator / torch.where(resolved, rms, torch.inf)).float().reshape(x.shape[1:])
             if rows:
                 guidance[rows] = direction
-        part.segment.art_guidance = guidance
+        part.segment.art_restore_anchor = None
+        if part.has_pairwise_labels:
+            ties = part.rewards.to(x.device) == 0.5
+            guidance.masked_fill_(ties.view(-1, *([1] * (x.ndim - 1))), 0)
+            activity = torch.stack((guidance.any(), (~ties).any(), ties.any()))
+        else:
+            activity = active
         if distributed:
-            dist.all_reduce(active, op=dist.ReduceOp.MAX)
-        self._has_global_guidance = bool(active)
+            dist.all_reduce(activity, op=dist.ReduceOp.MAX)
+        if part.has_pairwise_labels:
+            self._has_global_guidance, any_preference, any_tie = activity.tolist()
+            self._train_rollout = self._has_global_guidance or (any_preference and any_tie)
+            if any_preference and any_tie:
+                part.segment.art_restore_anchor = ties
+        else:
+            self._has_global_guidance = bool(activity)
+            self._train_rollout = self._has_global_guidance or self.config.restore_zero_signal
+            if self.config.restore_zero_signal:
+                part.segment.art_restore_anchor = ~guidance.flatten(1).any(1)
+        part.segment.art_guidance = guidance
         return part
 
     def compute_loss_and_backward(self, *, conditions, segment, advantages, training_progress, loss_scale):
@@ -335,7 +372,7 @@ class DiffusionART(StageAlgorithm):
             raise ValueError("DiffusionART guidance/anchor shapes must match [B, *latent] / [B, T, *latent].")
         if self._has_global_guidance is None:
             raise ValueError("DiffusionART requires full-shard prepare_part before training.")
-        if not self._has_global_guidance:
+        if not self._train_rollout:
             return AlgorithmStepResult(
                 loss=0.0,
                 metrics={"policy_loss": 0.0, "zero_signal_fraction": 1.0},
@@ -358,6 +395,7 @@ class DiffusionART(StageAlgorithm):
                         sigma_next=segment.sigmas[step + 1].to(new.device).float(),
                         reference_nu=self.config.reference_nu,
                         kl_mask_threshold=self.config.kl_mask_threshold,
+                        restore_anchor=segment.art_restore_anchor,
                     )
                     losses.append(loss.mean())
                     for name, value in diagnostics.items():

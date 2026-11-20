@@ -227,13 +227,21 @@ even group size and an even local row count.
 
 Guidance is the per-prompt reward/endpoint covariance divided by its RMS.
 The precision guard compares the covariance norm to the product of the centered
-endpoint and reward norms scaled by the input precision. Unresolved groups
-receive zero guidance and contribute zero loss. A globally zero-guidance rollout
-skips both optimizer steps, including AdamW momentum and weight decay. A locally
-inactive shard still runs backward when any other shard has guidance.
-`art_guidance` stays aligned with each sample. Both updates need velocities from the rollout policy. Native SD3, HunyuanVideo
-and Wan ART recipes
-cache scheduler-input velocities during rollout in host memory
+endpoint and reward norms scaled by the input precision. Unresolved groups have
+zero guidance. Scalar SD3 uses the default `restore_zero_signal: false`; these
+rows contribute zero loss, and a globally inactive rollout skips both optimizer
+steps. The HunyuanVideo and Wan recipes use `restore_zero_signal: true`: rows
+with zero guidance regress to their frozen old velocity and both optimizer
+windows run even when every group has zero guidance.
+
+Pairwise winner, loser and tie labels enter the same full-group covariance.
+Only winners and losers receive the resulting direction. If any rank has a
+decisive comparison, tied rows regress toward their frozen old velocity. An entirely
+tied rollout skips both optimizer steps. All modes use the original row
+denominator and agree across ranks on whether to run backward.
+
+Both updates use velocities from the rollout policy. Native SD3, HunyuanVideo
+and Wan ART recipes cache scheduler-input velocities during rollout in host memory
 (`cache_art_old_predictions: true`) and reuse them on both updates. Engines
 without this field use the first update's own detached velocity there and
 replay only the second update's microbatches before the first optimizer step. Training

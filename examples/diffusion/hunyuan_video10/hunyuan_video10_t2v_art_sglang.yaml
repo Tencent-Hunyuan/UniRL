@@ -126,6 +126,7 @@ reward:
       model_id: yuvalkirstain/PickScore_v1
 algorithm:
   _target_: unirl.algorithms.diffusionart.DiffusionART
+  restore_zero_signal: true
   stage_attr: diffusion
   conditions_cls:
     _target_: hydra.utils.get_class

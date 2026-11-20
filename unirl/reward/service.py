@@ -164,7 +164,12 @@ class RewardService(Remote):
             name: torch.tensor(values, dtype=torch.float32)
             for name, values in reward_response.component_rewards.items()
         }
-        scored = replace(frontier, rewards=rewards, component_rewards=component_rewards)
+        scored = replace(
+            frontier,
+            rewards=rewards,
+            component_rewards=component_rewards,
+            has_pairwise_labels=reward_response.has_pairwise_labels,
+        )
         return sample.with_parts([*sample.parts[:-1], scored])
 
     # Broadcast, not scatter: every reward worker holds its own copy of the
