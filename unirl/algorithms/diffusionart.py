@@ -254,13 +254,16 @@ class DiffusionART(StageAlgorithm):
         distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if distributed else 0
         ri = getattr(self.backend, "rank_info", None)
-        local = (part.sample_ids, labels, tuple(x.shape[1:]), ri.dp_rank if ri is not None else 0)
+        input_eps = max(
+            torch.finfo(t.dtype).eps for t in (part.segment.latents, part.advantages, x) if t.is_floating_point()
+        )
+        local = (part.sample_ids, labels, tuple(x.shape[1:]), ri.dp_rank if ri is not None else 0, input_eps)
         metadata = [local]
         if distributed:
             metadata = [None] * dist.get_world_size()
             dist.all_gather_object(metadata, local)
         owners, groups = {}, {}
-        for owner, (ids, names, shape, dp_rank) in enumerate(metadata):
+        for owner, (ids, names, shape, dp_rank, _) in enumerate(metadata):
             if shape != tuple(x.shape[1:]):
                 raise ValueError("DiffusionART DP reduction requires the same dense latent shape on all train ranks.")
             if len(set(ids)) != len(ids):
@@ -284,32 +287,33 @@ class DiffusionART(StageAlgorithm):
             if not split and not rows:
                 continue
             owned = [i for i in rows if owners[part.sample_ids[i]][0] == rank] if split else rows
-            reference = x.new_zeros(x.shape[1:])
-            if split:
-                first = groups[label][0]
-                source = owners[first][0]
-                if rank == source:
-                    reference.copy_(x[part.sample_ids.index(first)])
-                dist.broadcast(reference, src=source)
-            else:
-                reference = x[rows[0]]
-            moments = x.new_zeros((2, x[0].numel() + 2))
-            extrema = x.new_full((2,), -torch.inf)
+            means = x.new_zeros(x[0].numel() + 1, dtype=torch.float64)
             if owned:
-                values, rewards = (x[owned] - reference).flatten(1), adv[owned]
-                moments[0, :-2] = (values * rewards[:, None]).sum(0)
-                moments[1, :-2] = values.sum(0)
-                moments[0, -2:] = torch.stack((rewards.sum(), rewards.new_tensor(len(owned))))
-                extrema = torch.stack((rewards.max(), -rewards.min()))
+                values = x[owned].flatten(1).double()
+                rewards = adv[owned].double()
+                means[:-1] = values.sum(0)
+                means[-1] = rewards.sum()
+            if split:
+                dist.all_reduce(means)
+            means.div_(expected)
+            moments = means.new_zeros(means.numel() + 1)
+            if owned:
+                values.sub_(means[:-1])
+                rewards.sub_(means[-1])
+                moments[:-2] = (values * rewards[:, None]).sum(0)
+                moments[-2] = values.square_().sum()
+                moments[-1] = rewards.square().sum()
             if split:
                 dist.all_reduce(moments)
-                dist.all_reduce(extrema, op=dist.ReduceOp.MAX)
-            count = moments[0, -1]
-            covariance = (moments[0, :-2] - moments[0, -2] / count * moments[1, :-2]) / count
-            covariance = torch.where(extrema[0] == -extrema[1], 0.0, covariance)
-            rms = covariance.double().square().mean().sqrt()
-            active |= rms > 0
-            direction = (covariance.double() / torch.where(rms > 0, rms, 1)).float().reshape(x.shape[1:])
+            numerator = moments[:-2]
+            rms = numerator.square().mean().sqrt()
+            scale = (moments[-2] / numerator.numel() * moments[-1]).sqrt()
+            # Resolve the group covariance against the RMS Cauchy-Schwarz bound at its input precision.
+            storage_eps = max(metadata[owner][4] for owner in group_owners)
+            tolerance = max(storage_eps, (expected + 4) * torch.finfo(numerator.dtype).eps)
+            resolved = rms > tolerance * scale
+            active |= resolved
+            direction = (numerator / torch.where(resolved, rms, torch.inf)).float().reshape(x.shape[1:])
             if rows:
                 guidance[rows] = direction
         part.segment.art_guidance = guidance
