@@ -82,7 +82,9 @@ The included tools are:
 
 - `CalculatorTool`: whitelisted arithmetic AST evaluation.
 - `SandboxTool`: a per-session persistent Python subprocess with timeout and output limits.
-- `SearchTool`: batched Serper or SerpApi search; requires `SERPER_KEY_ID`.
+- `SearchTool`: batched Serper or SerpApi search; requires `SERPER_KEY_ID`. `SEARCH_PROVIDER=you` selects
+  You.com instead: `YDC_API_KEY` uses the keyed API, and without it the keyless endpoint is used
+  (about 100 searches a day, up to 50 results per query).
 - `VisitTool`: Jina page reading with optional OpenAI-compatible summarization.
 
 ## Errors and limits
