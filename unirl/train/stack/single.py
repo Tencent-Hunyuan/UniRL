@@ -333,6 +333,8 @@ class TrainStack(BaseTrainStack):
             cm = maybe_profile_update(self, self.fsdp_backend._rank) if scope_update else nullcontext()
             with cm:
                 update_part = first_update_part(self.algorithm, part) if index == 0 else part
-                results.append(self._run_update(update_part, micros=micros, order=order, training_progress=training_progress))
+                results.append(
+                    self._run_update(update_part, micros=micros, order=order, training_progress=training_progress)
+                )
         results[0] = self._guard_first_update_ratio(results[0])
         return aggregate_update_results(results, include_per_update=True)
