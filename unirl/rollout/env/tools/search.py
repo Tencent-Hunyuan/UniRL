@@ -1,4 +1,4 @@
-"""SearchTool — batched web search via Serper or SerpApi."""
+"""SearchTool — batched web search via Serper, SerpApi, or You.com."""
 
 from __future__ import annotations
 
@@ -12,10 +12,14 @@ from unirl.rollout.env.tools.base import Tool
 
 _SERPER_URL = "https://google.serper.dev/search"
 _SERPAPI_URL = "https://serpapi.com/search"
+_YOU_URL = "https://ydc-index.io/v1/search"
+_YOU_KEYLESS_URL = "https://api.you.com/v1/agents/search"
+_YOU_KEYLESS_MAX_COUNT = 50
+_YOU_USER_AGENT = "youdotcom-integration/Tencent-Hunyuan-UniRL"
 
 
 class SearchTool(Tool):
-    """Google web search via Serper or SerpApi."""
+    """Web search via Serper, SerpApi (Google), or You.com."""
 
     name = "search"
 
@@ -65,6 +69,33 @@ class SearchTool(Tool):
 
     def _fetch_organic(self, query: str) -> list:
         """One provider call -> the list of organic result dicts. Raises on HTTP error."""
+        if self._provider == "you":
+            # keyed API when YDC_API_KEY is set, else the keyless endpoint; mapped to Serper's organic shape
+            headers = {"User-Agent": _YOU_USER_AGENT}
+            ydc_key = os.environ.get("YDC_API_KEY", "")
+            if ydc_key:
+                resp = requests.post(
+                    _YOU_URL,
+                    json={"query": query, "count": self._top_k},
+                    headers={**headers, "X-API-Key": ydc_key},
+                    timeout=self._timeout,
+                )
+            else:
+                resp = requests.get(
+                    _YOU_KEYLESS_URL,
+                    params={"query": query, "count": min(self._top_k, _YOU_KEYLESS_MAX_COUNT)},
+                    headers=headers,
+                    timeout=self._timeout,
+                )
+            resp.raise_for_status()
+            return [
+                {
+                    "title": r.get("title", ""),
+                    "link": r.get("url", ""),
+                    "snippet": " ".join(r.get("snippets") or []) or r.get("description", ""),
+                }
+                for r in resp.json()["results"].get("web") or []
+            ]
         key = os.environ.get("SERPER_KEY_ID", "")
         if self._provider == "serpapi":
             resp = requests.get(
