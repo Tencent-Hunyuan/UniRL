@@ -15,7 +15,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, score_generated_sample
 from unirl.trainer.eval_suites import EvalRewardSuite, build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
@@ -862,7 +862,7 @@ class DiffusionTrainer(BaseTrainer):
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
-                sample = self.reward.score_and_attach(sample)
+                sample = score_generated_sample(self.reward, sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -1068,7 +1068,7 @@ class DiffusionTrainer(BaseTrainer):
             first_scored: Optional[Sample] = None
             with self._reward_phase(preserve_rollout=not sleep_rollout):
                 for name, reward in scorers:
-                    scored = reward.score_and_attach(generated)
+                    scored = score_generated_sample(reward, generated)
                     if first_scored is None:
                         first_scored = scored
                     part = scored.parts[-1]

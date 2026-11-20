@@ -19,7 +19,7 @@ from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, score_generated_sample
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
@@ -229,7 +229,7 @@ class PETrainer(BaseTrainer):
         diff_idx = sample.gen_part_index(DiffusionSamplingParams)
         parts_by_name = {"ar": ar_idx, "diffusion": diff_idx}
 
-        sample = self.reward.score_and_attach(sample)
+        sample = score_generated_sample(self.reward, sample)
         diff_part = sample.parts[diff_idx]
         if diff_part.rewards is not None:
             diff_part.rewards = hydrate(diff_part.rewards)
@@ -317,7 +317,7 @@ class PETrainer(BaseTrainer):
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
             for name, reward in scorers:
-                scored = reward.score_and_attach(generated)
+                scored = score_generated_sample(reward, generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
                     r = hydrate(rewards).to(torch.float32)
