@@ -168,8 +168,13 @@ class DiffusionART(StageAlgorithm):
         cached = part.segment.art_old_predictions
         if cached is not None:
             latents = part.segment.latents
-            if cached.shape != (latents.shape[0], sigmas.numel() - 1, *latents.shape[2:]) or not cached.is_floating_point():
-                raise ValueError("ART rollout velocities must be floating [B,T,*latent], aligned with trajectory states.")
+            if (
+                cached.shape != (latents.shape[0], sigmas.numel() - 1, *latents.shape[2:])
+                or not cached.is_floating_point()
+            ):
+                raise ValueError(
+                    "ART rollout velocities must be floating [B,T,*latent], aligned with trajectory states."
+                )
             if not torch.isfinite(cached).all():
                 raise ValueError("ART rollout velocities must be finite.")
         x = part.segment.latents[:, -1]
@@ -319,7 +324,9 @@ class DiffusionART(StageAlgorithm):
         if (cached is None and not segment.art_self_anchor) or segment.art_guidance is None:
             raise ValueError("DiffusionART requires prepare_segment and full-shard prepare_part before training.")
         expected = (segment.latents.shape[0], steps, *segment.latents.shape[2:])
-        if (cached is not None and cached.shape != expected) or segment.art_guidance.shape != segment.latents[:, -1].shape:
+        if (cached is not None and cached.shape != expected) or segment.art_guidance.shape != segment.latents[
+            :, -1
+        ].shape:
             raise ValueError("DiffusionART guidance/anchor shapes must match [B, *latent] / [B, T, *latent].")
         if self._has_global_guidance is None:
             raise ValueError("DiffusionART requires full-shard prepare_part before training.")
