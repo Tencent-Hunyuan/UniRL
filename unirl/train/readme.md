@@ -144,7 +144,9 @@ use LoRA adapter mode. Formats and export live in
 - **Checkpointing preserves never-updated AdamW params** — export writes a param
   without state (or a never-stepped AdamW) as the step-0 zero state its first
   update would create, so torch and DCP checkpoints stay dense; load drops step-0
-  entries back to lazy init. Torch-format checkpoints that omitted them still load.
+  entries back to lazy init. Legacy torch and DCP checkpoints may omit the entire
+  state for a parameter listed in its optimizer group. DCP still requires every
+  expected moment for parameters with recorded state.
 - **`master_dtype` defaults to `None`, so the optimizer master follows `param_dtype`** —
   a bf16-loaded base then keeps a bf16 LoRA master and the ~1e-6 AdamW steps round
   away (the policy drifts into a degenerate reward-hack). An fp32-loaded model gets an
