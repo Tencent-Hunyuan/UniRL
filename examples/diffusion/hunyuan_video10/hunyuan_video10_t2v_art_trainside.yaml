@@ -127,6 +127,7 @@ data_source:
       prompts_per_rollout: ${batch_size}
 sampling:
   _target_: unirl.types.sampling.DiffusionSamplingParams
+  cache_art_old_predictions: true
   num_inference_steps: 10
   guidance_scale: 1.0
   height: 720
