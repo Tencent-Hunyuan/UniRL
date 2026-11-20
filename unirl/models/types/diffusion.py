@@ -17,6 +17,33 @@ B = TypeVar("B")
 C = TypeVar("C")
 
 
+class RolloutPredictionCache:
+    """Copy each denoiser output into step-major host storage and expose it as [B, T, *latent]."""
+
+    def __init__(self, num_steps: int) -> None:
+        self.num_steps = num_steps
+        self.buffer: Optional[torch.Tensor] = None
+        self.ready: Optional[torch.cuda.Event] = None
+
+    def store(self, step: int, prediction: torch.Tensor) -> None:
+        """Queue a contiguous step copy on the rollout stream at the prediction's native precision."""
+        if self.buffer is None:
+            self.buffer = torch.empty(
+                (self.num_steps, *prediction.shape), device="cpu", dtype=prediction.dtype, pin_memory=prediction.is_cuda
+            )
+        self.buffer[step].copy_(prediction.detach(), non_blocking=prediction.is_cuda)
+        if prediction.is_cuda and step == self.num_steps - 1:
+            self.ready = torch.cuda.current_stream(prediction.device).record_event()
+
+    def finish(self) -> torch.Tensor:
+        """Wait for the final copy before the segment is sliced or transported."""
+        if self.buffer is None:
+            raise RuntimeError("No rollout predictions were recorded.")
+        if self.ready is not None:
+            self.ready.synchronize()
+        return self.buffer.transpose(0, 1)
+
+
 @runtime_checkable
 class DiffusionStep(Protocol[B, C]):
     """A single diffusion transition (per-step math kernel)."""
@@ -117,4 +144,4 @@ def combine_modality_logp(
     return (video_logp * n_video + audio_logp * n_audio) / total
 
 
-__all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult", "combine_modality_logp"]
+__all__ = ["DiffusionStage", "DiffusionStep", "ReplayResult", "RolloutPredictionCache", "combine_modality_logp"]
