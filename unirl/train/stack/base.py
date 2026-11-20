@@ -10,6 +10,7 @@ from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
 from unirl.types.segments import TextSegment
+from unirl.types.segments.latent import LatentSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
@@ -116,7 +117,11 @@ class BaseTrainStack(Remote):
         if isinstance(part.segment, TextSegment):
             part.segment.pad_empty_rows()
         device = self.fsdp_backend._device
-        if part.segment is not None:
+        if isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None:
+            cached = part.segment.art_old_predictions
+            part.segment = replace(part.segment, art_old_predictions=None).to_device(device)
+            part.segment.art_old_predictions = cached.cpu()
+        elif part.segment is not None:
             part.segment = part.segment.to_device(device)
         part.conditions = {k: _move_value(v, device) for k, v in part.conditions.items()}
         if part.advantages is not None:
