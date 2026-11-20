@@ -231,12 +231,12 @@ endpoint and reward norms scaled by the input precision. Unresolved groups
 receive zero guidance and contribute zero loss. A globally zero-guidance rollout
 skips both optimizer steps, including AdamW momentum and weight decay. A locally
 inactive shard still runs backward when any other shard has guidance.
-`art_guidance` stays aligned with each sample. The first update uses its own
-detached velocity as the old prediction. The second update needs velocities
-from before that optimizer step. Native SD3, HunyuanVideo and Wan ART recipes
+`art_guidance` stays aligned with each sample. Both updates need velocities from the rollout policy. Native SD3, HunyuanVideo
+and Wan ART recipes
 cache scheduler-input velocities during rollout in host memory
-(`cache_art_old_predictions: true`). Engines without this field replay only
-the second update's microbatches before the first optimizer step. Training
+(`cache_art_old_predictions: true`) and reuse them on both updates. Engines
+without this field use the first update's own detached velocity there and
+replay only the second update's microbatches before the first optimizer step. Training
 transfers cached velocities to the device per microbatch. Metrics are transferred together
 after the microbatch's backward passes. Skipped disjoint updates do not advance
 the checkpointed optimizer counter.
