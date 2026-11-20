@@ -372,6 +372,11 @@ class StageAlgorithm(Remote, ABC):
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 
+    @property
+    def update_prompt_groups(self) -> tuple[int, int | None] | None:
+        """Optional (group size, ancestor depth) for prompt-balanced two-update membership."""
+        return None
+
     def validate_part(self, part: "Part") -> None:
         """Optional full-shard preflight before anchor slicing or model execution."""
         return None

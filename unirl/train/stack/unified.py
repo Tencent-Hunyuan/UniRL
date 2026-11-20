@@ -210,6 +210,8 @@ class UnifiedModelTrainStack(BaseTrainStack):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
+            prompt_groups=self.image_algorithm.update_prompt_groups,
+            dp_rank=self.rank_info.dp_rank if self.rank_info is not None else 0,
         )
 
         from unirl.utils.profiling import profile_mode
