@@ -355,6 +355,7 @@ class StageAlgorithm(Remote, ABC):
     required_num_updates: Optional[int] = None
     requires_backend: bool = False
     requires_advantages: bool = True
+    first_update_self_anchor: bool = False
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 

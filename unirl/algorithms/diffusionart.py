@@ -65,6 +65,7 @@ class DiffusionART(StageAlgorithm):
     supports_multi_update = True
     required_num_updates = 2
     requires_backend = True
+    first_update_self_anchor = True
     recomputes_anchor = True
     anchor_fields = ("art_old_predictions",)
 
@@ -90,8 +91,8 @@ class DiffusionART(StageAlgorithm):
             raise ValueError("DiffusionART requires FlowSDEStrategy for its scheduler-reference mask.")
         if params.eta != 0 or params.guidance_scale != 1:
             raise ValueError("DiffusionART requires ODE sampling eta=0 and guidance_scale=1.")
-        if params.samples_per_prompt < 2:
-            raise ValueError("DiffusionART requires samples_per_prompt >= 2 for full-group covariance.")
+        if params.samples_per_prompt < 2 or params.samples_per_prompt % 2:
+            raise ValueError("DiffusionART requires an even samples_per_prompt >= 2 for two prompt-balanced updates.")
         if not math.isfinite(reference_nu) or reference_nu <= 0:
             raise ValueError("DiffusionART reference_nu must be finite and positive.")
         if not math.isfinite(kl_mask_threshold) or kl_mask_threshold < 0:
@@ -108,6 +109,10 @@ class DiffusionART(StageAlgorithm):
         self.params, self.backend, self.conditions_cls = params, backend, conditions_cls
         self.config = DiffusionARTConfig(reference_nu, kl_mask_threshold, timestep_chunk_size, group_layer)
         self._has_global_guidance = None
+
+    @property
+    def update_prompt_groups(self) -> tuple[int, Optional[int]]:
+        return self.params.samples_per_prompt, self.config.group_layer
 
     def _validate_segment_shape(self, segment):
         """Check dense ``[B, T+1, *latent]`` metadata without reading device tensor values."""
@@ -135,13 +140,16 @@ class DiffusionART(StageAlgorithm):
             self._validate_local_part(part)
         except (ValueError, TypeError) as exc:
             error = str(exc)
-        errors = [error]
+        cached = isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None
+        reports = [(error, cached)]
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            errors = [None] * dist.get_world_size()
-            dist.all_gather_object(errors, error)
-        for rank, message in enumerate(errors):
+            reports = [None] * dist.get_world_size()
+            dist.all_gather_object(reports, (error, cached))
+        for rank, (message, _) in enumerate(reports):
             if message is not None:
                 raise ValueError(f"DiffusionART shard {rank}: {message}")
+        if any(has_cache != cached for _, has_cache in reports):
+            raise ValueError("DiffusionART rollout velocity cache must be present on every train rank or none.")
 
     def _validate_local_part(self, part: Part) -> None:
         """Collect local contract failures before the rank-synchronous preflight boundary."""
@@ -157,6 +165,13 @@ class DiffusionART(StageAlgorithm):
             raise ValueError(
                 "DiffusionART requires all T+1 trajectory states; configure dense trajectory storage at eta=0."
             )
+        cached = part.segment.art_old_predictions
+        if cached is not None:
+            latents = part.segment.latents
+            if cached.shape != (latents.shape[0], sigmas.numel() - 1, *latents.shape[2:]) or not cached.is_floating_point():
+                raise ValueError("ART rollout velocities must be floating [B,T,*latent], aligned with trajectory states.")
+            if not torch.isfinite(cached).all():
+                raise ValueError("ART rollout velocities must be finite.")
         x = part.segment.latents[:, -1]
         if part.advantages is None or part.advantages.shape != (x.shape[0],) or len(part.sample_ids) != x.shape[0]:
             raise ValueError("DiffusionART requires scalar advantages and sample_ids aligned with every endpoint.")
@@ -300,10 +315,11 @@ class DiffusionART(StageAlgorithm):
 
     def compute_loss_and_backward(self, *, conditions, segment, advantages, training_progress, loss_scale):
         steps = self._validate_segment_shape(segment)
-        if segment.art_old_predictions is None or segment.art_guidance is None:
+        cached = segment.art_old_predictions
+        if (cached is None and not segment.art_self_anchor) or segment.art_guidance is None:
             raise ValueError("DiffusionART requires prepare_segment and full-shard prepare_part before training.")
         expected = (segment.latents.shape[0], steps, *segment.latents.shape[2:])
-        if segment.art_old_predictions.shape != expected or segment.art_guidance.shape != segment.latents[:, -1].shape:
+        if (cached is not None and cached.shape != expected) or segment.art_guidance.shape != segment.latents[:, -1].shape:
             raise ValueError("DiffusionART guidance/anchor shapes must match [B, *latent] / [B, T, *latent].")
         if self._has_global_guidance is None:
             raise ValueError("DiffusionART requires full-shard prepare_part before training.")
@@ -315,7 +331,7 @@ class DiffusionART(StageAlgorithm):
                 has_backward=False,
             )
         conditions = typed_conditions(conditions, self.conditions_cls)
-        old_predictions = segment.art_old_predictions.to(device=segment.latents.device, dtype=torch.float32)
+        old_predictions = None if segment.art_self_anchor else cached.to(device=segment.latents.device)
         metrics, total = {}, segment.latents.new_zeros((), dtype=torch.float32)
         with self._prediction_mode():
             for start in range(0, steps, self.config.timestep_chunk_size):
@@ -324,7 +340,7 @@ class DiffusionART(StageAlgorithm):
                     new = self._predict(conditions, segment, step)
                     loss, diagnostics = art_velocity_loss(
                         new,
-                        old_predictions[:, step],
+                        new.detach() if old_predictions is None else old_predictions[:, step],
                         segment.art_guidance,
                         sigma=segment.sigmas[step].to(new.device).float(),
                         sigma_next=segment.sigmas[step + 1].to(new.device).float(),

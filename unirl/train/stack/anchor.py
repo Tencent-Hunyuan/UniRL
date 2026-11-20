@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -9,6 +10,13 @@ import torch
 from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner import Plan, arranged_slice, restore_row_order
 from unirl.types.sample import Part
+
+
+def first_update_part(algorithm: StageAlgorithm, part: Part) -> Part:
+    """Reuse the current prediction as the first ART anchor without gathering cached velocities."""
+    if not algorithm.first_update_self_anchor:
+        return part
+    return replace(part, segment=replace(part.segment, art_old_predictions=None, art_self_anchor=True))
 
 
 def validate_anchor_contract(algorithm: StageAlgorithm) -> None:
@@ -26,6 +34,23 @@ def prepare_segment_anchors(
     """Freeze declared anchors over the plan's micros, before any update, and write them back onto ``part``."""
     algorithm.validate_part(part)
     if part.segment is None:
+        return
+    if algorithm.first_update_self_anchor:
+        if len(plan) != 2:
+            raise ValueError("ART requires two disjoint update windows.")
+        if part.segment.art_old_predictions is not None:
+            return
+        for start, end in plan[1]:
+            micro = arranged_slice(part, order, start, end)
+            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
+            predictions = micro.segment.art_old_predictions
+            if start == plan[1][0][0]:
+                anchors = predictions.new_zeros((part.batch_size, *predictions.shape[1:]))
+            if order is None:
+                anchors[start:end] = predictions
+            else:
+                anchors.index_copy_(0, order[start:end].to(anchors.device), predictions)
+        part.segment.art_old_predictions = anchors
         return
     micro_slices = [r for update in plan for r in update]
     if not algorithm.recomputes_anchor or len(micro_slices) == 1:
