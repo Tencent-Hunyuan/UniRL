@@ -88,7 +88,7 @@ ar:
       use_torch_compile: false
     optimizer_cfg:
       _target_: unirl.train.backend.base.OptimizerConfig
-      learning_rate: 1.0e-4
+      learning_rate: 5.0e-6      # as in pe_sglang_lora_pickscore; 1.0e-4 collapses the N rewrites of a prompt into one
       adam_beta1: 0.9
       adam_beta2: 0.999
       adam_epsilon: 1.0e-8
