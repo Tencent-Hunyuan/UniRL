@@ -205,7 +205,7 @@ TensorWeightSync):
 | `enable_lora` | `false` | TensorWeightSync pushes full dense weights; a LoRA pool would be the wrong receive path. |
 | `cuda_graph_max_bs_decode` | `16` | CUDA graph stays on (`disable_cuda_graph: false`); SGLang otherwise auto-tunes the capture cap from GPU memory and TP size, often reserving much larger buffers that fight the weight push. |
 | `skip_server_warmup` | `true` | Skip SRT startup warmup on the 4B colocate path; this knob does not control `wake_up()`. |
-| `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes. |
+| `attention_backend` | `triton` | Matches the in-tree 4B full-FT recipes; SGLang's off-Hopper default skews log-probs on 0.5.19 (see Gotchas). |
 
 **Larger / MoE colocate:** memory and graph settings are recipe-specific
 (`mem_fraction_static` ranges from `0.15` to `0.5`; graph caps include `64` and
@@ -233,6 +233,12 @@ enabled, which UniRL's rollout backend does not do.
 
 ## Gotchas
 
+- **On 0.5.19, SGLang's default `flashinfer` backend silently skews log-probs off
+  Hopper.** With `attention_backend` unset, SGLang picks `fa3` on SM90 and
+  `flashinfer` elsewhere; on 0.5.19 `flashinfer` returns prompt and rollout
+  log-probs about 10x the bf16 noise floor against HF (#676), which skews the GRPO
+  ratio and KL. Set `attention_backend: triton` as the 4B/9B and text MoE recipes
+  do, and re-check when the pin moves past 0.5.19.
 - **SGLang diffusion tensor LoRA accepts standard PEFT LoRA only.** A global
   `lora_alpha` is supported; rsLoRA, DoRA, per-layer alpha patterns, and PEFT
   auxiliary features fail closed. `use_lora=true` selects adapter-only sync for
