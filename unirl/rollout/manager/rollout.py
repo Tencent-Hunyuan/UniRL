@@ -28,9 +28,13 @@ class RolloutManager:
         capacities: Sequence[int],
         group_size: int,
         filter_fn: RolloutFilter = identity,
+        affinity_policy: str = "least_loaded",
+        dispatch_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._rollout = rollout
-        self._pool = RolloutPool(launchers, capacities)
+        pool_kwargs = dict(dispatch_kwargs or {})
+        pool_kwargs.setdefault("affinity_policy", affinity_policy)
+        self._pool = RolloutPool(launchers, capacities, **pool_kwargs)
         self._group_size = int(group_size)
         self._pending = PendingGroups(group_size)
         self._complete = CompleteGroups()
@@ -149,6 +153,11 @@ class RolloutManager:
         self._raise_if_failed()
         inflight_count, completed_count = self._pool.counts
         return inflight_count, completed_count + self._complete.group_count
+
+    def dispatch_stats(self, *, reset: bool = False) -> Dict[str, float]:
+        """Return rollout-pool sibling dispersion and co-location statistics."""
+        self._raise_if_failed()
+        return self._pool.dispatch_stats(reset=reset)
 
     @property
     def empty(self) -> bool:
