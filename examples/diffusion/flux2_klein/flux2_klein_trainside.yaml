@@ -141,8 +141,9 @@ rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs: [diffusion]
   # Klein 9B + VAE + Qwen3 text encoder are heavy; chunk the rollout forward to
-  # bound peak memory (VAE decode on 32-ch latents). 16 = samples_per_prompt so
-  # groups never straddle a chunk boundary (matters with init_same_noise).
+  # bound peak memory (VAE decode on 32-ch latents). Shared x_T under
+  # init_same_noise is seeded per (seed, group id), not per chunk, so this value
+  # need not divide samples_per_prompt.
   forward_batch_size: 16
 
 reward:
