@@ -105,7 +105,15 @@ class AROPD(StageAlgorithm):
             teacher_logp = self.stage.replay(
                 typed_conds, segment=segment, temperature=self.sampling_temperature
             )  # [total_tokens]
-        segment.teacher_log_probs = teacher_logp.detach().cpu()
+        teacher_logp = teacher_logp.detach().cpu()
+        if teacher_logp.shape != segment.tokens.shape:
+            raise RuntimeError(
+                f"AROPD.prepare_segment: teacher replay returned {tuple(teacher_logp.shape)} log-probs for "
+                f"{tuple(segment.tokens.shape)} response tokens; the teacher anchor is misaligned."
+            )
+        if not bool(torch.isfinite(teacher_logp).all()):
+            raise RuntimeError("AROPD.prepare_segment: the teacher replay returned non-finite log-probs.")
+        segment.teacher_log_probs = teacher_logp
 
     def compute_loss_and_backward(
         self,

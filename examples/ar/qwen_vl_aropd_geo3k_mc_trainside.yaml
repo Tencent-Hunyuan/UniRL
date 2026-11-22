@@ -1,0 +1,133 @@
+# @package _global_
+# AR AROPD — sampled-token on-policy distillation for a VLM: Qwen2.5-VL-7B-Instruct
+# LoRA student with a same-backbone frozen-LoRA teacher, Geometry3K-MC (one image
+# per prompt) — v2 trainer (ARTrainer), trainside rollout (no serving engine), 8 GPU.
+#
+# The VLM counterpart of qwen3_aropd_4b_base_dapo_trainside.yaml (#368 A6, first
+# step): same AROPD estimator and scope locks (single teacher, synchronous, one
+# sample per prompt, one optimizer update per rollout, no reward). The student
+# rollout, the teacher anchor replay and the student replay all see the same
+# pixel_values / image_grid_thw and M-RoPE position ids; QwenVLARStage.replay
+# raises on prompt/response row skew or on image tokens, grid and pixels that
+# disagree, and AROPD raises on a misaligned or non-finite teacher anchor.
+#
+# Teacher: the frozen LoRA adapter named `teacher` (backend.lora_cfg.frozen_adapters),
+# same backbone and therefore the same tokenizer/vocabulary as the student. Build
+# one with examples/sft/qwen_vl_sft_lora.yaml (q/k/v/o, plain LoRA) and point
+# TEACHER_LORA_PATH at its adapter dir. The vision tower is frozen and shared.
+#
+# Data prep (one-time):
+#   python datasets/geo3k_mc/prepare_geo3k_mc.py --out-dir data/geo3k_mc
+#
+# Run (8 GPU; shrink num_devices + add +devices_per_node for smaller nodes):
+#   TEACHER_LORA_PATH=<teacher-adapter-dir> DATA_PATH=data/geo3k_mc/train.jsonl \
+#   python -m unirl.train_ar --config-name=ar/qwen_vl_aropd_geo3k_mc_trainside num_devices=8
+
+num_devices: 8
+batch_size: 16 # prompts_per_rollout
+num_rollouts: 100
+eval_interval: 0 # no reward -> no eval scoring (ARTrainer rejects eval_interval>0)
+
+logging:
+  report_to_wandb: true
+  project_name: unirl-aropd
+  run_name: aropd_qwen2.5-vl-7b_geo3k_mc_trainside
+  entity: ${oc.env:WANDB_ENTITY,null}
+  tags: [aropd, opd, distillation, qwen-vl, 7b, geo3k-mc, trainside, v2]
+
+bundle:
+  _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+  config:
+    _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+    pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+    # fp32 storage; bf16 compute via FSDP param_dtype; replay log-softmax is always fp32.
+    model_precision: fp32
+    # sdpa: with micro_batch_size 1 every replay takes the padded path, so a
+    # FlashAttention build buys nothing here and sdpa is portable.
+    attn_implementation: sdpa
+    freeze_vision_tower: true
+    use_gradient_checkpointing: true
+
+pipeline:
+  _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+  max_prompt_length: 2048
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Qwen2_5_VLDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    cpu_offload: false
+    mixed_precision: true
+    fsdp_mode: full
+    reshard_after_forward: true
+    forward_prefetch: false
+    activation_checkpointing: false # bundle already enables HF gradient checkpointing
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 0.0
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: 1000
+  # Student = the trainable `default` adapter; teacher = the frozen adapter
+  # `teacher`, injected pre-FSDP-wrap from TEACHER_LORA_PATH.
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 16
+    alpha: 32
+    dropout: 0.0
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules: [q_proj, k_proj, v_proj, o_proj]
+    frozen_adapters:
+      - name: teacher
+        path: ${oc.env:TEACHER_LORA_PATH}
+
+rollout:
+  # The student (`default`) adapter samples; AROPD replays the same segments,
+  # with the same image conditions, under the frozen teacher adapter.
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [ar]
+  forward_batch_size: 1
+
+algorithm:
+  _target_: unirl.algorithms.aropd.AROPD
+  stage_attr: ar
+  teacher: teacher # must match backend.lora_cfg.frozen_adapters[].name
+  sampling_temperature: ${sampling.temperature} # must equal the rollout temperature
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1 # supports_multi_update=False
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: ${oc.env:DATA_PATH} # local jsonl; build with datasets/geo3k_mc/prepare_geo3k_mc.py
+      eval_data_path: ${oc.env:EVAL_DATA_PATH,${oc.env:DATA_PATH}}
+      seed: 42
+    algorithm:
+      prompts_per_rollout: 16
+
+sampling:
+  _target_: unirl.types.sampling.ARSamplingParams
+  samples_per_prompt: 1
+  temperature: 0.7
+  top_p: 1.0
+  top_k: 0
+  max_new_tokens: 512
