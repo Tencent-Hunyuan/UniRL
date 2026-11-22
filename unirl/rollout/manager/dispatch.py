@@ -17,6 +17,19 @@ Launch = Callable[["Sample"], Any]
 
 
 @dataclass(frozen=True)
+class PoolSnapshot:
+    """Local dispatch state and lifetime event counts; see ../README.md."""
+
+    queued_tasks: int
+    launch_reserved_tasks: int
+    running_tasks: int
+    completed_unrouted_tasks: int
+    capacity_tasks: int
+    launched_tasks_total: int
+    completed_tasks_total: int
+
+
+@dataclass(frozen=True)
 class _PendingUnit:
     sequence: int
     launcher: int
@@ -50,6 +63,8 @@ class RolloutPool:
         self._completed: Deque[_PendingUnit] = deque()
         self._reserved = [0] * len(self._launchers)
         self._next_sequence = 0
+        self._launched_tasks_total = 0
+        self._completed_tasks_total = 0
         self._paused = True
         self._closed = False
         self._failure: Optional[BaseException] = None
@@ -128,6 +143,20 @@ class RolloutPool:
             inflight = len(self._queue) + len(self._running) + sum(self._reserved)
             return inflight, len(self._completed)
 
+    def snapshot(self) -> PoolSnapshot:
+        """Copy dispatch state without probing handles or advancing work."""
+        with self._condition:
+            self._raise_if_unavailable()
+            return PoolSnapshot(
+                queued_tasks=len(self._queue),
+                launch_reserved_tasks=sum(self._reserved),
+                running_tasks=len(self._running),
+                completed_unrouted_tasks=len(self._completed),
+                capacity_tasks=sum(self._capacities),
+                launched_tasks_total=self._launched_tasks_total,
+                completed_tasks_total=self._completed_tasks_total,
+            )
+
     def close(self) -> None:
         with self._condition:
             if self._closed:
@@ -189,6 +218,7 @@ class RolloutPool:
                         continue
                     self._running.remove(unit)
                     self._completed.append(unit)
+                    self._completed_tasks_total += 1
                 self._condition.notify_all()
 
     def _plan_launches(self) -> List[tuple[int, int, "Sample"]]:
@@ -226,6 +256,7 @@ class RolloutPool:
             for unit in launched:
                 self._reserved[unit.launcher] -= 1
                 self._running.append(unit)
+                self._launched_tasks_total += 1
             if failure is not None:
                 remaining = plan[len(launched) :]
                 for _, index, _ in remaining:
@@ -276,4 +307,4 @@ def validate_worker_inflight(
         )
 
 
-__all__ = ["RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]
+__all__ = ["PoolSnapshot", "RolloutPool", "required_worker_concurrency", "validate_worker_inflight"]
