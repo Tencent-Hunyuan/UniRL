@@ -1,0 +1,146 @@
+# @package _global_
+# Cosmos3-Nano text-to-image FlowGRPO + PickScore with trainside rollout (LoRA on the generation stream).
+# Settings follow the Miles Nano T2I recipe
+# (github.com/radixark/miles_diffusion scripts/run_diffusion_grpo_cosmos3_pickscore_t2i_4gpu.py):
+# 832x480 single frame, 16 steps, guidance 4.0, eta 0.7, two SDE steps per rollout drawn from steps 8-11.
+# Validated on 4x H100 80GB with torch 2.13 / cu130; the bf16 base is not validated on H20.
+# Precision and schedule notes: unirl/models/cosmos3/README.md.
+#
+# Launch (needs the `cosmos3` extra):
+#   PRETRAINED_MODEL=/path/to/Cosmos3-Nano \
+#   python -m unirl.train_diffusion --config-name diffusion/cosmos3/cosmos3_nano_trainside
+
+num_devices: 4
+batch_size: 48                # prompts_per_rollout
+adv_use_global_std: true
+num_rollouts: 10000
+
+logging:
+  report_to_wandb: false
+  project_name: unirl
+  run_name: cosmos3-nano-grpo
+  entity: null
+  tags: [cosmos3, nano, t2i, trainside, lora]
+
+bundle:
+  _target_: unirl.models.cosmos3.bundle.Cosmos3Bundle.from_config
+  config:
+    _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
+    # The frozen base stays in the checkpoint's bf16; only the LoRA masters are fp32 (backend.fsdp_cfg).
+    model_precision: bf16
+    master_precision: bf16
+    vae_precision: fp32
+
+pipeline:
+  _target_: unirl.models.cosmos3.pipeline.Cosmos3Pipeline
+  shift: 3.0
+  trajectory_precision: bf16
+  logprob_precision: fp32
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+
+backend:
+  _target_: unirl.train.backend.fsdp.FSDPBackend
+  block_class_names: ["Cosmos3VLTextMoTDecoderLayer"]
+  trainable_attr: transformer
+  fsdp_cfg:
+    _target_: unirl.train.configs.FSDPConfig
+    param_dtype: bf16
+    master_dtype: fp32
+    cpu_offload: false
+    mixed_precision: true
+    # No root shard group, which would gather a bf16 copy of the fp32 `time_embedder`.
+    # Every LoRA parameter sits inside a decoder layer.
+    root_wrap: false
+    # Each rank keeps the full ~30 GB bf16 model, so the 36 forwards per sample do not re-gather weights.
+    fsdp_mode: no_shard
+    activation_checkpointing: false
+    use_torch_compile: false
+  optimizer_cfg:
+    _target_: unirl.train.backend.base.OptimizerConfig
+    learning_rate: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_epsilon: 1.0e-8
+    weight_decay: 1.0e-4
+  scheduler_cfg:
+    _target_: unirl.train.backend.base.LrSchedulerConfig
+    type: constant
+    warmup_steps: 0
+    total_steps: ${num_rollouts}
+  lora_cfg:
+    _target_: unirl.train.configs.LoraConfig
+    rank: 64
+    alpha: 128
+    dropout: 0.0
+    bias: none
+    task_type: FEATURE_EXTRACTION
+    # Generation-stream attention only; the understanding stream uses to_q / to_k / to_v / to_out.
+    target_modules:
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+
+rollout:
+  _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
+  stage_attrs: [diffusion]
+  # The transformer takes one packed sequence per call.
+  forward_batch_size: 1
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+      batch_size: 8
+      device: auto
+      processor_id: laion/CLIP-ViT-H-14-laion2B-s32B-b79K
+      model_id: yuvalkirstain/PickScore_v1
+
+algorithm:
+  _target_: unirl.algorithms.flowgrpo.FlowGRPO
+  stage_attr: diffusion
+  clip_range: 1.0e-3
+  clip_schedule: constant
+  conditions_cls:
+    _target_: hydra.utils.get_class
+    path: unirl.models.cosmos3.conditions.Cosmos3Conditions
+  params: ${sampling}
+
+stack:
+  _target_: unirl.train.stack.TrainStack
+  micro_batch_size: 1
+  max_grad_norm: 1.0
+  num_updates_per_batch: 1
+  shuffle_updates: true
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/pickscore/train.txt
+      eval_data_path: datasets/pickscore/test.txt
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+sampling:
+  _target_: unirl.types.sampling.DiffusionSamplingParams
+  num_inference_steps: 16
+  guidance_scale: 4.0
+  height: 480
+  width: 832
+  num_frames: 1
+  eta: 0.7
+  samples_per_prompt: 16
+  seed: 42
+  init_same_noise: false
+  scheduler:
+    _target_: unirl.sde.index_schedule.AllSDEScheduler
+    num_timesteps: ${..num_inference_steps}
+    num_sde_steps: 2
+    timestep_fraction: [0.5, 0.75]   # steps 8-11 of 16, sigma 0.75 to 0.58 at shift 3
