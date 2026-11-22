@@ -106,8 +106,8 @@ The current trainer surface is:
 | `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Colocated barrier multi-turn tool use. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
-one slab-wide launcher and keep completed batches intact; the agentic trainer
-provides one launcher per engine slot and lets the manager assemble root groups.
+one launcher per engine slot and submit individual prompt trees; the agentic
+trainer submits individual trajectories and lets the manager assemble root groups.
 `weight_sync_interval` counts consumed rollout batches between publications;
 `stack.num_updates_per_batch` counts optimizer updates within each batch. They
 are independent; `(weight_sync_interval - 1) * num_updates_per_batch` is the
@@ -227,6 +227,28 @@ ready buffer up to a whole batch finishes, and the rest is resubmitted after
 publication. **Hard boundaries** — every `eval_interval`, every
 `save_interval`, and the final rollout — admit no carry, and each raises if
 work remains after quiescing.
+
+### Async manager metrics
+
+With W&B enabled, async AR/DiT emits `rollout/async/*` on the one-based
+`rollout/step` axis. Agentic does not emit these keys. Manager tasks map to prompts;
+groups retain their logical unit. See [manager semantics](../rollout/README.md#manager-telemetry).
+
+| Snapshot | Sampling point |
+|---|---|
+| `pre_sync` | After training, before any due quiesce/publication. |
+| `step_end` | After required publication/carry handling and any final-empty check. Metrics are logged before eval/save. |
+
+| Keys relative to `rollout/async/` | Value / unit |
+|---|---|
+| `capacity_prompts` | `pool.capacity_tasks`, in prompts. |
+| `pre_sync_{queued,launch_reserved,running,completed_unrouted}_prompts`, `step_end_queued_prompts` | Pool state, in prompts. |
+| `{pre_sync,step_end}_ready_groups` | Ready logical groups. |
+| `{pre_sync,step_end}_max_ready_lag_updates` | `train_version - oldest_ready_output_version`, in optimizer updates. Omitted without a ready version. `pre_sync` can exceed the budget before filtering against the new version. |
+| `pre_sync_slot_occupancy` | `(running + reserved) / capacity`. Instantaneous scheduler occupancy, not GPU utilization. |
+| `{launched,completed,carried,finished}_prompts_delta`, `dropped_groups_delta` | Manager event deltas since the previous successful drain. May include prefetched work. |
+| `admitted_prompts_delta`, `carry_resubmitted_prompts_delta` | This step's successful new admissions and post-publication carry resubmissions, in prompts. |
+| `admission_{collect,refill}_{capacity,freshness,boundary}_headroom_prompts` | Non-negative capacity, batch-based freshness, and eval/save/final budgets, in prompts. Their minimum is admitted. Sampled before collection and at refill. |
 
 ### Variant constraints
 

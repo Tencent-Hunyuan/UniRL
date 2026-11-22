@@ -126,6 +126,14 @@ class CompleteGroups:
     def group_count(self) -> int:
         return sum(chunk.group_count for chunk in self._chunks)
 
+    @property
+    def oldest_output_version(self) -> Optional[int]:
+        """Lowest generated-Part version in the ready buffer, or None if no generated Parts exist."""
+        return min(
+            (part.output_version for chunk in self._chunks for sample in chunk.samples for part in sample.gen_parts()),
+            default=None,
+        )
+
     def __len__(self) -> int:
         return len(self._chunks)
 
