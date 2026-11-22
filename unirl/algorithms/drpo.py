@@ -20,6 +20,7 @@ from .base import (
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
+    zero_loss_backward,
 )
 from .grpo import GRPO
 
@@ -65,6 +66,8 @@ def _drpo_loss(
     ratio, log_diff, quadratic_penalty, adaptive_eps = select_active_tokens(
         mask, ratio, log_diff, quadratic_penalty, adaptive_eps
     )
+    if ratio.numel() == 0:
+        return pg_losses, {}
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -164,6 +167,8 @@ class DRPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         loss = aggregate_token_losses(
             loss_per_elem,
             lengths=segment.lengths,
