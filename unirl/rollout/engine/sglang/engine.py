@@ -158,10 +158,7 @@ class SGLangRolloutEngine(BaseRolloutEngine):
                 cuda_visible_devices=self._tp_visible_devices,
             )
 
-        self._weight_sync = WeightSync(
-            self._backend,
-            uses_lora=bool(engine_kwargs.get("enable_lora", False)),
-        )
+        self._weight_sync = WeightSync(self._backend)
 
         self._version = 0
 
@@ -228,8 +225,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         self._backend.release_memory(tags=release_tags)
         self._is_offloaded = True
         self._weights_onloaded_for_sync = False
-        if release_tags is None or "weights" in release_tags:
-            self._weight_sync.mark_weights_released()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -372,13 +367,6 @@ class SGLangRolloutEngine(BaseRolloutEngine):
         if not self._is_tp_zero:
             return
         self._weight_sync.set_lora_from_tensors(adapter_name, lora_tensors, peft_config=peft_config)
-
-    @property
-    def lora_dirty(self) -> bool:
-        """True when LoRA is in use but the adapter must be (re)pushed before generate."""
-        if not self._is_tp_zero or self._weight_sync is None:
-            return False
-        return self._weight_sync.lora_dirty
 
     def update_weights_from_checkpoint_engine_ipc(
         self,
