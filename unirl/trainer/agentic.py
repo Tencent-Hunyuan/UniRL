@@ -292,6 +292,7 @@ class AgenticTrainer(BaseTrainer):
 
     def _group_advantages(self, groups: List[List[Sample]], rewards: torch.Tensor) -> torch.Tensor:
         advantages = torch.zeros_like(rewards, dtype=torch.float32)
+        rewards = rewards.to(torch.float64)
         offset = 0
         for group in groups:
             end = offset + len(group)
