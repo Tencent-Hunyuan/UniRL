@@ -1,10 +1,9 @@
-# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image generation
+# Cosmos3 (NVIDIA omnimodal world model) — SFT and text-to-image RL
 
 > **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
-> `Cosmos3Pipeline.generate` samples single-frame text-to-image. Trajectory replay is not
-> implemented: `Cosmos3DiffusionStage.replay` and `predict_noise_at_step` raise, so no RL
-> recipe ships yet.
+> `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the single-frame
+> text-to-image FlowGRPO recipe `examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml`.
 
 ## What it is
 
@@ -40,16 +39,17 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
 
 - **Uniform `master_precision` storage**: upcasting only trainable params would mix
   bf16/fp32 inside every MoT layer (the und stream is frozen), which FSDP2 rejects.
-- **The shipped recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
+- **The SFT recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
   `mixed_precision: false`): torch 2.10/cu128 on H20 rejects every bf16 `cublasGemmEx`,
   and `bundle.py` scopes further cuBLAS workarounds (contiguous mRoPE, 2-D-GEMM
   DomainAwareLinear, non-MATH SDPA, frozen-DTensor `full_tensor()` linears) to that
   runtime via `_needs_h20_cu128_workaround()`. Newer CUDA stacks may switch back to
   fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
-  (`_keep_in_fp32_modules = ["time_embedder"]`). The shipped full-fp32 recipes satisfy
-  this trivially. A future bf16 mixed-precision recipe must land an fp32 exemption for it
-  (e.g. its own FSDP group with an fp32 gather/reduce policy) together with that recipe.
+  (`_keep_in_fp32_modules = ["time_embedder"]`). The full-fp32 SFT recipes satisfy
+  this trivially. The bf16 RL recipe `cosmos3_nano_trainside` keeps it out of every FSDP
+  group with `root_wrap: false` (see Gotchas); it is validated on H100 with torch 2.13/cu130,
+  not on H20. Any other bf16 mixed-precision recipe needs its own fp32 exemption.
   Without one the outcome depends on the diffusers version: 0.39 casts only *after* the
   embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul;
   0.40 casts the sinusoid to the embedder's parameter dtype first, so the embedder
@@ -62,7 +62,7 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   tolerates. Do not "align" training to it: training σ are logit-normal draws that
   never land on the inference grid anyway, so flooring only quantizes the signal and
   biases the σ↔conditioning map by an average of −0.5 timestep units.
-- **`meta_init_transformer: true`** (both recipes) builds the 16B transformer on the meta
+- **`meta_init_transformer: true`** (both SFT recipes) builds the 16B transformer on the meta
   device and lets the backend load sharded weights after wrapping — the eager path would
   put the full ~64 GB fp32 model on every rank before sharding. The sharded loader reads
   local `*.safetensors` only, so the shared meta-init resolver downloads and validates
@@ -109,6 +109,11 @@ from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `s
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
 stored in `trajectory_precision` between steps.
 
+`Cosmos3DiffusionStage.replay` recomputes the SDE log-probs with gradients, one sample and
+one step per packed forward (two with CFG), feeding the stored latents back through the
+same `step_with_logp` call as rollout. `predict_noise_at_step` is the same forward without
+the solver step.
+
 ## Gotchas
 
 - **CFG runs two transformer calls per step, not one batched call.** The cond and uncond
@@ -137,6 +142,11 @@ stored in `trajectory_precision` between steps.
   `Cosmos3DiffusionStage.diffuse` raises if the stored dtype is not fp32. That check reads
   the stored parameter, so it does not catch an FSDP `mp_policy` that gathers the embedder
   in bf16 for the forward (see Precision & loading).
+- **The RL recipe needs `root_wrap: false`.**
+  `time_embedder`, `proj_in` and `proj_out` live outside the decoder layers; a root shard
+  group would gather them in `param_dtype` (bf16) and the timestep MLP would run in bf16
+  silently. Every LoRA target (`add_{q,k,v}_proj`, `to_add_out`) is inside a
+  `Cosmos3VLTextMoTDecoderLayer`, so no trainable parameter is left outside the wrap.
 - The und-param regexes are anchored with trailing `\.` on purpose: `to_out` must not
   swallow `to_add_out`, and `norm.` must not swallow `norm_moe_gen.`. Touch
   `_UND_PARAM_PATTERNS` only with the freeze-count log line as your regression check.
