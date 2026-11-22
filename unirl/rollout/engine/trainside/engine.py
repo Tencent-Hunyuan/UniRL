@@ -83,11 +83,11 @@ class TrainsideRolloutEngine(BaseRolloutEngine):
                 rng_scope = torch.random.fork_rng(devices=devices) if self.seed is not None else nullcontext()
                 with torch.no_grad(), rng_scope:
                     if self.seed is not None:
-                        rollout_ids = {row["rollout_id"] for row in sample.parts[0].metadata}
-                        if len(rollout_ids) != 1:
-                            raise ValueError("Seeded trainside generation requires one rollout_id per request.")
+                        rng_ids = {row.get("rng_id", row["rollout_id"]) for row in sample.parts[0].metadata}
+                        if len(rng_ids) != 1:
+                            raise ValueError("Seeded trainside generation requires one rng_id per request.")
                         rank = self.rank_info
-                        seed = self.seed + rollout_ids.pop() * rank.dp_size + rank.dp_rank
+                        seed = self.seed + rng_ids.pop() * rank.dp_size + rank.dp_rank
                         torch.random.default_generator.manual_seed(seed)
                         if devices:
                             torch.cuda.manual_seed(seed)

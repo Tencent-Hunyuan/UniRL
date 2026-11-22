@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
+from unirl.distributed.tensor import hydrate
+
 
 def _tensor_stats(prefix: str, tensor: Optional[torch.Tensor]) -> Dict[str, float]:
     if tensor is None or (not torch.is_tensor(tensor)) or tensor.numel() == 0:
@@ -124,7 +126,7 @@ def pooled_window_reward_metrics(parts: Sequence[Any], *, trunc_len: Optional[in
                 pooled_c = torch.cat([t.detach().to(dtype=torch.float32).reshape(-1).cpu() for t in tensors])
                 metrics.update(_tensor_stats(f"reward_{str(cname).replace('/', '_')}", pooled_c))
     if trunc_len is not None:
-        lengths = torch.cat([p.segment.lengths.detach().to(dtype=torch.float32).cpu() for p in parts])
+        lengths = torch.cat([hydrate(p.segment.lengths).detach().to(dtype=torch.float32).cpu() for p in parts])
         metrics.update(_tensor_stats("response_len", lengths))
         if trunc_len > 0:
             metrics["trunc_ratio"] = float((lengths >= trunc_len).to(dtype=torch.float32).mean().item())

@@ -1,12 +1,13 @@
+import hashlib
 import importlib
 import importlib.util
 import inspect
 import json
 import logging
 import math
+import os
 import time
 from contextlib import contextmanager, nullcontext
-from pathlib import Path
 from typing import Dict, Iterator, Optional, Set, Tuple
 
 import torch
@@ -31,6 +32,12 @@ from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 logger = logging.getLogger(__name__)
 
 _ROLLOUT_SHUTDOWN_TIMEOUT_S = 60.0
+
+
+def _file_sha256(path: str) -> str:
+    """SHA-256 hex digest of one prompt file."""
+    with open(path, "rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def ar_preflight(
@@ -63,6 +70,8 @@ def ar_preflight(
 
 class ARTrainer(BaseTrainer):
     """Autoregressive (VLM / LLM) RL trainer: rollout + train colocated."""
+
+    _teacher_cycle: Optional[Dict[str, object]] = None
 
     def __init__(
         self,
@@ -107,7 +116,6 @@ class ARTrainer(BaseTrainer):
         if isinstance(accumulate_rollouts, bool) or not isinstance(accumulate_rollouts, int) or accumulate_rollouts < 1:
             raise ValueError("accumulate_rollouts must be an integer >= 1.")
         self.accumulate_rollouts = accumulate_rollouts
-        self._teacher_cycle = None
         if issubclass(algorithm_cls, ARMultiTeacherOPD):
             teachers = algorithm_cfg["teachers"]
             if not issubclass(get_class(data_source_cfg["_target_"]), MultiDomainRLDataSource):
@@ -122,11 +130,14 @@ class ARTrainer(BaseTrainer):
                 raise ValueError("Every teacher must be declared in backend.lora_cfg.frozen_adapters.")
             if data_source_cfg.args.run.get("seed") is None or rollout_cfg.get("seed") is None:
                 raise ValueError("Multi-teacher resume requires data-source and rollout seeds.")
-            if algorithm_cfg["sampling_temperature"] != sampling_cfg["temperature"]:
+            if algorithm_cfg["sampling_temperature"] != build_sampling_dict(sampling_cfg)["ar"].temperature:
                 raise ValueError("Teacher replay and student sampling temperatures must match.")
             self._teacher_cycle = {
                 "teachers": dict(teachers),
                 "domains": domains,
+                "data_sha256": {
+                    entry["name"]: _file_sha256(entry["data_path"]) for entry in data_source_cfg.args.run.domains
+                },
                 "data_seed": data_source_cfg.args.run.seed,
                 "rollout_seed": rollout_cfg.seed,
                 "batch_size": batch_size,
@@ -465,6 +476,7 @@ class ARTrainer(BaseTrainer):
         rollout_id: int,
         *,
         sampling: Optional[Dict[str, BaseSamplingParams]] = None,
+        rng_id: Optional[int] = None,
     ) -> Sample:
         """Turn a data source batch into a request :class:`Sample`."""
         sp = sampling if sampling is not None else self.sampling_params
@@ -473,6 +485,7 @@ class ARTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives=self._allowed_input_primitives,
             caller="ARTrainer._build_request_sample",
+            rng_id=rng_id,
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp["ar"])
 
@@ -603,9 +616,11 @@ class ARTrainer(BaseTrainer):
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        eval_batches = self.data_source.iter_eval_batches(
-            self.eval_batch_size,
-            eval_num_prompts=self.eval_num_prompts,
+        eval_batches = list(
+            self.data_source.iter_eval_batches(
+                self.eval_batch_size,
+                eval_num_prompts=self.eval_num_prompts,
+            )
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
 
@@ -635,12 +650,17 @@ class ARTrainer(BaseTrainer):
             with eval_session:
                 if preserve_rollout_weights:
                     self._preserve_rollout_weights_for_next_sleep()
-                for eval_inputs in eval_batches:
+                for batch_index, eval_inputs in enumerate(eval_batches):
                     batch_n += 1
                     real_prompt_n = eval_inputs.batch_size
                     prompt_n += real_prompt_n
                     dispatch_inputs = self._pad_eval_inputs(eval_inputs)
-                    sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
+                    sample = self._build_request_sample(
+                        dispatch_inputs,
+                        rollout_id,
+                        sampling=eval_sp,
+                        rng_id=-1 - ((rollout_id + 1) * len(eval_batches) + batch_index),  # < 0: disjoint from training
+                    )
                     generated = self.rollout.generate(sample)
                     scored = self.reward.score_and_attach(generated)
                     rewards = scored.parts[-1].rewards
@@ -752,6 +772,10 @@ class ARTrainer(BaseTrainer):
         except Exception as exc:  # debug path — never let it kill training
             logger.warning("rollout sample dump failed: %s", exc)
 
+    def _extra_trainer_state(self) -> Dict[str, object]:
+        """Persist the multi-teacher cycle contract checked on resume."""
+        return {} if self._teacher_cycle is None else {"teacher_cycle": self._teacher_cycle}
+
     def train(
         self,
         *,
@@ -770,10 +794,12 @@ class ARTrainer(BaseTrainer):
             raise ValueError("num_rollouts and save_interval must align with complete teacher cycles.")
         interval = max(1, weight_sync_interval)
         if load_dir and self._teacher_cycle is not None:
-            with (Path(load_dir) / "ar_teacher_cycle.json").open() as stream:
-                saved_cycle = json.load(stream)
+            with open(os.path.join(load_dir, "trainer_state.json")) as stream:
+                saved_cycle = json.load(stream).get("teacher_cycle")
             if saved_cycle != self._teacher_cycle:
-                raise ValueError("The checkpoint's teacher mapping, domain order, seeds or batch topology changed.")
+                raise ValueError(
+                    "The checkpoint's teacher mapping, domain order, data, seeds or batch topology changed."
+                )
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         if start_rollout % acc:
             raise ValueError("The checkpoint ends inside an incomplete teacher cycle.")
@@ -831,14 +857,6 @@ class ARTrainer(BaseTrainer):
                 self.maybe_save_checkpoint(
                     final_id, num_rollouts, save_interval=save_interval, save_dir=save_dir, save_mode=save_mode
                 )
-                if self._teacher_cycle is not None and save_interval > 0:
-                    if next_rollout_id % save_interval == 0 or next_rollout_id == num_rollouts:
-                        path = (
-                            Path(save_dir or "checkpoints") / f"checkpoint-{next_rollout_id}" / "ar_teacher_cycle.json"
-                        )
-                        temporary = path.with_suffix(".json.tmp")
-                        temporary.write_text(json.dumps(self._teacher_cycle))
-                        temporary.replace(path)
         finally:
             try:
                 self._finish_wandb()

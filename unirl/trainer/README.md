@@ -508,12 +508,14 @@ without driver-authored x_T. `media_log_interval` does not apply
   `CODE_TEACHER_PATH`. Each teacher is a frozen LoRA on the same Qwen3 backbone.
 - **AR cycle resume requires unchanged data, seeds, domain order and topology.**
   Prompt streams are fast-forwarded from their configured seed. The trainside
-  engine's optional `seed` derives the Torch sampling seed from the rollout ID
-  and DP rank inside an RNG-restoring scope. This reproduces sampling at a cycle
+  engine's optional `seed` derives the Torch sampling seed from the request's
+  RNG ID and DP rank inside an RNG-restoring scope. Training uses the rollout
+  ID; each eval batch gets its own negative ID, so eval never reuses a training
+  or another eval batch's seed. This reproduces sampling at a cycle
   boundary without replaying prior model generations. Exact update comparisons
   also require deterministic kernels and zero model/adapter dropout.
-- **A3 checkpoints include `ar_teacher_cycle.json`.** Resume rejects a changed
-  domain-to-adapter mapping, domain order, data or rollout seed, batch size or
-  device count before loading model state. The teacher adapter content hashes
-  remain checked by the backend. A checkpoint without the cycle record cannot
+- **A3 checkpoints record the teacher cycle in `trainer_state.json`.** Resume
+  rejects a changed domain-to-adapter mapping, domain order, prompt-file SHA-256,
+  data or rollout seed, batch size or device count before loading model state.
+  The teacher adapter content hashes remain checked by the backend. A checkpoint without the cycle record cannot
   resume multi-teacher training.
