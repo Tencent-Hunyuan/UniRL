@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from typing import Dict, List, Optional, Tuple
 
 from unirl.rollout.manager import (
@@ -15,6 +14,7 @@ from unirl.rollout.manager import (
 from unirl.trainer.base import unwrap_replicated_int
 from unirl.types.sample import Sample
 from unirl.types.sampling import total_samples_per_prompt
+from unirl.utils.wandb_logger import async_step_timing, install_async_phase_timing
 
 logger = logging.getLogger(__name__)
 
@@ -114,54 +114,62 @@ class AsyncRolloutTrainerMixin:
 
         ar_sampling = self.sampling_params.get("ar")
         trunc_len = ar_sampling.max_new_tokens if ar_sampling is not None else None
+        install_async_phase_timing(self)
         try:
             for rollout_id in range(start_rollout, num_rollouts):
-                t0 = time.perf_counter()
-                hard_boundary = num_rollouts
-                for interval in (self.eval_interval, save_interval):
-                    if interval > 0:
-                        hard_boundary = min(hard_boundary, ((rollout_id // interval) + 1) * interval)
-                sample, output_version = self._next_rollout_batch(
-                    rollout_id,
-                    hard_boundary=hard_boundary,
-                )
-                staleness = self._train_version - output_version
-                training_progress = rollout_id / max(1, num_rollouts - 1)
-                sample, result, mean_reward = self._advantage_and_train(
-                    sample,
-                    training_progress=training_progress,
-                    rollout_id=rollout_id,
-                )
-                self._train_version += result.optimizer_updates
-                self._batches_since_sync += 1
-                self.wandb_logger.log_rollout_step(
-                    rollout_id,
-                    result,
-                    sample,
-                    step_time_s=time.perf_counter() - t0,
-                    trunc_len=trunc_len,
-                    extra_metrics={
-                        "async/output_version": output_version,
-                        "async/staleness_updates": staleness,
-                        "async/train_version": self._train_version,
-                        "async/published_version": self._rollout_manager.published_version,
-                        "async/publish_lag": self._train_version - self._rollout_manager.published_version,
-                        "async/optimizer_updates": result.optimizer_updates,
-                        "async/batches_since_sync": self._batches_since_sync,
+                with async_step_timing(self) as timing:
+                    hard_boundary = num_rollouts
+                    for interval in (self.eval_interval, save_interval):
+                        if interval > 0:
+                            hard_boundary = min(hard_boundary, ((rollout_id // interval) + 1) * interval)
+                    sample, output_version = self._next_rollout_batch(
+                        rollout_id,
+                        hard_boundary=hard_boundary,
+                    )
+                    staleness = self._train_version - output_version
+                    training_progress = rollout_id / max(1, num_rollouts - 1)
+                    sample, result, mean_reward = self._advantage_and_train(
+                        sample,
+                        training_progress=training_progress,
+                        rollout_id=rollout_id,
+                    )
+                    self._train_version += result.optimizer_updates
+                    self._batches_since_sync += 1
+                    self.wandb_logger.log_rollout_step(
+                        rollout_id,
+                        result,
+                        sample,
+                        trunc_len=trunc_len,
+                        extra_metrics={
+                            "async/output_version": output_version,
+                            "async/staleness_updates": staleness,
+                            "async/train_version": self._train_version,
+                            "async/published_version": self._rollout_manager.published_version,
+                            "async/publish_lag": self._train_version - self._rollout_manager.published_version,
+                            "async/optimizer_updates": result.optimizer_updates,
+                            "async/batches_since_sync": self._batches_since_sync,
+                        },
+                    )
+                    self._reset_transport_buffers()
+                    self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
+
+                    step = rollout_id + 1
+                    eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
+                    save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
+                    sync_due = step < num_rollouts and self._batches_since_sync >= self._weight_sync_interval
+                    if eval_due or save_due or sync_due:
+                        self._sync_rollout(require_empty=eval_due or save_due)
+
+                    if step >= num_rollouts and not self._rollout_manager.empty:
+                        raise RuntimeError("final rollout boundary requires an empty RolloutManager")
+
+                self.wandb_logger.log_perf(
+                    step,
+                    {
+                        "step_time_s": timing.total(),
+                        **{f"{name}_time_s": elapsed for name, elapsed in timing.phases.items()},
                     },
                 )
-                self._reset_transport_buffers()
-                self.wandb_logger.log_progress(rollout_id, num_rollouts, result, mean_reward, logger=logger)
-
-                step = rollout_id + 1
-                eval_due = self.eval_interval > 0 and step % self.eval_interval == 0
-                save_due = save_interval > 0 and (step % save_interval == 0 or step >= num_rollouts)
-                sync_due = step < num_rollouts and self._batches_since_sync >= self._weight_sync_interval
-                if eval_due or save_due or sync_due:
-                    self._sync_rollout(require_empty=eval_due or save_due)
-
-                if step >= num_rollouts and not self._rollout_manager.empty:
-                    raise RuntimeError("final rollout boundary requires an empty RolloutManager")
 
                 if eval_due:
                     self._boundary_evaluate(rollout_id, initial=False)

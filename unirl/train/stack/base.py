@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
+from unirl.types.segments import TextSegment
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 if TYPE_CHECKING:
@@ -105,6 +106,8 @@ class BaseTrainStack(Remote):
 
     def _align_track_inputs(self, part: Part) -> None:
         """Move the segment, conditions, and advantages to the training device; media payloads stay on the host."""
+        if isinstance(part.segment, TextSegment):
+            part.segment.pad_empty_rows()
         device = self.fsdp_backend._device
         if part.segment is not None:
             part.segment = part.segment.to_device(device)

@@ -400,10 +400,10 @@ class GenEvalScorer(BaseScorer):
         self, image: Image.Image, metadata: dict
     ) -> dict[str, float]:
         """Run Mask2Former detection and evaluate a single image against its metadata."""
+        from mmcv import rgb2bgr
         from mmdet.apis import inference_detector
 
-        np_image = np.array(image)
-        result = inference_detector(self._object_detector, np_image)
+        result = inference_detector(self._object_detector, rgb2bgr(np.asarray(image)))
 
         bbox = result[0] if isinstance(result, tuple) else result
         segm = result[1] if isinstance(result, tuple) and len(result) > 1 else None
