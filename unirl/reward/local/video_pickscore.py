@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, List
 
 import torch
@@ -77,15 +77,7 @@ class VideoPickScoreScorer(PickScoreRewardScorer):
 
             pil_frames = [self._extract_frame(v, self.frame_selection) for v in request.videos]
             frame_pixels = torch.stack([to_tensor(f) for f in pil_frames])
-            request = RewardRequest(
-                generated={"image": Images.from_dense(frame_pixels)},
-                conditioning=dict(request.conditioning),
-                original_prompt=request.original_prompt,
-                generation_prompt=request.generation_prompt,
-                sample_ids=request.sample_ids,
-                group_ids=request.group_ids,
-                metadata=request.metadata,
-            )
+            request = replace(request, generated={"image": Images.from_dense(frame_pixels)})
         return super()._compute_model_rewards(request)
 
 

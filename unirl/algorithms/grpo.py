@@ -24,6 +24,7 @@ from .base import (
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -152,6 +153,8 @@ class GRPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         loss = aggregate_token_losses(
             loss_per_elem,
             lengths=segment.lengths,
