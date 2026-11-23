@@ -59,8 +59,7 @@ dependency direction are owned by pre-commit; do not report what a hook enforces
 
 ## P1 Performance
 
-- [ ] `P1-HOST-SYNC` No `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, or tensor
-      truthiness in per-step or per-sample paths.
+- [ ] `P1-HOST-SYNC` No Class A `.item()`, `.cpu()`, `.tolist()`, `.numpy()`, `nonzero()`, or tensor truthiness in per-step, per-microbatch, per-sample, or per-layer hot paths across training or rollout/decode (Class B termination/boundary checks budgeted to `<= 1` batched sync).
 - [ ] `P1-VECTORIZE` No Python loop over elements of a GPU tensor.
 - [ ] `P1-FILTER-EARLY` Filter before collectives, gathers, and materialization,
       not after.

@@ -104,6 +104,7 @@ Local skills currently in this repo:
 | Area | Skill | Read before |
 | --- | --- | --- |
 | Model bundles | `.claude/skills/development/add-model-bundle/SKILL.md` | Adding or updating diffusion or autoregressive model pipelines, model config dataclasses, Bundle/Pipeline/Stage/Conditions implementations, LoRA targets, FSDP wrapping hints, Sample/Part plumbing, or multimodal text/image/video/audio conditioning. |
+| Hot paths & backends | `.claude/skills/development/hot-path-and-backend-changes/SKILL.md` | Adding or editing custom operators/kernels, training backends (`FSDPBackend`/`VeOmniBackend`), rollout adapters or upstream patches, hot-path loops, host-device syncs, SDE replay, or weight/tensor transport. |
 | Pull requests | `.claude/skills/development/pr-workflow/SKILL.md` | Creating or updating PRs, editing PR bodies, handling PR Body or Semantic Pull Request CI failures, or running `gh pr create`. |
 | PR review | `.claude/skills/development/pr-review/SKILL.md` | Pushing or opening a PR for a substantive code or config change, or reviewing a diff for correctness, hot-path cost, and redundancy. |
 | READMEs | `.claude/skills/development/readme-guide/SKILL.md` | Creating or editing a README, or renaming, moving, or removing a path, symbol, config key, or count a README mentions. |

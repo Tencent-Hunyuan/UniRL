@@ -8,7 +8,6 @@ from hydra.utils import get_class, instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.ar import ARTrainer, ar_preflight
 from unirl.trainer.async_rollout import (
@@ -196,7 +195,6 @@ class AsyncARTrainer(AsyncRolloutTrainerMixin, ARTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
         if self.advantage_mode == "grpo":
             part = part.compute_advantages(

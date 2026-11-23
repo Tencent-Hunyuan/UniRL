@@ -20,6 +20,7 @@ from .base import (
     rollout_replay_logp_absdiff,
     select_active_tokens,
     typed_conditions,
+    zero_loss_backward,
 )
 from .grpo import GRPO
 
@@ -117,6 +118,8 @@ def _cppo_loss(
 
     pg_losses = -adv * ratio * keep
     ratio, log_diff, keep = select_active_tokens(mask, ratio, log_diff, keep)
+    if ratio.numel() == 0:
+        return pg_losses, {}
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -226,6 +229,8 @@ class CPPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         loss = aggregate_token_losses(
             loss_per_elem,
             lengths=segment.lengths,

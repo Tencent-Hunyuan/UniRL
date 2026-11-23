@@ -81,14 +81,12 @@ def gather_sde_field(
 
 
 def select_active_tokens(mask: Optional[torch.Tensor], *tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-    """Detached ``loss_mask``-active elements for metrics; all elements when none are active (``max`` never empty)."""
+    """Select detached ``loss_mask``-active elements for metrics."""
     detached = tuple(t.detach() for t in tensors)
     if mask is None:
         return detached
-    active = mask.to(device=detached[0].device) > 0
-    if not bool(active.any()):
-        return detached
-    return tuple(t[active] for t in detached)
+    indices = (mask.to(device=detached[0].device) > 0).nonzero(as_tuple=True)[0]
+    return tuple(t.index_select(0, indices) for t in detached)
 
 
 def aggregate_token_losses(
@@ -139,6 +137,8 @@ def rollout_replay_logp_absdiff(
     """Per-token |Δlogp| between rollout and replay — AR train-rollout drift gauge."""
     with torch.no_grad():
         new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
+        if new_logp.numel() == 0:
+            return {}
         absdiff = (new_logp - old_logp).abs()
     return {
         "rollout_replay_logp_absdiff_mean": float(absdiff.mean()),
@@ -154,6 +154,8 @@ def rollout_replay_k3(
     """Per-token K3 KL estimator between rollout and replay log-probs."""
     with torch.no_grad():
         new_logp, old_logp = select_active_tokens(mask, new_logp, old_logp)
+        if new_logp.numel() == 0:
+            return {}
         log_r = (new_logp.float() - old_logp.float()).clamp(min=-20.0, max=20.0)
         k3 = torch.expm1(log_r) - log_r
         out = {
@@ -195,6 +197,8 @@ def grpo_clip_loss(
     loss_per_elem = torch.maximum(unclipped, clipped)
 
     ratio, log_diff = select_active_tokens(mask, ratio, log_diff)
+    if ratio.numel() == 0:
+        return loss_per_elem, {}
     if ratio.numel() > 1:
         ratio_std = ratio.std()
     else:
@@ -343,6 +347,15 @@ class AlgorithmStepResult:
     has_backward: bool
 
 
+def zero_loss_backward(log_probs: torch.Tensor, values: Optional[torch.Tensor] = None) -> AlgorithmStepResult:
+    """Backpropagate zero through AR replay outputs for a fully masked micro."""
+    loss = log_probs[:0].sum()
+    if values is not None:
+        loss = loss + values[:0].sum()
+    loss.backward()
+    return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=True)
+
+
 class BaseAlgorithmConfig(ABC):
     """Marker base for all algorithm config dataclasses."""
 
@@ -405,4 +418,5 @@ __all__ = [
     "slice_step_chunks",
     "transition_sigma",
     "typed_conditions",
+    "zero_loss_backward",
 ]
