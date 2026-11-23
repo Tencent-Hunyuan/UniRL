@@ -16,19 +16,6 @@ from unirl.types.reward import DEFAULT_PROMPT_SOURCE, PromptSource, RewardReques
 from unirl.types.sample_id import parent_id
 
 
-def _select_request(request: RewardRequest, rows: list[int]) -> RewardRequest:
-    return RewardRequest(
-        generated={key: value.select(rows) for key, value in request.generated.items()},
-        conditioning={key: value.select(rows) for key, value in request.conditioning.items()},
-        original_prompt=None if request.original_prompt is None else request.original_prompt.select(rows),
-        generation_prompt=None if request.generation_prompt is None else request.generation_prompt.select(rows),
-        metadata=None if request.metadata is None else [request.metadata[i] for i in rows],
-        sample_ids=None if request.sample_ids is None else [request.sample_ids[i] for i in rows],
-        group_ids=None if request.group_ids is None else [request.group_ids[i] for i in rows],
-        audio_sample_rate=request.audio_sample_rate,
-    )
-
-
 class PairwiseJudge(ABC):
     """Consume adjacent candidate pairs and return one left-candidate label in {0, 0.5, 1} per pair."""
 
@@ -101,7 +88,7 @@ class PairwiseRewardBackend(RewardBackend):
         rewards = [0.5] * len(ids)
         for start in range(0, len(pairs), self.batch_size):
             batch = pairs[start : start + self.batch_size]
-            labels = self.judge.score_pairs(_select_request(request, [row for pair in batch for row in pair]))
+            labels = self.judge.score_pairs(request.select([row for pair in batch for row in pair]))
             if len(labels) != len(batch) or any(label not in (0.0, 0.5, 1.0) for label in labels):
                 raise ValueError("Pairwise judge must return exactly one label in {0, 0.5, 1} per pair.")
             for (left, right), label in zip(batch, labels):
@@ -149,7 +136,7 @@ class ScalarComparisonJudge(PairwiseJudge):
             raise ValueError("Scalar comparison backend.batch_size must be a positive integer.")
         for start in range(0, request.batch_size, limit):
             rows = list(range(start, min(start + limit, request.batch_size)))
-            response = self.backend.compute_rewards(_select_request(request, rows))
+            response = self.backend.compute_rewards(request.select(rows))
             if (
                 len(response.rewards) != len(rows)
                 or len(response.successes) != len(rows)

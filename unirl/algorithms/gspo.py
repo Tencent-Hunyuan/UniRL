@@ -118,7 +118,7 @@ class GSPO(StageAlgorithm):
             else resolve_clip_range_from_schedule(self.clip_range_high, self.clip_schedule, training_progress)
         )
 
-        seq_new, seq_old, seq_adv, valid = self._reduce_to_sequences(
+        log_ratio, seq_adv, valid = self._reduce_to_sequences(
             new_logp,
             old_logp,
             advantages,
@@ -128,7 +128,7 @@ class GSPO(StageAlgorithm):
         if not bool(valid.any()):
             return zero_loss_backward(new_logp)
 
-        log_ratio = (seq_new - seq_old).clamp(max=self._MAX_LOG_RATIO)
+        log_ratio = log_ratio.clamp(max=self._MAX_LOG_RATIO)
         loss_per_seq, ratio_metrics = grpo_clip_loss(
             new_logp=log_ratio,
             old_logp=torch.zeros_like(log_ratio),
@@ -166,8 +166,8 @@ class GSPO(StageAlgorithm):
         lengths: torch.Tensor,
         *,
         loss_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-sequence length-normalized ``(new, old, adv, valid)``, each ``[B]``; ``valid`` = has an active token."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Mean token log-ratio, advantage and active-token validity per sequence, each ``[B]``."""
         device = new_logp.device
         lengths = lengths.to(device)
         num_seqs = int(lengths.shape[0])
@@ -175,10 +175,10 @@ class GSPO(StageAlgorithm):
             raise ValueError(f"GSPO: advantages batch={int(advantages.shape[0])} != sequences={num_seqs}")
 
         seg_ids = torch.repeat_interleave(torch.arange(num_seqs, device=device), lengths)
+        token_log_ratio = new_logp - old_logp
         if loss_mask is not None:
             mask = loss_mask.to(dtype=new_logp.dtype, device=device)
-            new_logp = new_logp * mask
-            old_logp = old_logp * mask
+            token_log_ratio = token_log_ratio * mask
             denom = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, mask)
             valid = denom > 0
         else:
@@ -186,10 +186,9 @@ class GSPO(StageAlgorithm):
             valid = lengths > 0
 
         denom = denom.clamp(min=1)
-        seq_new = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, new_logp) / denom
-        seq_old = old_logp.new_zeros(num_seqs).index_add(0, seg_ids, old_logp) / denom
+        log_ratio = new_logp.new_zeros(num_seqs).index_add(0, seg_ids, token_log_ratio) / denom
         seq_adv = advantages.detach().to(dtype=new_logp.dtype, device=device)
-        return seq_new, seq_old, seq_adv, valid
+        return log_ratio, seq_adv, valid
 
 
 __all__ = ["GSPO", "GSPOConfig"]

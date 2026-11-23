@@ -16,15 +16,20 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig
 
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
 from unirl.models.pe.pipeline import PEPipeline
+from unirl.reward.service import score_and_attach
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample, score_generated_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, pad_eval_inputs, prepare_input_sample
 from unirl.trainer.eval_suites import build_eval_suites
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.types.sample import Sample
 from unirl.types.sample_id import parent_id
-from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, DiffusionSamplingParams
+from unirl.types.sampling import (
+    ARSamplingParams,
+    BaseSamplingParams,
+    DiffusionSamplingParams,
+    total_samples_per_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,19 +234,14 @@ class PETrainer(BaseTrainer):
         diff_idx = sample.gen_part_index(DiffusionSamplingParams)
         parts_by_name = {"ar": ar_idx, "diffusion": diff_idx}
 
-        sample = score_generated_sample(self.reward, sample)
-        diff_part = sample.parts[diff_idx]
-        if diff_part.rewards is not None:
-            diff_part.rewards = hydrate(diff_part.rewards)
-        if isinstance(diff_part.component_rewards, dict):
-            diff_part.component_rewards = {name: hydrate(value) for name, value in diff_part.component_rewards.items()}
+        sample = score_and_attach(self.reward, sample)
 
         sample = sample.propagate_rewards(op="mean")
 
         mean_reward = 0.0
         di_rewards = sample.parts[diff_idx].rewards
         if di_rewards is not None:
-            mean_reward = float(hydrate(di_rewards).to(torch.float32).mean().item())
+            mean_reward = float(di_rewards.to(torch.float32).mean().item())
 
         new_parts = list(sample.parts)
         for name in self._train_tracks:
@@ -309,18 +309,27 @@ class PETrainer(BaseTrainer):
         all_inputs = data_source.get_eval_samples(num_prompts)
         n_prompts = all_inputs.batch_size
         chunk = max(1, self.batch_size)
-        usable = n_prompts - n_prompts % chunk or n_prompts
+        fanout = total_samples_per_prompt(eval_sp)
+        # Rollout DP-splits each request, so ragged eval sets are padded to full chunks and pad roots go unscored.
+        dispatch_inputs = pad_eval_inputs(all_inputs, chunk)
         sums = {name: 0.0 for name, _ in scorers}
         counts = {name: 0 for name, _ in scorers}
-        for start in range(0, usable, chunk):
-            sub = all_inputs.slice(start, min(start + chunk, n_prompts))
+        for start in range(0, dispatch_inputs.batch_size, chunk):
+            sub = dispatch_inputs.slice(start, start + chunk)
+            n_real = min(chunk, n_prompts - start)
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self.rollout.generate(request)
             for name, reward in scorers:
-                scored = score_generated_sample(reward, generated)
+                scored = score_and_attach(reward, generated)
                 rewards = scored.parts[-1].rewards
                 if rewards is not None:
-                    r = hydrate(rewards).to(torch.float32)
+                    r = rewards.to(torch.float32)
+                    if r.numel() != sub.batch_size * fanout:
+                        raise RuntimeError(
+                            f"PETrainer._eval_pass: reward count {r.numel()} != dispatch roots "
+                            f"{sub.batch_size} * fanout {fanout}."
+                        )
+                    r = r[: n_real * fanout]
                     sums[name] += float(r.sum().item())
                     counts[name] += int(r.numel())
         return {name: sums[name] / max(1, counts[name]) for name, _ in scorers}

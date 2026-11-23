@@ -135,14 +135,14 @@ _STEP_PHASE_SPECS = (
     ("rollout", "generate", "generate"),
     ("rollout", "sleep", "sleep"),
     ("weight_sync", "sync", "weight_sync"),
-    ("reward", "score_and_attach", "reward"),
+    ("reward", "score", "reward"),
     ("reward_stack", "rollout_and_score", "rollout_score"),
     ("stack", "train_track", "train"),
 )
 
 _ASYNC_PHASE_SPECS = (
     ("_rollout_manager", "collect", "rollout_collect_wait"),
-    ("reward", "score_and_attach", "reward"),
+    ("reward", "score", "reward"),
     ("stack", "train_track", "train"),
     ("_rollout_manager", "quiesce", "quiesce"),
     ("_rollout_manager", "finish", "carry_finish"),

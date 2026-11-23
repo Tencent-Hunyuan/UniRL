@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import replace
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -13,41 +13,11 @@ from unirl.distributed.group.device_pool import DevicePool
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
 from unirl.types.sampling import ARSamplingParams, BaseSamplingParams, total_samples_per_prompt
-from unirl.types.segments import LatentSegment
 
 logger = logging.getLogger(__name__)
 
 # Bound exception-path flushes so wedged workers cannot mask the primary error.
 _TEARDOWN_FLUSH_TIMEOUT_S = float(os.environ.get("UNIRL_TEARDOWN_FLUSH_TIMEOUT_S", "120"))
-
-
-def score_generated_sample(reward: Any, sample: Sample) -> Sample:
-    """Score generated primitives while keeping cached latent trajectories on their original transport handles."""
-    cached_parts = {
-        i: part
-        for i, part in enumerate(sample.parts)
-        if isinstance(part.segment, LatentSegment) and part.segment.art_old_predictions is not None
-    }
-    if not cached_parts:
-        return reward.score_and_attach(sample)
-
-    request = sample.with_parts(
-        [replace(part, segment=None) if i in cached_parts else part for i, part in enumerate(sample.parts)]
-    )
-    scored = reward.score_and_attach(request)
-    if len(scored.parts) != len(sample.parts):
-        raise ValueError("Reward scoring changed the sample lineage.")
-    parts = list(scored.parts)
-    for i, original in cached_parts.items():
-        result = parts[i]
-        segment = original.segment
-        if result.sample_ids != original.sample_ids:
-            rows = {sid: row for row, sid in enumerate(original.sample_ids)}
-            if rows.keys() != set(result.sample_ids):
-                raise ValueError("Reward scoring changed the set of cached trajectory rows.")
-            segment = segment.select([rows[sid] for sid in result.sample_ids])
-        parts[i] = replace(result, segment=segment)
-    return scored.with_parts(parts)
 
 
 def prepare_input_sample(
@@ -90,6 +60,34 @@ def prepare_input_sample(
     if control is not None:
         root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
+
+
+def pad_eval_inputs(inputs: Sample, multiple: int) -> Sample:
+    """Append copies of the last prompt tree under unique ``:eval-pad:`` roots to reach a ``multiple``."""
+    n = inputs.batch_size
+    if n == 0 or n % multiple == 0:
+        return inputs
+    source = inputs.slice(n - 1, n)
+    source_root_id = source.parts[0].sample_ids[0]
+    used_root_ids = set(inputs.parts[0].sample_ids)
+    padded: List[Sample] = []
+    for i in range((-n) % multiple):
+        candidate = f"{source_root_id}:eval-pad:{i}"
+        while candidate in used_root_ids:
+            candidate += ":pad"
+        used_root_ids.add(candidate)
+
+        def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
+            root, separator, suffix = sample_id.partition("/")
+            if root != source_root_id:
+                raise ValueError(
+                    "pad_eval_inputs: selected pad tree contains "
+                    f"unexpected root {root!r}; expected {source_root_id!r}."
+                )
+            return new_root + (f"/{suffix}" if separator else "")
+
+        padded.append(source.map_sample_ids(replace_root))
+    return Sample.concat([inputs, *padded])
 
 
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:

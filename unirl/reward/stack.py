@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
+from unirl.reward.service import score_and_attach
 from unirl.types.sample import Part, Sample
 from unirl.utils.memory_utils import aggressive_empty_cache
 
@@ -47,7 +48,7 @@ class RewardStack(Remote):
         total = gen.batch_size
         groups = gen.group_ids
         whole_groups = self.rollout.packs_groups
-        complete_groups = getattr(getattr(self.reward, "backend", None), "requires_complete_groups", False)
+        complete_groups = self.reward.backend.requires_complete_groups
         last_rows = {group: row for row, group in enumerate(groups)} if complete_groups else {}
         bounds: List[Tuple[int, int]] = []
         start = 0
@@ -110,7 +111,7 @@ class RewardStack(Remote):
 
     def _score(self, generated: Sample) -> Sample:
         t0 = time.perf_counter()
-        scored = self.reward.score_and_attach(generated)
+        scored = score_and_attach(self.reward, generated)
         self._score_s += time.perf_counter() - t0
         return scored
 
