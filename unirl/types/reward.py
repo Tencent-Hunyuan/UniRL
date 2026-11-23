@@ -1,12 +1,12 @@
 """Shared reward data types."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 from PIL import Image
 
-from unirl.distributed.tensor.batch import Batch, concat_field, max_field
+from unirl.distributed.tensor.batch import Batch, concat_field, max_field, shared_field
 from unirl.types.primitives import PrimitiveValue, Texts, primitive_modality_key
 
 PromptSource = Literal["original", "generation"]
@@ -15,19 +15,24 @@ DEFAULT_PROMPT_SOURCE: PromptSource = "generation"
 
 
 @dataclass
-class RewardRequest:
-    """Request for reward computation."""
+class RewardRequest(Batch):
+    """Row-aligned, DP-shardable request for reward computation."""
 
-    generated: Dict[str, PrimitiveValue] = field(default_factory=dict)
-    conditioning: Dict[str, PrimitiveValue] = field(default_factory=dict)
-    original_prompt: Optional[Texts] = None
-    generation_prompt: Optional[Texts] = None
-    metadata: Optional[List[Optional[Dict[str, Any]]]] = None
-    sample_ids: Optional[List[str]] = None
-    group_ids: Optional[List[str]] = None
-    audio_sample_rate: Optional[int] = None
+    generated: Dict[str, PrimitiveValue] = concat_field(default_factory=dict)
+    conditioning: Dict[str, PrimitiveValue] = concat_field(default_factory=dict)
+    original_prompt: Optional[Texts] = concat_field(default=None)
+    generation_prompt: Optional[Texts] = concat_field(default=None)
+    metadata: Optional[List[Optional[Dict[str, Any]]]] = concat_field(default=None)
+    sample_ids: Optional[List[str]] = concat_field(default=None)
+    group_ids: Optional[List[str]] = concat_field(default=None)
+    # Generated AR token counts; RewardService shapes truncated rows against max_new_tokens.
+    response_lengths: Optional[List[int]] = concat_field(default=None)
+    audio_sample_rate: Optional[int] = shared_field(default=None)
+    max_new_tokens: Optional[int] = shared_field(default=None)
 
     def __post_init__(self) -> None:
+        if (self.response_lengths is None) != (self.max_new_tokens is None):
+            raise ValueError("RewardRequest.response_lengths and max_new_tokens must be provided together.")
         if "text" in self.conditioning:
             raise ValueError(
                 "RewardRequest.conditioning must contain only non-text condition media; "
@@ -50,6 +55,7 @@ class RewardRequest:
             ("metadata", self.metadata),
             ("sample_ids", self.sample_ids),
             ("group_ids", self.group_ids),
+            ("response_lengths", self.response_lengths),
         ):
             if value is not None:
                 batch_sizes[name] = len(value)
@@ -88,19 +94,6 @@ class RewardRequest:
         if prim is None:
             return None
         return [a.waveform for a in prim.to_list()]
-
-    @property
-    def batch_size(self) -> int:
-        for v in self.generated.values():
-            if v is not None:
-                return len(v)
-        for v in (self.original_prompt, self.generation_prompt):
-            if v is not None:
-                return len(v)
-        for v in self.conditioning.values():
-            if v is not None:
-                return len(v)
-        return 0
 
     @property
     def is_video(self) -> bool:

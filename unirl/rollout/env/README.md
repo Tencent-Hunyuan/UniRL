@@ -60,6 +60,10 @@ than trainable policy output. The next generation reconstructs its chat history 
 chain. Environments produce observations and termination; the trainer scores
 valid terminal answers through its configured `RewardService`.
 
+For SGLang, `AgenticTrainer` requests `no_stop_trim` so the next turn sees the assistant's
+closing stop string (e.g. `</tool_call>`). Rendering the chat template again can still
+change tokenization at turn boundaries.
+
 ### Manager quiescence
 
 On manager `quiesce`, dispatch pauses and each in-flight turn finishes. A

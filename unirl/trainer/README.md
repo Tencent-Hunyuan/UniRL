@@ -40,7 +40,7 @@ stay swappable by `_target_`.
   disjoint `placement` slabs and runs a one-time cross-slab handshake for weight sync.
 - **The Sample-native loop** (`train_step`) is the conductor sequence, one
   rollout per call: `wake_up` → (sync weights, if due) →
-  `rollout.generate(sample)` → (if configured) `reward.score_and_attach(sample)` →
+  `rollout.generate(sample)` → (if configured) `score_and_attach(reward, sample)` →
   (if required) `part.compute_advantages(...)` → drop reward-only decoded media →
   `stack.train_track(...)`. On synchronous `ARTrainer`, `requires_advantages=False`
   algorithms (supervised / teacher-anchored, e.g. the planned AR OPD) may omit the
@@ -101,13 +101,13 @@ The current trainer surface is:
 | `SFTTrainer` | dataset records → one standalone training `Part` | Reuses the RL TrainStack without rollout, reward, or advantages; owns exact epoch/cursor resume and full-set evaluation. |
 | `AsyncARTrainer` | FIFO AR generation batch → one `TrainStack` | Separate train/rollout slabs with resident generation and optimizer-update versioning. The trainer refills immediately after collection so the manager's existing dispatch thread overlaps the next generation with scoring and training, then quiesces before weight sync, eval, or checkpoint. |
 | `AsyncDiffusionTrainer` | FIFO diffusion generation batch → one `TrainStack` | The same update-versioned manager loop for DiT. Requires `max_inflight=1` and resolves and scores each intact batch before launching its replacement, so cross-slab transfer never queues behind fresh generation. |
-| `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only. |
+| `PETrainer` | `ar` + `diffusion` Parts → two `TrainStack`s | Composed prompt-rewrite/image rollout; image rewards propagate to AR rewrites. `freeze_llm=true` trains and checkpoints diffusion only; `freeze_diffusion=true` trains and checkpoints the rewriter only (trainside engine only). On the trainside engine the request may carry one source image per prompt, passed to the rewriter and the editor. |
 | `UnifiedModelTrainer` | whole `Sample` → one `UnifiedModelTrainStack` | AR and image losses accumulate into shared-backbone optimizer steps while prompt-tree lineage remains intact during DP scatter. |
 | `AgenticTrainer` | variable-depth `List[Sample]` → concatenated turn `Part` | Multi-turn tool use on colocated or separate GPU slabs, with optional bounded partial-rollout windows. It syncs every step, waits for complete groups, scores terminal answers through `RewardService`, and excludes failed trajectories. Overflow trajectories are scored like completed ones; `mask_overflow_loss=true` keeps them in the group baseline but drops their gradient. |
 
 All async variants use the driver-local `RolloutManager`. Batch trainers provide
-one slab-wide launcher and keep completed batches intact; the agentic trainer
-provides one launcher per engine slot and lets the manager assemble root groups.
+one launcher per engine slot and submit individual prompt trees; the agentic
+trainer submits individual trajectories and lets the manager assemble root groups.
 `weight_sync_interval` counts consumed rollout batches between publications;
 `stack.num_updates_per_batch` counts optimizer updates within each batch. They
 are independent; `(weight_sync_interval - 1) * num_updates_per_batch` is the
@@ -228,6 +228,28 @@ publication. **Hard boundaries** — every `eval_interval`, every
 `save_interval`, and the final rollout — admit no carry, and each raises if
 work remains after quiescing.
 
+### Async manager metrics
+
+With W&B enabled, async AR/DiT emits `rollout/async/*` on the one-based
+`rollout/step` axis. Agentic does not emit these keys. Manager tasks map to prompts;
+groups retain their logical unit. See [manager semantics](../rollout/README.md#manager-telemetry).
+
+| Snapshot | Sampling point |
+|---|---|
+| `pre_sync` | After training, before any due quiesce/publication. |
+| `step_end` | After required publication/carry handling and any final-empty check. Metrics are logged before eval/save. |
+
+| Keys relative to `rollout/async/` | Value / unit |
+|---|---|
+| `capacity_prompts` | `pool.capacity_tasks`, in prompts. |
+| `pre_sync_{queued,launch_reserved,running,completed_unrouted}_prompts`, `step_end_queued_prompts` | Pool state, in prompts. |
+| `{pre_sync,step_end}_ready_groups` | Ready logical groups. |
+| `{pre_sync,step_end}_max_ready_lag_updates` | `train_version - oldest_ready_output_version`, in optimizer updates. Omitted without a ready version. `pre_sync` can exceed the budget before filtering against the new version. |
+| `pre_sync_slot_occupancy` | `(running + reserved) / capacity`. Instantaneous scheduler occupancy, not GPU utilization. |
+| `{launched,completed,carried,finished}_prompts_delta`, `dropped_groups_delta` | Manager event deltas since the previous successful drain. May include prefetched work. |
+| `admitted_prompts_delta`, `carry_resubmitted_prompts_delta` | This step's successful new admissions and post-publication carry resubmissions, in prompts. |
+| `admission_{collect,refill}_{capacity,freshness,boundary}_headroom_prompts` | Non-negative capacity, batch-based freshness, and eval/save/final budgets, in prompts. Their minimum is admitted. Sampled before collection and at refill. |
+
 ### Variant constraints
 
 | Constraint | Async AR | Async diffusion |
@@ -271,8 +293,8 @@ flushes shards in the background. The next save/load drains the prior future,
 and every trainer drains the final save before worker teardown.
 
 PE checkpoints use one checkpoint directory per trained side:
-`<save_dir>/checkpoint-<step>/diffusion/` and, unless `freeze_llm=true`,
-`<save_dir>/checkpoint-<step>/ar/`. Each side uses its backend's selected format.
+`<save_dir>/checkpoint-<step>/diffusion/` unless `freeze_diffusion=true` and,
+unless `freeze_llm=true`, `<save_dir>/checkpoint-<step>/ar/`. Each side uses its backend's selected format.
 The driver-owned `trainer_state.json` remains at the common
 `checkpoint-<step>/` level. A normal PE save writes every trained side at the
 same rollout step; resume expects those sibling directories together.

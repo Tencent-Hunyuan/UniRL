@@ -14,7 +14,7 @@ from omegaconf import DictConfig
 
 from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
-from unirl.distributed.tensor import hydrate
+from unirl.reward.service import score_and_attach
 from unirl.rollout.manager import RolloutManager, required_worker_concurrency, validate_worker_inflight
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.async_rollout import (
@@ -229,7 +229,7 @@ class AgenticTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives={"text"},
             caller="AgenticTrainer._build_request_sample",
-            control={"ar": {"stop": list(self._stop)}},
+            control={"ar": {"stop": list(self._stop), "no_stop_trim": True}},
         )
 
     def _collect_groups(self, requests: List[Sample], *, allow_carry: bool = False) -> List[List[Sample]]:
@@ -331,11 +331,11 @@ class AgenticTrainer(BaseTrainer):
             .fork(1, sampling_params=ar_sampling)
             .with_filled_frontier(primitives={"text": Texts(texts=predictions)})
         )
-        scored = self.reward.score_and_attach(scoring)
+        scored = score_and_attach(self.reward, scoring)
         scored_rewards = scored.parts[-1].rewards
         if scored_rewards is None:
             raise RuntimeError("reward service returned no rewards")
-        values = hydrate(scored_rewards).to(torch.float32).flatten()
+        values = scored_rewards.to(torch.float32).flatten()
         if values.numel() != score_count + score_padding:
             raise RuntimeError(
                 f"reward service returned {values.numel()} rewards for {score_count + score_padding} scoring rows"
@@ -356,6 +356,7 @@ class AgenticTrainer(BaseTrainer):
 
     def _group_advantages(self, groups: List[List[Sample]], rewards: torch.Tensor) -> torch.Tensor:
         advantages = torch.zeros_like(rewards, dtype=torch.float32)
+        rewards = rewards.to(torch.float64)
         offset = 0
         for group in groups:
             end = offset + len(group)
