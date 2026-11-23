@@ -129,3 +129,8 @@ MixGRPO keeps `FlowSDEStrategy` and adds a `WindowScheduler` under
 - **`exp_decay_threshold` defaults to 13.** Decay starts only once a window start passes it.
   Shipped mixgrpo schedules are shorter, so `strategy=exp_decay` stays at `iters_per_window`
   until the threshold is lowered.
+- **Keep scheduled `sigmas` as `fp32` GPU tensors through the denoise loop.** Do
+  not convert `sigmas` to Python floats via `.tolist()` or `float()` before stepping;
+  host scalars inside hot denoising loops force syncs, and explicit `fp32`
+  normalization avoids caller-dtype / `float64` drift. (`regen_initial_noise`
+  intentionally draws on CPU in `fp32` for cross-hardware `x_T` bit-identity.)

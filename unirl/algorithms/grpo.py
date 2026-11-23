@@ -24,6 +24,7 @@ from .base import (
     rollout_replay_k3,
     rollout_replay_logp_absdiff,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -159,6 +160,8 @@ class GRPO(StageAlgorithm):
             mask=segment.loss_mask,
         )
 
+        if not ratio_metrics:
+            return zero_loss_backward(new_logp)
         if self.rollout_is_threshold is not None:
             behavior_logp = segment.rollout_log_probs.to(device=old_logp.device, dtype=torch.float32)
             log_weights = (old_logp.float() - behavior_logp).detach().clamp(min=-20.0, max=20.0)

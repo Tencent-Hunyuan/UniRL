@@ -197,7 +197,12 @@ class WAN21Pipeline(Pipeline):
         initial_latents = NoiseRecipe.from_sample(sample).resolve()
 
         latent_seg = self.diffusion.diffuse(
-            wan_conds, schedule=schedule, params=params, initial_latents=initial_latents
+            wan_conds,
+            schedule=schedule,
+            params=params,
+            initial_latents=initial_latents,
+            denoise_seed_keys=frontier.sample_ids if initial_latents is not None else None,
+            denoise_base_seed=params.seed if params.seed is not None else 0,
         )
         videos = self.vae_decode.decode(latent_seg)
 
