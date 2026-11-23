@@ -140,8 +140,12 @@ class RemoteRewardBackend(RewardBackend):
             prompt_source=config.prompt_source,
         )
         self.base_url = config.base_url.rstrip("/")
-        self.required_rewards = list(config.required_rewards)
         self.reward_weights = {} if config.reward_weights is None else dict(config.reward_weights)
+        self.monitor_rewards = set(config.monitor_rewards)
+        self.wire_rewards = [*config.required_rewards, *config.monitor_rewards]
+        self.component_keys = {
+            name: f"monitor_{name}" if name in self.monitor_rewards else name for name in self.wire_rewards
+        }
         self.max_retries = config.max_retries
         self.retry_delay = config.retry_delay
         self.request_batch_size = config.request_batch_size
@@ -222,7 +226,7 @@ class RemoteRewardBackend(RewardBackend):
             identity = _wire_identity(
                 request,
                 idx,
-                required_rewards=self.required_rewards,
+                required_rewards=self.wire_rewards,
                 expected_scorer_version=self.expected_scorer_version,
                 media_fingerprint=media_fingerprint,
                 prompt=prompt,
@@ -231,7 +235,7 @@ class RemoteRewardBackend(RewardBackend):
             wire_requests.append(
                 {
                     "history": history,
-                    "required_rewards": list(self.required_rewards),
+                    "required_rewards": list(self.wire_rewards),
                     "metadata": sample_metadata,
                     **identity,
                 }
@@ -253,7 +257,7 @@ class RemoteRewardBackend(RewardBackend):
             identity = _wire_identity(
                 request,
                 idx,
-                required_rewards=self.required_rewards,
+                required_rewards=self.wire_rewards,
                 expected_scorer_version=self.expected_scorer_version,
                 media_fingerprint=hashlib.sha256(video_b64.encode("ascii")).hexdigest(),
                 prompt=prompt,
@@ -262,7 +266,7 @@ class RemoteRewardBackend(RewardBackend):
             wire_requests.append(
                 {
                     "history": [{"text": prompt, "video_b64": video_b64}],
-                    "required_rewards": list(self.required_rewards),
+                    "required_rewards": list(self.wire_rewards),
                     "metadata": sample_metadata,
                     **identity,
                 }
@@ -373,7 +377,7 @@ class RemoteRewardBackend(RewardBackend):
         results: List[Dict[str, Dict[str, float]]] = raw["results"]
         errors_list: List[Dict[str, str]] = raw["errors"]
 
-        component_rewards: Dict[str, List[float]] = {name: [] for name in self.required_rewards}
+        component_rewards: Dict[str, List[float]] = {key: [] for key in self.component_keys.values()}
         aggregated_rewards: List[float] = []
         successes: List[bool] = []
         sample_errors: List[Optional[str]] = []
@@ -386,24 +390,27 @@ class RemoteRewardBackend(RewardBackend):
             weights: List[float] = []
             error_parts: List[str] = []
 
-            for reward_name in self.required_rewards:
+            for reward_name in self.wire_rewards:
+                component_key = self.component_keys[reward_name]
                 if reward_name in sample_result:
                     sub_metrics = sample_result[reward_name]
                     non_finite = self._first_non_finite(sub_metrics)
                     if non_finite is not None:
                         # Reject non-finite scores before they poison group normalization.
                         metric_name, bad_value = non_finite
-                        component_rewards[reward_name].append(0.0)
+                        component_rewards[component_key].append(0.0)
                         error_parts.append(
                             f"{reward_name}: non-finite value {bad_value!r} for sub-metric {metric_name!r}"
                         )
                         continue
                     score = self._reduce_sub_metrics(sub_metrics)
-                    component_rewards[reward_name].append(score)
+                    component_rewards[component_key].append(score)
+                    if reward_name in self.monitor_rewards:
+                        continue
                     scores.append(score)
                     weights.append(self.reward_weights.get(reward_name, 1.0))
                 else:
-                    component_rewards[reward_name].append(0.0)
+                    component_rewards[component_key].append(0.0)
                     if reward_name in sample_errors_dict:
                         error_parts.append(f"{reward_name}: {sample_errors_dict[reward_name]}")
                     else:
@@ -467,6 +474,7 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
     base_url: str = ""
     required_rewards: Tuple[str, ...] = ()
     reward_weights: Optional[Dict[str, float]] = None
+    monitor_rewards: Tuple[str, ...] = ()
     batch_size: int = 8
     timeout: float = 300.0
     max_retries: int = 3
@@ -493,6 +501,23 @@ class RemoteRewardSpec(PromptRewardComponentSpec):
         require(
             len(self.required_rewards) > 0,
             "RemoteRewardSpec.required_rewards must be non-empty",
+        )
+        overlapping = set(self.required_rewards) & set(self.monitor_rewards)
+        require(
+            not overlapping,
+            f"RemoteRewardSpec.required_rewards and monitor_rewards must be disjoint; "
+            f"both name {sorted(overlapping)!r}",
+        )
+        colliding = {f"monitor_{name}" for name in self.monitor_rewards} & set(self.required_rewards)
+        require(
+            not colliding,
+            f"RemoteRewardSpec.required_rewards must not contain {sorted(colliding)!r}; "
+            f"monitor_rewards report as monitor_<name>",
+        )
+        weighted_monitors = set(self.monitor_rewards) & set(self.reward_weights or ())
+        require(
+            not weighted_monitors,
+            f"RemoteRewardSpec.reward_weights must not name monitor_rewards; got {sorted(weighted_monitors)!r}",
         )
         require(
             self.max_retries >= 1,

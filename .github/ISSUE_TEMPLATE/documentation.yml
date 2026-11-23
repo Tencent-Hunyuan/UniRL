@@ -1,0 +1,35 @@
+# Adapted from vllm-project/vllm-omni.
+name: Documentation
+description: Report missing, stale, or inaccurate documentation or module README contracts
+title: "[Doc]: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues](https://github.com/Tencent-Hunyuan/UniRL/issues) first.
+        Module READMEs follow [`.claude/skills/development/readme-guide/SKILL.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/.claude/skills/development/readme-guide/SKILL.md) as single source of truth alongside the code.
+
+  - type: textarea
+    id: doc-issue
+    attributes:
+      label: Documentation issue
+      description: File path or doc URL, and what is missing, stale, or misleading.
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggested-fix
+    attributes:
+      label: Suggested fix or clarification
+      description: What the contract, command, or Gotcha should say instead.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: pre-submit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues/PRs for duplicates.
+          required: true

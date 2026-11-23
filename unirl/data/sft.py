@@ -14,15 +14,6 @@ from unirl.data.datasets import _LEGACY_EMBEDDING_FIELDS, _normalize_media_refs,
 logger = logging.getLogger(__name__)
 
 
-def _compute_manifest_fingerprint(path: str) -> str:
-    """Hash a training manifest for resume identity."""
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
 _SUPERVISED_EXCLUDED_KEYS = {
     "prompt",
     "caption",
@@ -178,18 +169,20 @@ class SupervisedDataset:
         self._base_dir = os.path.dirname(os.path.abspath(file_path))
         prefix = os.path.basename(file_path) or "sft_source"
         self.records: List[Dict[str, Any]] = []
-        for idx, item in enumerate(self._iter_raw(file_path)):
+        for idx, item in enumerate(self._iter_raw()):
             record = normalize_supervised_example(item, default_sample_id=f"{prefix}:{idx}", base_dir=self._base_dir)
             self.records.append(record)
         if not self.records:
             raise ValueError(f"No supervised examples found in {file_path}")
         logger.info("Loaded %d supervised examples from %s", len(self.records), file_path)
 
-    @staticmethod
-    def _iter_raw(path: str) -> Iterator[Dict[str, Any]]:
+    def _iter_raw(self) -> Iterator[Dict[str, Any]]:
+        path = self.file_path
+        digest = hashlib.sha256()
         if path.endswith(".jsonl"):
             with open(path, "rb") as handle:
                 for line_num, line in enumerate(handle, 1):
+                    digest.update(line)
                     line = line.strip()
                     if not line:
                         continue
@@ -199,12 +192,16 @@ class SupervisedDataset:
                         raise ValueError(f"{path}:{line_num}: invalid JSON — {exc}") from exc
         elif path.endswith(".json"):
             with open(path, "rb") as handle:
-                data = json.load(handle)
+                raw = handle.read()
+            digest.update(raw)
+            data = json.loads(raw)
+            del raw
             if not isinstance(data, list):
                 raise ValueError(f"{path}: .json supervised manifests must be a list of objects.")
             yield from data
         else:
             raise ValueError(f"Unsupported supervised manifest format: {path} (use .jsonl or .json)")
+        self.manifest_fingerprint = f"sha256:{digest.hexdigest()}"
 
     def __len__(self) -> int:
         return len(self.records)
@@ -225,7 +222,6 @@ class SupervisedDataSource:
         shuffle: bool = True,
     ) -> None:
         self.dataset = SupervisedDataset(train_manifest_path)
-        self._manifest_fingerprint: Optional[str] = None
         self.eval_dataset = SupervisedDataset(eval_manifest_path) if eval_manifest_path else None
         self.seed = seed
         self.shuffle = shuffle
@@ -282,9 +278,7 @@ class SupervisedDataSource:
 
     @property
     def manifest_fingerprint(self) -> str:
-        if self._manifest_fingerprint is None:
-            self._manifest_fingerprint = _compute_manifest_fingerprint(self.dataset.file_path)
-        return self._manifest_fingerprint
+        return self.dataset.manifest_fingerprint
 
     def state_dict(self) -> Dict[str, Any]:
         return {

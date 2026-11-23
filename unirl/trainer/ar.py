@@ -16,8 +16,9 @@ from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
 from unirl.distributed.tensor import hydrate
+from unirl.reward.service import score_and_attach
 from unirl.train.stack import TrainStepResult
-from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
+from unirl.trainer.base import BaseTrainer, build_sampling_dict, pad_eval_inputs, prepare_input_sample
 from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.rollout_sleep import must_preserve_rollout_weights
 from unirl.types.sample import Sample
@@ -473,7 +474,7 @@ class ARTrainer(BaseTrainer):
                 sample = self.rollout.generate(sample)
 
         if self.reward is not None:
-            sample = self.reward.score_and_attach(sample)
+            sample = score_and_attach(self.reward, sample)
 
         return sample
 
@@ -561,9 +562,6 @@ class ARTrainer(BaseTrainer):
         part = sample.parts[-1]
         mean_reward = 0.0
         if part.rewards is not None:
-            part.rewards = hydrate(part.rewards)
-            if isinstance(part.component_rewards, dict):
-                part.component_rewards = {name: hydrate(value) for name, value in part.component_rewards.items()}
             mean_reward = float(part.rewards.to(torch.float32).mean().item())
             if self._algorithm_requires_advantages and self.advantage_mode == "grpo":
                 part = part.compute_advantages(
@@ -625,6 +623,8 @@ class ARTrainer(BaseTrainer):
             eval_num_prompts=self.eval_num_prompts,
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
+        # Rollout and reward each DP-split the request, so every dispatched batch is a multiple of both DP sizes.
+        pad_multiple = math.lcm(self.rollout.dp_size, self.reward.dp_size)
 
         anchored = self._rollout_anchor_device is not None
 
@@ -656,13 +656,13 @@ class ARTrainer(BaseTrainer):
                     batch_n += 1
                     real_prompt_n = eval_inputs.batch_size
                     prompt_n += real_prompt_n
-                    dispatch_inputs = self._pad_eval_inputs(eval_inputs)
+                    dispatch_inputs = pad_eval_inputs(eval_inputs, pad_multiple)
                     sample = self._build_request_sample(dispatch_inputs, rollout_id, sampling=eval_sp)
                     generated = self.rollout.generate(sample)
-                    scored = self.reward.score_and_attach(generated)
+                    scored = score_and_attach(self.reward, generated)
                     rewards = scored.parts[-1].rewards
                     if rewards is not None:
-                        rewards = hydrate(rewards).to(torch.float32)
+                        rewards = rewards.to(torch.float32)
                         fanout = total_samples_per_prompt(eval_sp)
                         expected_total = dispatch_inputs.batch_size * fanout
                         if int(rewards.numel()) != expected_total:
@@ -697,38 +697,6 @@ class ARTrainer(BaseTrainer):
         )
         self.wandb_logger.log_eval(rollout_id + 1, {"acc": acc, "reward": acc})
         return acc
-
-    def _pad_eval_inputs(self, inputs: Sample) -> Sample:
-        """Append replicated prompt rows until rollout and reward DP can shard."""
-        n = inputs.batch_size
-        if n == 0:
-            return inputs
-        multiple = math.lcm(self.rollout.dp_size, self.reward.dp_size)
-        pad_n = (-n) % multiple
-        if pad_n == 0:
-            return inputs
-
-        source = inputs.slice(n - 1, n)
-        source_root_id = source.parts[0].sample_ids[0]
-        used_root_ids = set(inputs.parts[0].sample_ids)
-        padded: list[Sample] = []
-        for i in range(pad_n):
-            candidate = f"{source_root_id}:eval-pad:{i}"
-            while candidate in used_root_ids:
-                candidate += ":pad"
-            used_root_ids.add(candidate)
-
-            def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
-                root, separator, suffix = sample_id.partition("/")
-                if root != source_root_id:
-                    raise ValueError(
-                        "ARTrainer._pad_eval_inputs: selected pad tree contains "
-                        f"unexpected root {root!r}; expected {source_root_id!r}."
-                    )
-                return new_root + (f"/{suffix}" if separator else "")
-
-            padded.append(source.map_sample_ids(replace_root))
-        return Sample.concat([inputs, *padded])
 
     def _dump_rollout_samples(self, sample, rollout_id: int) -> None:
         """Debug dump of the first N (prompt, output, reward) triples per rollout."""

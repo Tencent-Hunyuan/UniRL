@@ -16,11 +16,9 @@ logger = logging.getLogger(__name__)
 class WeightSync:
     """Sync ops + LoRA lifecycle over the seam (one instance per engine)."""
 
-    def __init__(self, backend: Backend, *, uses_lora: bool) -> None:
+    def __init__(self, backend: Backend) -> None:
         self._backend = backend
-        self._uses_lora = uses_lora
         self._active_adapter: Optional[str] = None
-        self._lora_loaded = False
         self._lora_version = 0
 
     def update_weights_from_tensor(
@@ -114,7 +112,6 @@ class WeightSync:
             config_dict=peft_config,
         )
         self._active_adapter = nickname
-        self._lora_loaded = True
         logger.info(
             "sglang: LoRA adapter %r loaded as %r (%d tensor keys)",
             adapter_name,
@@ -122,19 +119,10 @@ class WeightSync:
             len(lora_tensors),
         )
 
-    def mark_weights_released(self) -> None:
-        """The engine released the runtime weights — the loaded LoRA pool is gone."""
-        self._lora_loaded = False
-
     @property
     def active_adapter(self) -> Optional[str]:
-        """The adapter name generation should tag requests with (None = base)."""
-        return self._active_adapter if self._lora_loaded else None
-
-    @property
-    def lora_dirty(self) -> bool:
-        """True when LoRA is in use but the adapter must be (re)pushed before generate."""
-        return self._uses_lora and not self._lora_loaded
+        """The adapter name generation tags requests with (None = base); see ../README.md Gotchas."""
+        return self._active_adapter
 
 
 __all__ = ["WeightSync"]
