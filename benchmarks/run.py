@@ -257,17 +257,15 @@ def _run_text_benchmark(spec: BenchmarkSpec, tag: str, args) -> None:
     if args.stage in ("all", "score"):
         if not completions_file.exists():
             raise SystemExit(f"{spec.name}: {completions_file} missing — run --stage generate (with --endpoint) first")
-        responses: Dict[str, List[str]] = {}
-        for row in read_completions(completions_file):
-            responses.setdefault(row["id"], []).append(row["response"])
-        n_short = sum(k - min(k, len(responses.get(item["id"], []))) for item in items)
+        responses = {(row["id"], row["sample"]): row["response"] for row in read_completions(completions_file)}
+        n_short = sum((item["id"], sample) not in responses for item in items for sample in range(k))
         if n_short:
             raise SystemExit(f"{spec.name}: {n_short} completions missing — rerun --stage generate to fill them")
         grader = GRADERS[spec.grader]
         accs = []
         with open(bench_dir / "scores.jsonl", "w") as f:
             for item in items:
-                acc = grader(item["answer"], responses[item["id"]][:k])
+                acc = grader(item["answer"], [responses[item["id"], sample] for sample in range(k)])
                 accs.append(acc)
                 f.write(json.dumps({"id": item["id"], "acc": acc, "n": k}) + "\n")
         metrics = {"acc": sum(accs) / len(accs)}
