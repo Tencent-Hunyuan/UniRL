@@ -261,7 +261,7 @@ class Part(Batch):
         rewards_local = hydrate(self.rewards)
 
         if scope == "global":
-            rewards_g = rewards_local.to(torch.float32)
+            rewards_g = rewards_local.to(torch.float64)
             finite = torch.isfinite(rewards_g)
             mean, std = finite_mean_std(rewards_g)
             centered = torch.where(finite, rewards_g - mean, torch.zeros_like(rewards_g))
@@ -269,7 +269,7 @@ class Part(Batch):
                 adv_g = centered / (std + eps)
             else:
                 adv_g = centered
-            return _part_with_field(self, "advantages", adv_g)
+            return _part_with_field(self, "advantages", adv_g.float())
 
         if group_size is not None:
             if group_size < 1 or n % group_size:
@@ -294,7 +294,7 @@ class Part(Batch):
                 "Siblings must be consecutive (use fork), got interleaved ordering."
             )
 
-        rewards = rewards_local.to(torch.float32)
+        rewards = rewards_local.to(torch.float64)
         reshaped = rewards.view(n_groups, branch)
         # Per-row finite mean/std (same contract as :func:`finite_mean_std`, vectorized).
         finite = torch.isfinite(reshaped)
@@ -311,7 +311,7 @@ class Part(Batch):
             adv = centered / (std + eps)
         else:
             adv = centered
-        return _part_with_field(self, "advantages", adv.flatten())
+        return _part_with_field(self, "advantages", adv.flatten().float())
 
     def compute_gae_advantages(
         self,
