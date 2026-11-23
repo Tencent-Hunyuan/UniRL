@@ -1,0 +1,73 @@
+# Adapted from vllm-project/vllm-omni.
+name: Performance & operator optimization
+description: Propose a kernel, hot-path, host-sync, overlap, or memory optimization, or report a performance regression
+title: "[Perf]: "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues and PRs](https://github.com/Tencent-Hunyuan/UniRL/issues) first.
+        For optimization rules across training and inference hot paths (Class A/B/C sync taxonomy, backend operator placement, and verification tiers), read the [hot-path and backend guide](https://github.com/Tencent-Hunyuan/UniRL/blob/main/.claude/skills/development/hot-path-and-backend-changes/SKILL.md).
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Target subsystem / backend
+      options:
+        - Train backend - FSDP2 (unirl/train/backend/fsdp/)
+        - Train backend - VeOmni SP/EP (unirl/train/backend/veomni/)
+        - Train stack / planner / anchor (unirl/train/stack/)
+        - Rollout - vLLM-Omni (unirl/rollout/engine/vllm_omni/)
+        - Rollout - SGLang / SGLang-Diffusion
+        - Rollout - FastVideo / Trainside / Composed / Agentic
+        - SDE / schedule / replay (unirl/sde/)
+        - Reward / judge (unirl/reward/)
+        - Distributed / weight sync / transport (unirl/distributed/)
+        - Model bundle / kernels (unirl/models/)
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type
+      options:
+        - Proposal (kernel / host-sync removal / overlap / memory optimization)
+        - Performance regression report
+        - Benchmarking / profiling discussion
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Bottleneck, proposal, or regression details
+      description: >
+        Describe the hot path, Class A/B host-sync sites, kernel/collective overhead, or regression delta.
+        State expected baseline → target metrics (step time, tokens/s, peak memory) and numerical parity constraints (`on-policy` ratio / `atol,rtol`).
+    validations:
+      required: true
+
+  - type: textarea
+    id: profiling-env
+    attributes:
+      label: Profiling & environment details
+      description: >
+        Include `git rev-parse HEAD`, GPU model/count/interconnect, recipe (`--config-name`), package versions (`torch`, `vllm`, `vllm-omni`, `sglang`, `veomni`), and `UNIRL_PROFILE=one-update|train` Perfetto summary if available.
+      placeholder: |
+        - UniRL SHA:
+        - Hardware / topology:
+        - Recipe & command:
+        - Profile / metrics:
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: pre-submit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues/PRs and confirmed this is not already tracked.
+          required: true

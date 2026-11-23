@@ -21,6 +21,7 @@ from .base import (
     resolve_clip_range_from_schedule,
     rollout_replay_logp_absdiff,
     typed_conditions,
+    zero_loss_backward,
 )
 
 
@@ -225,7 +226,7 @@ class PPO(StageAlgorithm):
                 )
         active_count = int(active.sum().item())
         if active_count == 0:
-            return AlgorithmStepResult(loss=0.0, metrics={}, num_steps_or_tokens=0, has_backward=False)
+            return zero_loss_backward(new_logp, new_values)
 
         clip_range = resolve_clip_range_from_schedule(self.clip_range, self.clip_schedule, training_progress)
         clip_high = (

@@ -35,8 +35,9 @@ def load_training_checkpoint(path: str) -> Dict[str, object]:
             checkpoint.update(torch.load(app_metadata, map_location="cpu", weights_only=True))
             checkpoint["_checkpoint_format"] = "dcp"
             return checkpoint
-        if os.path.exists(app_metadata) or any(
-            name.endswith(".distcp") or name == ".metadata.tmp" for name in os.listdir(path)
+        if os.path.exists(app_metadata) or (
+            not os.path.isfile(file_path)
+            and any(name.endswith(".distcp") or name == ".metadata.tmp" for name in os.listdir(path))
         ):
             raise RuntimeError(f"incomplete DCP checkpoint at {path!r}: async shard flush has not published .metadata")
         path = file_path
