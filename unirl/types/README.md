@@ -200,7 +200,8 @@ Both sinks warn on output failures instead of interrupting training.
 ### Gotchas
 
 - **A step's index is replaced after its media are written.** A retry uses new filenames, so a failed
-  index write leaves the previous index and its media intact. After publication the sink removes only
+  index write, or a retry in which every record is skipped, leaves the previous index and its media
+  intact. After publication the sink removes only
   files named in the previous index. Failed cleanup warns and leaves the new index usable.
 - **Malformed media are isolated.** The local sink skips the affected record and removes its partial
   files. The remaining rows still reach the index. W&B skips failed media entries and keeps the rest of

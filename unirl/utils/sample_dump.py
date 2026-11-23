@@ -137,6 +137,9 @@ def dump_sample_records(root: str, records: List[SampleRecord]) -> None:
                 continue
             written.extend(record_files)
             rows.append(row)
+        if not rows:
+            logger.warning("Local sample observation kept %s: no record could be written.", index_path)
+            return
         staged.write_text("".join(f"{row}\n" for row in rows), encoding="utf-8")
         os.replace(staged, index_path)
     except Exception as exc:
