@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from functools import partial
 from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -309,12 +308,12 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         )
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
-        prediction_cache = (
-            RolloutPredictionCache(T) if params.cache_art_old_predictions and len(needed) == T + 1 else None
-        )
-        rollout_step = self.step.step_with_logp
-        if prediction_cache is not None:
-            rollout_step = partial(self.step.step, prediction_cache=prediction_cache)
+        if params.cache_art_old_predictions and len(needed) != T + 1:
+            raise ValueError(
+                f"WAN21DiffusionStage.diffuse: cache_art_old_predictions=True requires dense trajectory storage "
+                f"(all {T + 1} positions), got {len(needed)}."
+            )
+        prediction_cache = RolloutPredictionCache(T) if params.cache_art_old_predictions else None
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
@@ -330,7 +329,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
             )
 
             with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = rollout_step(
+                new_latents, log_prob, _ = self.step.step(
                     self.model,
                     conditions,
                     strategy=self.strategy,
@@ -342,6 +341,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
                     sigma_max=sigma_max,
                     step_index=i,
                     generator=step_generators,
+                    prediction_cache=prediction_cache,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 

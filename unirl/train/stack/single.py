@@ -249,13 +249,14 @@ class TrainStack(BaseTrainStack):
             )
         for part in window:
             self._align_track_inputs(part)
+        ri = self.rank_info or self.fsdp_backend.rank_info
         arranged = self.update_planner.arrange_many(
             window,
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
-            prompt_groups=self.algorithm.update_prompt_groups,
-            dp_rank=self.rank_info.dp_rank if self.rank_info is not None else 0,
+            prompt_group_size=self.algorithm.update_group_size,
+            dp_rank=ri.dp_rank if ri is not None else 0,
         )
         from unirl.utils.profiling import profile_mode
 

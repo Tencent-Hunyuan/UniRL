@@ -655,7 +655,7 @@ class UniRLWandBLogger:
     def log_progress(
         self,
         rollout_id: int,
-        num_rollouts: Optional[int],
+        num_rollouts: int,
         results: Union["TrainStepResult", Dict[str, "TrainStepResult"]],
         mean_reward: float,
         *,
@@ -698,9 +698,9 @@ class UniRLWandBLogger:
             body = _fmt(results)
         suffix = ("  " + " ".join(f"{k}={v}" for k, v in extra.items())) if extra else ""
         log.info(
-            "rollout %d/%s  reward=%.4f  %s%s",
+            "rollout %d/%d  reward=%.4f  %s%s",
             rollout_id + 1,
-            num_rollouts if num_rollouts is not None else "unlimited",
+            num_rollouts,
             mean_reward,
             body,
             suffix,

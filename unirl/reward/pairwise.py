@@ -46,11 +46,11 @@ class PairwiseRewardBackend(RewardBackend):
     supports_truncation_penalty = False
 
     def __init__(self, judge: PairwiseJudge, group_size: int, batch_size: int = 8, seed: int = 0) -> None:
-        if not isinstance(group_size, int) or group_size < 2 or group_size % 2:
+        if isinstance(group_size, bool) or not isinstance(group_size, int) or group_size < 2 or group_size % 2:
             raise ValueError("PairwiseRewardBackend.group_size must be an even integer >= 2.")
-        if not isinstance(batch_size, int) or batch_size < 1:
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError("PairwiseRewardBackend.batch_size must be a positive integer (pairs per call).")
-        if not isinstance(seed, int) or seed < 0:
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("PairwiseRewardBackend.seed must be a nonnegative integer.")
         super().__init__(model_name="pairwise", batch_size=batch_size, prompt_source=judge.prompt_source)
         self.judge = judge
@@ -121,8 +121,10 @@ class ScalarComparisonJudge(PairwiseJudge):
     """Compare scores from an independent pointwise reward backend."""
 
     def __init__(self, backend: RewardBackend) -> None:
-        if getattr(backend, "requires_complete_groups", False):
+        if not isinstance(backend, RewardBackend) or backend.requires_complete_groups:
             raise ValueError("ScalarComparisonJudge requires an independent per-candidate scalar backend.")
+        if isinstance(backend.batch_size, bool) or not isinstance(backend.batch_size, int) or backend.batch_size < 1:
+            raise ValueError("Scalar comparison backend.batch_size must be a positive integer.")
         self.backend = backend
         self.input_kind = backend.preferred_input_kind
         self.prompt_source = backend.prompt_source
@@ -132,8 +134,6 @@ class ScalarComparisonJudge(PairwiseJudge):
             raise ValueError("ScalarComparisonJudge requires adjacent candidate pairs.")
         scores: list[float] = []
         limit = self.backend.batch_size
-        if not isinstance(limit, int) or limit < 1:
-            raise ValueError("Scalar comparison backend.batch_size must be a positive integer.")
         for start in range(0, request.batch_size, limit):
             rows = list(range(start, min(start + limit, request.batch_size)))
             response = self.backend.compute_rewards(request.select(rows))
@@ -174,13 +174,24 @@ class PairwiseImageJudge(PairwiseJudge):
         api_key_env: str = "JUDGE_API_KEY",
         prompt_source: PromptSource = DEFAULT_PROMPT_SOURCE,
     ) -> None:
-        if not endpoint or not model or not math.isfinite(timeout) or timeout <= 0:
+        if (
+            not endpoint
+            or not model
+            or isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
             raise ValueError("PairwiseImageJudge requires endpoint, model, and a finite positive timeout.")
         self.endpoint = endpoint
         self.model = model
-        self.timeout = timeout
+        self.timeout = float(timeout)
         self.api_key_env = api_key_env
         self.prompt_source = prompt_source
+        self._session = requests.Session()
+
+    def dispose(self) -> None:
+        self._session.close()
 
     def score_pairs(self, request: RewardRequest) -> list[float]:
         images = request.images
@@ -212,7 +223,7 @@ class PairwiseImageJudge(PairwiseJudge):
                 content.extend(
                     [{"type": "text", "text": f"Image {label}:"}, {"type": "image_url", "image_url": {"url": url}}]
                 )
-            response = requests.post(
+            with self._session.post(
                 self.endpoint,
                 json={
                     "model": self.model,
@@ -222,9 +233,9 @@ class PairwiseImageJudge(PairwiseJudge):
                 },
                 headers=headers,
                 timeout=self.timeout,
-            )
-            response.raise_for_status()
-            verdict = response.json()["choices"][0]["message"]["content"].strip().upper()
+            ) as response:
+                response.raise_for_status()
+                verdict = response.json()["choices"][0]["message"]["content"].strip().upper()
             if verdict not in {"A", "B", "TIE"}:
                 raise ValueError("Pairwise image judge must reply with exactly A, B, or TIE.")
             labels.append({"A": 1.0, "B": 0.0, "TIE": 0.5}[verdict])

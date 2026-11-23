@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from functools import partial
 from typing import ClassVar, List, Optional, Set, Tuple
 
 import torch
@@ -278,19 +277,19 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
         )
         sigma_max = schedule[1].float() if int(schedule.shape[0]) > 1 else torch.tensor(0.99)
 
-        prediction_cache = (
-            RolloutPredictionCache(T) if params.cache_art_old_predictions and len(needed) == T + 1 else None
-        )
-        rollout_step = self.step.step_with_logp
-        if prediction_cache is not None:
-            rollout_step = partial(self.step.step, prediction_cache=prediction_cache)
+        if params.cache_art_old_predictions and len(needed) != T + 1:
+            raise ValueError(
+                f"SD3DiffusionStage.diffuse: cache_art_old_predictions=True requires dense trajectory storage "
+                f"(all {T + 1} positions), got {len(needed)}."
+            )
+        prediction_cache = RolloutPredictionCache(T) if params.cache_art_old_predictions else None
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = params.eta if i in sde_set else 0.0
 
             with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = rollout_step(
+                new_latents, log_prob, _ = self.step.step(
                     self.model,
                     conditions,
                     strategy=self.strategy,
@@ -301,6 +300,7 @@ class SD3DiffusionStage(BatchedStepReplayMixin, DiffusionStage[SD3Conditions]):
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
+                    prediction_cache=prediction_cache,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 

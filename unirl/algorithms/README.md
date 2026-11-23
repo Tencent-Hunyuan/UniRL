@@ -217,7 +217,7 @@ conditions. It uses the train-side fallback described below.
 These dimensions are frame counts, not video durations in seconds.
 
 `prepare_part` groups scalar advantages by sample lineage, using the same
-default parent layer as `Part.compute_advantages` (`group_layer` overrides it).
+parent layer as `Part.compute_advantages`.
 The group size must match `params.samples_per_prompt`. Train workers exchange
 sample metadata and compute intact groups locally. For groups spanning DP shards,
 they reduce centered endpoint and reward moments in FP64. SP/TP replicas count

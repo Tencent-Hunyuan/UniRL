@@ -54,11 +54,11 @@ class UpdatePlanner:
         num_updates: int,
         micro_batch_size: int,
         shuffle_step: Optional[int],
-        prompt_groups: tuple[int, int | None] | None = None,
+        prompt_group_size: Optional[int] = None,
         dp_rank: int = 0,
     ) -> Tuple[Arrangement, ...]:
         """Arrange lineage-aligned parts; one permutation of the coarsest part orders them all."""
-        if prompt_groups is None and not (self.shuffle_updates and num_updates > 1):
+        if prompt_group_size is None and not (self.shuffle_updates and num_updates > 1):
             return tuple(
                 (*self.micro_planner.arrange(part, num_updates=num_updates, micro_batch_size=micro_batch_size), None)
                 for part in parts
@@ -70,11 +70,11 @@ class UpdatePlanner:
         generator = None
         if self.shuffle_updates:
             generator = torch.Generator().manual_seed((self.shuffle_seed + shuffle_step) & 0xFFFFFFFF)
-        if prompt_groups is not None:
+        if prompt_group_size is not None:
             if num_updates != 2 or not isinstance(self.micro_planner, CountPlanner):
                 raise ValueError("Prompt-stratified updates require two updates and CountPlanner micro-batching.")
             coarse_order = prompt_half_order(
-                coarse, parts[-1], prompt_groups=prompt_groups, dp_rank=dp_rank, generator=generator
+                coarse, parts[-1], group_size=prompt_group_size, dp_rank=dp_rank, generator=generator
             )
         else:
             coarse_order = torch.randperm(coarse_size, generator=generator)

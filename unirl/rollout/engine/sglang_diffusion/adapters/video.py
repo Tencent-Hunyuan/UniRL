@@ -68,6 +68,11 @@ class HunyuanVideo10Adapter(VideoAdapter):
         """Convert sampling guidance to Hunyuan checkpoint units unless explicitly overridden."""
         if "embedded_cfg_scale" in self.cfg.engine_kwargs:
             return {}
+        if not isinstance(self.cfg.sampling, DiffusionSamplingParams):
+            raise ValueError(
+                "HunyuanVideo-1.0 SGLang rollout requires rollout.config.sampling: ${sampling} "
+                "or an explicit rollout.config.engine_kwargs.embedded_cfg_scale."
+            )
         return {"embedded_cfg_scale": self.cfg.sampling.guidance_scale * 1000.0}
 
     def build_condition(self, results: List[RawResult]) -> Dict[str, Any]:

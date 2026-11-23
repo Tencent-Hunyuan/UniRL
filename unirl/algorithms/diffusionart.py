@@ -31,7 +31,6 @@ class DiffusionARTConfig(BaseAlgorithmConfig):
     reference_nu: float = 0.8
     kl_mask_threshold: float = 1e-5
     timestep_chunk_size: int = 1
-    group_layer: Optional[int] = None
     restore_zero_signal: bool = False
 
 
@@ -85,7 +84,6 @@ class DiffusionART(StageAlgorithm):
         reference_nu: float = 0.8,
         kl_mask_threshold: float = 1e-5,
         timestep_chunk_size: int = 1,
-        group_layer: Optional[int] = None,
         restore_zero_signal: bool = False,
     ) -> None:
         super().__init__()
@@ -105,24 +103,20 @@ class DiffusionART(StageAlgorithm):
         require_timestep_chunk_size(timestep_chunk_size, algo="DiffusionART")
         if timestep_chunk_size is None:
             raise ValueError("DiffusionART requires a finite timestep_chunk_size.")
-        if group_layer is not None and (
-            isinstance(group_layer, bool) or not isinstance(group_layer, int) or group_layer < 0
-        ):
-            raise ValueError("DiffusionART group_layer must be a nonnegative integer or None.")
         if backend is not None and getattr(backend, "ema", None) is not None:
             raise ValueError("DiffusionART is EMA-free; remove ema_cfg and ema_lora_cfg from the backend.")
         self.params, self.backend, self.conditions_cls = params, backend, conditions_cls
+        self._autocast_dtype = getattr(self.stage, "autocast_dtype", None)
         if not isinstance(restore_zero_signal, bool):
             raise ValueError("DiffusionART restore_zero_signal must be a boolean.")
-        self.config = DiffusionARTConfig(
-            reference_nu, kl_mask_threshold, timestep_chunk_size, group_layer, restore_zero_signal
-        )
-        self._has_global_guidance = None
-        self._train_rollout = False
+        self.config = DiffusionARTConfig(reference_nu, kl_mask_threshold, timestep_chunk_size, restore_zero_signal)
+
+    def _resolve_rank_info(self):
+        return self.rank_info or (None if self.backend is None else self.backend.rank_info)
 
     @property
-    def update_prompt_groups(self) -> tuple[int, Optional[int]]:
-        return self.params.samples_per_prompt, self.config.group_layer
+    def update_group_size(self) -> int:
+        return self.params.samples_per_prompt
 
     def _validate_segment_shape(self, segment):
         """Check dense ``[B, T+1, *latent]`` metadata without reading device tensor values."""
@@ -176,6 +170,12 @@ class DiffusionART(StageAlgorithm):
                 "DiffusionART requires all T+1 trajectory states; configure dense trajectory storage at eta=0."
             )
         cached = part.segment.art_old_predictions
+        if self.params.cache_art_old_predictions and cached is None:
+            raise ValueError(
+                "DiffusionART: sampling.cache_art_old_predictions=True requires rollout velocity caching, "
+                "but segment.art_old_predictions is None. Disable cache_art_old_predictions for external "
+                "engines or stages without rollout prediction caching."
+            )
         if cached is not None:
             latents = part.segment.latents
             if (
@@ -197,13 +197,11 @@ class DiffusionART(StageAlgorithm):
             raise ValueError("DiffusionART requires finite endpoints and advantages.")
         if any(not isinstance(sid, str) or not sid for sid in part.sample_ids):
             raise ValueError("DiffusionART requires nonempty string sample_ids.")
-        layer = self.config.group_layer
-        if layer is None:
-            layer = max(part.sample_ids[0].count("/") - 1, 0)
+        layer = max(part.sample_ids[0].count("/") - 1, 0)
         for sid in part.sample_ids:
             ancestor_id(sid, layer)
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            ri = getattr(self.backend, "rank_info", None)
+            ri = self._resolve_rank_info()
             if ri is None or ri.world_size != dist.get_world_size():
                 raise ValueError("DiffusionART covariance requires backend RankInfo for the train process group.")
 
@@ -227,10 +225,9 @@ class DiffusionART(StageAlgorithm):
     def _predict(self, conditions, segment, step):
         """Predict one stored state at its original micro geometry, with stage autocast."""
         sample = segment.latents[:, step]
-        dtype = getattr(self.stage, "autocast_dtype", None)
         ctx = (
-            torch.autocast("cuda", dtype)
-            if sample.is_cuda and dtype in (torch.bfloat16, torch.float16)
+            torch.autocast("cuda", self._autocast_dtype)
+            if sample.is_cuda and self._autocast_dtype in (torch.bfloat16, torch.float16)
             else nullcontext()
         )
         with ctx:
@@ -260,13 +257,11 @@ class DiffusionART(StageAlgorithm):
         self._validate_segment_shape(part.segment)
         x = part.segment.latents[:, -1].detach().float()
         adv = part.advantages.detach().to(x)
-        layer = self.config.group_layer
-        if layer is None:
-            layer = max(part.sample_ids[0].count("/") - 1, 0)
+        layer = max(part.sample_ids[0].count("/") - 1, 0)
         labels = [ancestor_id(sid, layer) for sid in part.sample_ids]
         distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         rank = dist.get_rank() if distributed else 0
-        ri = getattr(self.backend, "rank_info", None)
+        ri = self._resolve_rank_info()
         input_eps = max(
             torch.finfo(t.dtype).eps for t in (part.segment.latents, part.advantages, x) if t.is_floating_point()
         )
@@ -348,31 +343,33 @@ class DiffusionART(StageAlgorithm):
         if distributed:
             dist.all_reduce(activity, op=dist.ReduceOp.MAX)
         if part.has_pairwise_labels:
-            self._has_global_guidance, any_preference, any_tie = activity.tolist()
-            self._train_rollout = self._has_global_guidance or (any_preference and any_tie)
+            has_guidance, any_preference, any_tie = activity.tolist()
+            train_rollout = bool(has_guidance or (any_preference and any_tie))
             if any_preference and any_tie:
                 part.segment.art_restore_anchor = ties
         else:
-            self._has_global_guidance = bool(activity)
-            self._train_rollout = self._has_global_guidance or self.config.restore_zero_signal
+            train_rollout = bool(activity) or self.config.restore_zero_signal
             if self.config.restore_zero_signal:
                 part.segment.art_restore_anchor = ~guidance.flatten(1).any(1)
+        part.segment.art_train_rollout = train_rollout
         part.segment.art_guidance = guidance
         return part
 
     def compute_loss_and_backward(self, *, conditions, segment, advantages, training_progress, loss_scale):
         steps = self._validate_segment_shape(segment)
         cached = segment.art_old_predictions
-        if (cached is None and not segment.art_self_anchor) or segment.art_guidance is None:
+        if (
+            (cached is None and not segment.art_self_anchor)
+            or segment.art_guidance is None
+            or segment.art_train_rollout is None
+        ):
             raise ValueError("DiffusionART requires prepare_segment and full-shard prepare_part before training.")
         expected = (segment.latents.shape[0], steps, *segment.latents.shape[2:])
         if (cached is not None and cached.shape != expected) or segment.art_guidance.shape != segment.latents[
             :, -1
         ].shape:
             raise ValueError("DiffusionART guidance/anchor shapes must match [B, *latent] / [B, T, *latent].")
-        if self._has_global_guidance is None:
-            raise ValueError("DiffusionART requires full-shard prepare_part before training.")
-        if not self._train_rollout:
+        if not segment.art_train_rollout:
             return AlgorithmStepResult(
                 loss=0.0,
                 metrics={"policy_loss": 0.0, "zero_signal_fraction": 1.0},

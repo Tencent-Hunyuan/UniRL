@@ -373,8 +373,8 @@ class StageAlgorithm(Remote, ABC):
     anchor_fields: Tuple[str, ...] = ()
 
     @property
-    def update_prompt_groups(self) -> tuple[int, int | None] | None:
-        """Optional (group size, ancestor depth) for prompt-balanced two-update membership."""
+    def update_group_size(self) -> Optional[int]:
+        """Optional prompt group size for prompt-balanced two-update membership."""
         return None
 
     def validate_part(self, part: "Part") -> None:

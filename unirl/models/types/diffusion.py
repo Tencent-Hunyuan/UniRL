@@ -21,24 +21,34 @@ class RolloutPredictionCache:
     """Copy each denoiser output into step-major host storage and expose it as [B, T, *latent]."""
 
     def __init__(self, num_steps: int) -> None:
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 1:
+            raise ValueError(f"RolloutPredictionCache.num_steps must be a positive int; got {num_steps!r}.")
         self.num_steps = num_steps
         self.buffer: Optional[torch.Tensor] = None
         self.ready: Optional[torch.cuda.Event] = None
+        self._recorded: set[int] = set()
 
     def store(self, step: int, prediction: torch.Tensor) -> None:
         """Queue a contiguous step copy on the rollout stream at the prediction's native precision."""
+        if not 0 <= step < self.num_steps or step in self._recorded:
+            raise ValueError(f"RolloutPredictionCache expected each step in 0..{self.num_steps - 1} once; got {step}.")
         if self.buffer is None:
             self.buffer = torch.empty(
                 (self.num_steps, *prediction.shape), device="cpu", dtype=prediction.dtype, pin_memory=prediction.is_cuda
             )
+        elif prediction.shape != self.buffer.shape[1:] or prediction.dtype != self.buffer.dtype:
+            raise ValueError("RolloutPredictionCache received inconsistent step prediction shape or dtype.")
         self.buffer[step].copy_(prediction.detach(), non_blocking=prediction.is_cuda)
-        if prediction.is_cuda and step == self.num_steps - 1:
+        self._recorded.add(step)
+        if prediction.is_cuda:
             self.ready = torch.cuda.current_stream(prediction.device).record_event()
 
     def finish(self) -> torch.Tensor:
-        """Wait for the final copy before the segment is sliced or transported."""
-        if self.buffer is None:
-            raise RuntimeError("No rollout predictions were recorded.")
+        """Wait for the queued copies before the segment is sliced or transported."""
+        if self.buffer is None or len(self._recorded) != self.num_steps:
+            raise RuntimeError(
+                f"RolloutPredictionCache recorded {len(self._recorded)} of {self.num_steps} rollout predictions."
+            )
         if self.ready is not None:
             self.ready.synchronize()
         return self.buffer.transpose(0, 1)

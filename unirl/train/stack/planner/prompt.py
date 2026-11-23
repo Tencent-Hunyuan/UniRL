@@ -15,12 +15,11 @@ def prompt_half_order(
     coarse: Part,
     target: Part,
     *,
-    prompt_groups: tuple[int, int | None],
+    group_size: int,
     dp_rank: int,
     generator: torch.Generator | None,
 ) -> torch.Tensor:
     """Order local lineage blocks so both updates contain half of each global prompt and DP shard."""
-    group_size, layer = prompt_groups
     local = (dp_rank, coarse.sample_ids if coarse is not target else None, target.sample_ids)
     metadata = [local]
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
@@ -48,7 +47,7 @@ def prompt_half_order(
         if any(not isinstance(sid, str) or not sid or sid in seen for sid in ids) or len(set(ids)) != len(ids):
             raise ValueError("Prompt-stratified updates require globally unique, nonempty sample IDs.")
         seen.update(ids)
-        depth = max(ids[0].count("/") - 1, 0) if layer is None else layer
+        depth = max(ids[0].count("/") - 1, 0)
         rows = torch.randperm(blocks, generator=generator).tolist() if generator is not None else range(blocks)
         if rank == dp_rank:
             local_rows = rows

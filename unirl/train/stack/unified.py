@@ -19,7 +19,6 @@ from unirl.train.stack import (
     resolve_loss_scales,
     validate_anchor_contract,
 )
-from unirl.train.stack.anchor import first_update_part
 from unirl.train.stack.base import BaseTrainStack
 from unirl.train.stack.planner import (
     CountPlanner,
@@ -210,8 +209,6 @@ class UnifiedModelTrainStack(BaseTrainStack):
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
-            prompt_groups=self.image_algorithm.update_prompt_groups,
-            dp_rank=self.rank_info.dp_rank if self.rank_info is not None else 0,
         )
 
         from unirl.utils.profiling import profile_mode
@@ -229,8 +226,8 @@ class UnifiedModelTrainStack(BaseTrainStack):
             for u in range(self.num_updates_per_batch):
                 per_update.append(
                     self._train_one_step(
-                        first_update_part(self.ar_algorithm, ar_part) if u == 0 else ar_part,
-                        first_update_part(self.image_algorithm, image_part) if u == 0 else image_part,
+                        ar_part,
+                        image_part,
                         ar_slices=ar_steps[u],
                         image_slices=image_steps[u],
                         ar_order=ar_order,

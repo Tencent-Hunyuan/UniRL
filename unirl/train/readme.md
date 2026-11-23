@@ -125,13 +125,6 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
-- **Diffusion training accepts `num_rollouts: null` for an unlimited run** —
-  rollout and optimizer counters keep advancing; only the fractional
-  `training_progress` input is fixed at zero because there is no total budget.
-  Use algorithms without budget-fraction schedules (such as DiffusionART) and
-  a constant learning rate. Periodic checkpoint/evaluation cadences still apply;
-  there is no budget-triggered final checkpoint. Finite budgets are unchanged.
-
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.

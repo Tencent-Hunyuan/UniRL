@@ -67,7 +67,7 @@ rollout:
   _target_: unirl.rollout.engine.trainside.engine.TrainsideRolloutEngine
   stage_attrs:
   - diffusion
-  forward_batch_size: 9
+  forward_batch_size: 8
 reward:
   _target_: unirl.reward.service.RewardService
   backend:
@@ -92,7 +92,7 @@ algorithm:
   timestep_chunk_size: 1
 stack:
   _target_: unirl.train.stack.TrainStack
-  micro_batch_size: 9
+  micro_batch_size: 8
   shuffle_updates: true
   max_grad_norm: 1.0
   num_updates_per_batch: 2
