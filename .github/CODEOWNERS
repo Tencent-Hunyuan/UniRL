@@ -26,7 +26,8 @@
 
 # --- rollout ---------------------------------------------------------------
 /unirl/rollout/                         @celve @zzhuoxin1508 @leviking98z-rgb
-/unirl/rollout/engine/asynchronous.py         @CjhHa1 @celve
+/unirl/rollout/engine/base.py           @CjhHa1 @celve
+/unirl/rollout/manager/                 @CjhHa1 @celve
 /unirl/rollout/engine/sglang/           @celve @leviking98z-rgb
 /unirl/rollout/engine/sglang_diffusion/ @celve @leviking98z-rgb
 /unirl/rollout/engine/vllm_omni/        @celve @zzhuoxin1508

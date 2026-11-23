@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import replace
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from hydra.utils import instantiate
 from omegaconf import DictConfig
@@ -60,6 +60,34 @@ def prepare_input_sample(
     if control is not None:
         root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
+
+
+def pad_eval_inputs(inputs: Sample, multiple: int) -> Sample:
+    """Append copies of the last prompt tree under unique ``:eval-pad:`` roots to reach a ``multiple``."""
+    n = inputs.batch_size
+    if n == 0 or n % multiple == 0:
+        return inputs
+    source = inputs.slice(n - 1, n)
+    source_root_id = source.parts[0].sample_ids[0]
+    used_root_ids = set(inputs.parts[0].sample_ids)
+    padded: List[Sample] = []
+    for i in range((-n) % multiple):
+        candidate = f"{source_root_id}:eval-pad:{i}"
+        while candidate in used_root_ids:
+            candidate += ":pad"
+        used_root_ids.add(candidate)
+
+        def replace_root(sample_id: str, *, new_root: str = candidate) -> str:
+            root, separator, suffix = sample_id.partition("/")
+            if root != source_root_id:
+                raise ValueError(
+                    "pad_eval_inputs: selected pad tree contains "
+                    f"unexpected root {root!r}; expected {source_root_id!r}."
+                )
+            return new_root + (f"/{suffix}" if separator else "")
+
+        padded.append(source.map_sample_ids(replace_root))
+    return Sample.concat([inputs, *padded])
 
 
 def build_sampling_dict(sampling_cfg: DictConfig) -> Dict[str, BaseSamplingParams]:

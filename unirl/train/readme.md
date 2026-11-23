@@ -173,8 +173,14 @@ use LoRA adapter mode. Formats and export live in
   masked micros backward at `loss_scale` 0, so AR-only params get zero grads that AdamW
   still decays and steps (skipping them would leave `None` grads, which AdamW skips). The
   image track steps, a warning is logged, and the update's `has_zero_valid_tokens` is 1.0
-  (a rollout-level mean over updates). A micro with no AR tokens at all is skipped by the
-  algorithm, which FSDP2 tolerates only when every DP rank skips it.
+  (a rollout-level mean over updates). Before device alignment and anchor preparation,
+  both stacks insert token 0 with `loss_mask=0` into each zero-length AR row, including
+  before SFT evaluation slices its batch. All ranks therefore run replay and, in training,
+  backward even for the final micro under `defer_grad_sync`. The placeholder contributes
+  no loss, valid tokens, or evaluation weight. Fully masked policy micros omit replay
+  diagnostics. Training-side response lengths include the placeholder.
+  An all-empty GSPO update now creates zero gradients and steps the optimizer, including
+  AdamW decay, instead of skipping the update.
 - **Advantages are not computed here** — `train` raises if
   `part.advantages is None`; the trainer must call `compute_advantages` on the
   full shard first.
@@ -249,6 +255,17 @@ use LoRA adapter mode. Formats and export live in
   the tolerance, and reports DP rank 0's worst `|ratio - 1|` as
   `first_update_ratio_dev`. Algorithms that omit `ratio_min` (`DPPO`, `DRPO`,
   `CPPO`, `DiffusionNFT`, `SFT`) raise `KeyError` on the first backward micro.
+- **Training hot paths ban Class A host-device syncs.** Never call `.item()`,
+  `.cpu()`, `.tolist()`, `.numpy()`, `bool(tensor)`, or CUDA `nonzero()` inside
+  micro-batch forward/backward or per-layer loops. Accumulate GPU scalar metrics via
+  `torch.stack` and transfer once at end-of-step; `optimizer_step`'s single
+  non-finite `grad_norm` check and VeOmni EP `split_sizes` host conversion stay
+  within Class B budget (`<= 1` per boundary).
+- **Backend-specific operators live in their owning backend or `models/<family>/`.**
+  Keep `FSDPBackend` (`backend/fsdp/`) and `VeOmniBackend` (`backend/veomni/`) behind
+  the `BaseFSDP2Backend` contract (`backend/base_backend.py`) so `TrainStack` and
+  `algorithms/` remain backend-agnostic; never copy legacy cross-layer coupling from
+  `models/{hunyuan_image3,qwen3_moe,qwen3_5}` or `models/cosmos3`.
 
 ## Profiling → Perfetto
 

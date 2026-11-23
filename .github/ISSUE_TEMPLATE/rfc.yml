@@ -1,0 +1,78 @@
+# Adapted from vllm-project/vllm-omni.
+name: Request for comments (RFC)
+description: Propose a major architectural change, cross-layer contract, operator/backend design, or breaking migration
+title: "[RFC]: "
+labels: ["RFC"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues and RFCs](https://github.com/Tencent-Hunyuan/UniRL/issues) first — overlapping proposals may be consolidated.
+        Read [`AGENTS.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/AGENTS.md), [`unirl/README.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/unirl/README.md), and the [hot-path and backend guide](https://github.com/Tencent-Hunyuan/UniRL/blob/main/.claude/skills/development/hot-path-and-backend-changes/SKILL.md) before drafting.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation and problem
+      description: >
+        What problem, bottleneck, or architectural gap is blocked today, and why can't existing recipes, local policy, or minor bugfixes solve it cleanly?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-change
+    attributes:
+      label: Proposed design and layering seam
+      description: >
+        Specify the contracts, public/config interfaces, exact file ownership (`trainer/`, `rollout/`, `reward/`, `algorithms/`, `train/`, `models/`, `sde/`, `distributed/`, `config/`, `types/`), why any shared abstraction is justified, and `DELETE-WHEN` conditions for temporary workarounds or upstream patches.
+      placeholder: |
+        - Architecture / contract summary:
+        - Affected packages and dependency direction (`lint/check_core_dependencies.py`):
+        - Shared mechanism vs backend/model-local policy rationale:
+        - Alternatives considered:
+    validations:
+      required: true
+
+  - type: textarea
+    id: compat-sync-perf
+    attributes:
+      label: Compatibility, sync, and hot-path budget
+      description: >
+        Cover compatibility across training backends (`FSDPBackend`, `VeOmniBackend`), rollout engines (`trainside`, `vllm_omni`, `sglang`, `sglang_diffusion`, `fastvideo`, `composed`), dependency extras exclusivity (e.g. `sglang` vs `vllm`), checkpoint/config migration, and Class A/B/C host-device sync behavior on both training and rollout hot paths.
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification-plan
+    attributes:
+      label: Verification plan
+      description: >
+        Outline Tier 0–3 checks: lint/Hydra `--cfg job --resolve`, Perfetto trace (`UNIRL_PROFILE`) and parity bounds, single-GPU multi-rank vs real multi-GPU / multi-node matrix, and rollback plan.
+    validations:
+      required: true
+
+  - type: input
+    id: feedback-period
+    attributes:
+      label: Feedback period
+      description: Target review window (usually at least 1 week for breaking or cross-layer changes).
+      placeholder: 1 week
+    validations:
+      required: false
+
+  - type: textarea
+    id: cc-list
+    attributes:
+      label: CC list
+      description: Maintainers or subsystem owners from `.github/CODEOWNERS` to notify.
+      placeholder: "@..."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: pre-submit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues/PRs for overlapping work and checked layer boundaries against `unirl/README.md`.
+          required: true

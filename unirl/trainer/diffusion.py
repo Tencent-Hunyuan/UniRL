@@ -12,6 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.tensor import hydrate
+from unirl.reward.service import score_and_attach
 from unirl.train.configs import FSDPConfig, resolve_fsdp_mesh_shape
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, prepare_input_sample
@@ -861,7 +862,7 @@ class DiffusionTrainer(BaseTrainer):
         # With no reward configured, ``part.rewards`` stays None and the block below no-ops.
         if self.reward is not None and self.reward_stack is None:
             with self._reward_phase():
-                sample = self.reward.score_and_attach(sample)
+                sample = score_and_attach(self.reward, sample)
 
         part = sample.parts[-1]
         mean_reward = 0.0
@@ -1067,22 +1068,19 @@ class DiffusionTrainer(BaseTrainer):
             first_scored: Optional[Sample] = None
             with self._reward_phase(preserve_rollout=not sleep_rollout):
                 for name, reward in scorers:
-                    scored = reward.score_and_attach(generated)
+                    scored = score_and_attach(reward, generated)
                     if first_scored is None:
                         first_scored = scored
                     part = scored.parts[-1]
                     rewards = part.rewards
                     if rewards is not None:
-                        r = hydrate(rewards).to(torch.float32)
-                        if scored is first_scored:
-                            # Captions read part.rewards, which remote scoring returns dehydrated.
-                            part.rewards = r
+                        r = rewards.to(torch.float32)
                         sums[name] += float(r.sum().item())
                         counts[name] += int(r.numel())
                     components = part.component_rewards
                     if isinstance(components, dict):
                         for component_name, component_values in components.items():
-                            component = hydrate(component_values).to(torch.float32)
+                            component = component_values.to(torch.float32)
                             metric_name = f"{name}_{str(component_name).replace('/', '_')}"
                             sums.setdefault(metric_name, 0.0)
                             counts.setdefault(metric_name, 0)

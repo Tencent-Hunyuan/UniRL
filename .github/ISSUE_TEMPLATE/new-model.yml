@@ -1,0 +1,68 @@
+# Adapted from vllm-project/vllm-omni.
+name: New model request
+description: Propose or request support for a new diffusion, AR, PE, or unified model bundle
+title: "[New Model]: "
+labels: ["new model"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search [existing issues and PRs](https://github.com/Tencent-Hunyuan/UniRL/issues) first.
+        Contributors implementing a model bundle should follow [`.claude/skills/development/add-model-bundle/SKILL.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/.claude/skills/development/add-model-bundle/SKILL.md) and [`unirl/models/README.md`](https://github.com/Tencent-Hunyuan/UniRL/blob/main/unirl/models/README.md).
+
+  - type: input
+    id: model-url
+    attributes:
+      label: Model / checkpoint URL
+      description: Hugging Face model ID/URL, paper, or reference repository.
+      placeholder: https://huggingface.co/...
+    validations:
+      required: true
+
+  - type: input
+    id: closest-model
+    attributes:
+      label: Closest model already in unirl/models/
+      description: Existing model family closest in architecture, conditioning, or scheduler.
+      placeholder: e.g. qwen_image, bagel, qwen3_moe, wan22_v2v
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: target-stack
+    attributes:
+      label: Required training backends and rollout engines
+      options:
+        - label: FSDPBackend (`unirl/train/backend/fsdp/`)
+        - label: VeOmniBackend SP / EP (`unirl/train/backend/veomni/`, requires meta-device init)
+        - label: Trainside rollout
+        - label: vLLM-Omni
+        - label: SGLang (AR/VLM)
+        - label: SGLang-Diffusion
+        - label: FastVideo
+        - label: Composed / PE
+
+  - type: textarea
+    id: technical-gaps
+    attributes:
+      label: Technical requirements & difficulties
+      description: >
+        Mention custom operators, fused MoE/EP expert weight layouts, Ulysses SP head divisibility, bespoke SDE/schedule (`unirl/sde/`), preprocessing, or upstream engine patches (`DELETE-WHEN`).
+    validations:
+      required: false
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Use case, recipe target, and contribution plan
+      description: Primary RL/SFT/PE use case and whether you plan to submit a PR.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: pre-submit
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues/PRs for duplicates.
+          required: true

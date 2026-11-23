@@ -10,7 +10,8 @@ import torch
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
 from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
 from unirl.models.types.replay_result import ReplayResult
-from unirl.sde.kernels import StepStrategy
+from unirl.sde.kernels import GeneratorLike, StepStrategy
+from unirl.sde.noise import make_denoise_step_generators
 from unirl.types.sampling import DiffusionSamplingParams, compute_trajectory_positions
 from unirl.types.segments.latent import LatentSegment, make_video_segment
 from unirl.utils.dtypes import parse_torch_dtype
@@ -109,6 +110,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run one SDE transition given a precomputed ``noise_pred``."""
         return strategy.denoise(
@@ -120,6 +122,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             prev_sample=prev_sample,
             sigma_max=sigma_max,
             step_index=step_index,
+            generator=generator,
         )
 
     def step(
@@ -136,6 +139,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
@@ -149,6 +153,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
+            generator=generator,
         )
 
     def step_with_logp(
@@ -165,6 +170,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         sigma_max: float = 0.99,
         eta: float = 1.0,
         step_index: int = 0,
+        generator: GeneratorLike = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition."""
         return self.step(
@@ -179,6 +185,7 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
             sigma_max=sigma_max,
             eta=eta,
             step_index=step_index,
+            generator=generator,
         )
 
 
@@ -220,6 +227,8 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         schedule: torch.Tensor,
         params: DiffusionSamplingParams,
         initial_latents: Optional[torch.Tensor] = None,
+        denoise_seed_keys: Optional[List[str]] = None,
+        denoise_base_seed: int = 0,
     ) -> LatentSegment:
         """Run full WAN 2.1 T2V sampling. Returns a ``LatentSegment``."""
         from unirl.sde.noise import generate_latents
@@ -229,6 +238,11 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         prompt_embeds = conditions.text.embeds
         device = prompt_embeds.device
         batch_size = int(prompt_embeds.shape[0])
+        if denoise_seed_keys is not None and len(denoise_seed_keys) != batch_size:
+            raise ValueError(
+                f"WAN21DiffusionStage.diffuse: denoise_seed_keys length {len(denoise_seed_keys)} "
+                f"!= batch_size={batch_size}."
+            )
         T = params.num_inference_steps
         if int(schedule.shape[0]) != T + 1:
             raise ValueError(f"WAN21DiffusionStage.diffuse: schedule length {schedule.shape[0]} != T+1={T + 1}")
@@ -295,6 +309,15 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
             step_eta = params.eta if i in sde_set else 0.0
+            step_generators = (
+                make_denoise_step_generators(
+                    base_seed=denoise_base_seed,
+                    step_index=i,
+                    sample_ids=denoise_seed_keys,
+                )
+                if step_eta > 0.0 and denoise_seed_keys is not None
+                else None
+            )
 
             with torch.no_grad(), autocast_ctx:
                 new_latents, log_prob, _ = self.step.step_with_logp(
@@ -308,6 +331,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
                     eta=step_eta,
                     sigma_max=sigma_max,
                     step_index=i,
+                    generator=step_generators,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 
