@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import ClassVar, List, Optional, Tuple
 
 import torch
 
 from unirl.config.require import require
 from unirl.distributed.tensor.batch import Batch, concat_field
-from unirl.types.conditions import TextEmbedCondition
+from unirl.types.conditions import Condition, Modality, TextEmbedCondition
+
+
+@dataclass
+class MiniMaxH3KeyframeCondition(Condition):
+    """Per-sample FL2VA keyframe rows, anchors and text tags; see ``README.md`` Gotchas."""
+
+    modality: ClassVar[Modality] = Modality.IMAGE
+
+    rows: List[torch.Tensor] = concat_field(default_factory=list)  # per sample [K * rows_per_frame, 96] fp32, noised
+    anchors: List[Tuple[str, ...]] = concat_field(default_factory=list)  # per sample (), ("first",), ("last",) or both
+    text_token_tags: List[torch.Tensor] = concat_field(default_factory=list)  # per sample [L] long, 0 vision / 1 text
+
+    def __post_init__(self) -> None:
+        require(
+            len(self.rows) == len(self.anchors) == len(self.text_token_tags),
+            f"MiniMaxH3KeyframeCondition: rows/anchors/text_token_tags hold {len(self.rows)}/{len(self.anchors)}/"
+            f"{len(self.text_token_tags)} samples; they must be per-sample aligned",
+        )
 
 
 @dataclass
@@ -17,6 +35,22 @@ class MiniMaxH3Conditions(Batch):
     """Conditions passed to the MiniMax-H3 diffusion stage."""
 
     text: Optional[TextEmbedCondition] = concat_field(default=None)
+    keyframes: Optional[MiniMaxH3KeyframeCondition] = concat_field(default=None)
+
+    def __post_init__(self) -> None:
+        keyframes = self.keyframes
+        if keyframes is None:
+            return
+        require(
+            isinstance(keyframes, MiniMaxH3KeyframeCondition),
+            f"MiniMaxH3Conditions: keyframes must be a MiniMaxH3KeyframeCondition, got {type(keyframes).__name__}",
+        )
+        text_batch = self.text.batch_size if self.text is not None else 0
+        require(
+            keyframes.batch_size == text_batch,
+            f"MiniMaxH3Conditions: keyframes hold {keyframes.batch_size} samples but text holds {text_batch}; a batch "
+            f"with keyframes needs an entry for every sample, anchors () for a t2va one (README.md Gotchas)",
+        )
 
     @classmethod
     def from_dict(cls, d: dict) -> "MiniMaxH3Conditions":
@@ -55,13 +89,14 @@ class MiniMaxH3Conditions(Batch):
         length = int(lengths[0].item())
         if length == int(embeds.shape[1]):
             return self
-        return type(self)(
+        return replace(
+            self,
             text=TextEmbedCondition(
                 embeds=embeds[:, :length],
                 pooled=self.text.pooled,
                 attn_mask=mask[:, :length],
-            )
+            ),
         )
 
 
-__all__ = ["MiniMaxH3Conditions"]
+__all__ = ["MiniMaxH3Conditions", "MiniMaxH3KeyframeCondition"]
