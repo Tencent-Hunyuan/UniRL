@@ -41,20 +41,20 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
 - **Uniform `master_precision` storage**: upcasting only trainable params would mix
   bf16/fp32 inside every MoT layer (the und stream is frozen), which FSDP2 rejects.
 - **The SFT recipes run full fp32** (`model_precision`/`param_dtype: fp32`,
-  `mixed_precision: false`): torch 2.10/cu128 on H20 rejects every bf16 `cublasGemmEx`,
-  and `bundle.py` scopes further cuBLAS workarounds (contiguous mRoPE, 2-D-GEMM
-  DomainAwareLinear, non-MATH SDPA, frozen-DTensor `full_tensor()` linears) to that
-  runtime via `_needs_h20_cu128_workaround()`. Newer CUDA stacks may switch back to
-  fp32 storage + bf16 mixed compute (the official Cosmos recipe shape).
+  `mixed_precision: false`): full-parameter SFT keeps the root FSDP group enabled
+  (`root_wrap: true`) because `time_embedder`, `proj_in`, and `proj_out` are trainable,
+  so setting `param_dtype: bf16` without a separate fp32 FSDP group for `time_embedder`
+  all-gathers it in bf16 and doubles initial video-prediction velocity MSE (0.09986 →
+  0.20077 on 8x H20).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
   (`_keep_in_fp32_modules = ["time_embedder"]`). The full-fp32 SFT recipes satisfy
   this trivially. The bf16 RL recipe `cosmos3_nano_trainside` keeps it out of every FSDP
-  group with `root_wrap: false` (see Gotchas); it is validated on H100 with torch 2.13/cu130,
-  not on H20. Any other bf16 mixed-precision recipe needs its own fp32 exemption.
-  Without one the outcome depends on the diffusers version: 0.39 casts only *after* the
-  embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid × bf16-linear matmul;
-  0.40 casts the sinusoid to the embedder's parameter dtype first, so the embedder
-  silently runs in bf16.
+  group with `root_wrap: false` (see Gotchas) and is validated on H100, H200, and H20
+  with `torch==2.13.0+cu130`. Any other bf16 mixed-precision recipe needs its own fp32
+  exemption. Without one the outcome depends on the diffusers version: 0.39 casts only
+  *after* the embedder, so the bf16 all-gather fails loudly on the fp32-sinusoid ×
+  bf16-linear matmul; 0.40 casts the sinusoid to the embedder's parameter dtype first,
+  so the embedder silently runs in bf16.
 - **Timestep conditioning stays continuous fp32** (`sigma * num_train_timesteps`, no
   rounding), matching NVIDIA's official training (`cosmos-framework`
   `omni_mot_model.py`: `timesteps = sigmas * max_timestep`, fp32). diffusers-0.39
@@ -231,15 +231,6 @@ re-derived for the shift-5 grid, not a setting tuned for video.
   `action`) by default. That output is a `BaseOutput`, so tuple-unpacking it yields its
   non-`None` field names rather than the three lists. `Cosmos3JointStage.predict_velocity`
   reads both forms; passing `return_dict=False` instead would break 0.39.
-- The H20 workaround patches in `bundle.py` install frozen diffusers-0.39 copies of
-  `DomainAwareLinear.forward`, `dispatch_attention_fn`, and the rotary `forward`. Because
-  the pin is an open `diffusers>=0.39`, each patch first fingerprints the upstream
-  parameter list via `_require_signature` and fails closed on drift — otherwise a newer
-  diffusers would be silently overridden by the stale copy. Re-verify the frozen bodies
-  against the installed diffusers before extending the fingerprints on a version bump.
-- The H20 SDPA wrapper repeats kv heads before dispatch: Cosmos3 attention is GQA
-  (32 q / 8 kv heads), the fused Flash/Efficient kernels require equal head counts, and
-  the MATH fallback is exactly the strided-batched GEMM that is broken on H20+cu128.
 - Eval loss is noised velocity MSE at a per-sample deterministic (σ, ε) draw
   (`unirl.algorithms.sft.sample_eval_seed`) — comparable across runs, but not a
   sample-quality gate (use a later denoise path for PSNR/SSIM).
