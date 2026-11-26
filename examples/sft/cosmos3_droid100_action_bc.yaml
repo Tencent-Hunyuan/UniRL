@@ -53,8 +53,8 @@ bundle:
   config:
     _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
-    # torch 2.10/cu128 on H20 rejects bf16 cublasGemmEx; keep this validated
-    # compatibility recipe in fp32. Newer CUDA stacks may override both dtypes.
+    # Full-FT wraps trainable `time_embedder` in the root FSDP group (`root_wrap: true`),
+    # so `param_dtype: fp32` keeps `time_embedder` in fp32 without a separate FSDP group.
     model_precision: fp32
     master_precision: fp32
     meta_init_transformer: true
