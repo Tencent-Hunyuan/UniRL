@@ -6,9 +6,9 @@
 # jointly noise future video and the full action chunk with ONE sigma, and
 # regress both velocity targets (vision/action MSE balanced 1:1 via 10/10
 # weights). 17 frames pair with a 16-step action chunk (chunk_size + 1).
-# Same numeric conventions as the videopred recipe: fp32 storage + bf16 FSDP
-# compute, frozen und stream, logit-normal sigma through the official
-# short-edge shift tiers (256→3, 480→5, 720→10).
+# Same numeric conventions as the videopred recipe: full fp32 storage and FSDP
+# compute (unirl/models/cosmos3/README.md), frozen und stream, logit-normal sigma
+# through the official short-edge shift tiers (256→3, 480→5, 720→10).
 #
 # droid_100 is DEBUG-scale: its collapsed 7-D action differs from the canonical
 # 10-D droid_lerobot layout (9D EE pose + 1D gripper), so the pretrained action
@@ -53,8 +53,8 @@ bundle:
   config:
     _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
-    # Full-FT wraps trainable `time_embedder` in the root FSDP group (`root_wrap: true`),
-    # so `param_dtype: fp32` keeps `time_embedder` in fp32 without a separate FSDP group.
+    # Full-FT keeps `root_wrap: true`, so `model_precision` and `backend.fsdp_cfg.param_dtype`
+    # stay fp32 to keep trainable `time_embedder` in fp32 (unirl/models/cosmos3/README.md).
     model_precision: fp32
     master_precision: fp32
     meta_init_transformer: true

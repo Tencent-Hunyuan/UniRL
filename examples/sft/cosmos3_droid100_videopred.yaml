@@ -3,10 +3,10 @@
 #
 # Clean observation at latent frame 0, flow-match the remaining latent frames
 # through the shared SFT stack (SupervisedDataSource → Cosmos3SupervisedTrackBuilder
-# → Part → TrainStack → Cosmos3JointFlowMatchSFT). The transformer is stored fp32
-# (stable optimizer master) and FSDP-gathered bf16 for compute; the und (text)
-# stream is frozen, only the gen tower trains. Training sigma is logit-normal
-# warped by the official short-edge shift tiers (256→3, 480→5, 720→10).
+# → Part → TrainStack → Cosmos3JointFlowMatchSFT). The transformer is stored and
+# FSDP-gathered in fp32 (unirl/models/cosmos3/README.md); the und (text) stream
+# is frozen, only the gen tower trains. Training sigma is logit-normal warped by
+# the official short-edge shift tiers (256→3, 480→5, 720→10).
 #
 # Env:
 #   PRETRAINED_MODEL  diffusers-layout nvidia/Cosmos3-Nano checkpoint
@@ -46,8 +46,8 @@ bundle:
   config:
     _target_: unirl.models.cosmos3.config.Cosmos3SFTConfig
     pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Nano}
-    # Full-FT wraps trainable `time_embedder` in the root FSDP group (`root_wrap: true`),
-    # so `param_dtype: fp32` keeps `time_embedder` in fp32 without a separate FSDP group.
+    # Full-FT keeps `root_wrap: true`, so `model_precision` and `backend.fsdp_cfg.param_dtype`
+    # stay fp32 to keep trainable `time_embedder` in fp32 (unirl/models/cosmos3/README.md).
     model_precision: fp32
     master_precision: fp32
     meta_init_transformer: true

@@ -44,8 +44,7 @@ short-edge tier table 256/480/720 → 3/5/10; short edges above the 720p bin sta
   (`root_wrap: true`) because `time_embedder`, `proj_in`, and `proj_out` are trainable,
   so setting `param_dtype: bf16` without a separate fp32 FSDP group for `time_embedder`
   all-gathers it in bf16 and doubles initial video-prediction velocity MSE (0.09986 →
-  0.20077 on 8x H20). The bf16 `cublasGemmEx` and strided-batched GEMM paths themselves
-  are verified healthy on H20 with the pinned `torch==2.13.0+cu130` stack.
+  0.20077 on 8x H20).
 - **`time_embedder` must stay fp32 in compute**, matching stock diffusers
   (`_keep_in_fp32_modules = ["time_embedder"]`). The full-fp32 SFT recipes satisfy
   this trivially. The bf16 RL recipe `cosmos3_nano_trainside` keeps it out of every FSDP
