@@ -26,7 +26,7 @@ class MediaPreview(Batch):
     rewards: List[float] = concat_field(default_factory=list)
 
     def __post_init__(self) -> None:
-        n = len(self.images) if self.images else len(self.videos)
+        n = self.batch_size
         for name, val in (
             ("images", self.images),
             ("videos", self.videos),
@@ -37,19 +37,19 @@ class MediaPreview(Batch):
             if val and len(val) != n:
                 raise ValueError(
                     f"MediaPreview: {name!r} has {len(val)} entries but the "
-                    f"canonical batch size (from images / videos) is {n}. "
+                    f"canonical media batch size is {n}. "
                     f"All non-empty parallel lists must agree."
                 )
 
     @property
     def batch_size(self) -> int:
-        return len(self.images) if self.images else len(self.videos)
+        return len(self.images) or len(self.videos) or len(self.audios)
 
     def __len__(self) -> int:
         return self.batch_size
 
     def is_empty(self) -> bool:
-        return not self.images and not self.videos
+        return self.batch_size == 0
 
 
 def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
@@ -57,12 +57,12 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
     from unirl.distributed.tensor import TensorRef
 
     total = len(decoded)
-    want = max(1, min(int(min_items), total))
+    want = min(max(1, int(min_items)), total)
     if isinstance(decoded, Images):
         meta = decoded.packed_pixels
         cu = decoded.cu_seqlens
         if not isinstance(meta, TensorRef) or cu is None:
-            return total
+            return want
         sample_at_pixel = {int(v): i for i, v in enumerate(cu.tolist())}
         pixels = 0
         for size in meta.sizes:
@@ -73,10 +73,10 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
             if sample_idx >= want:
                 return sample_idx
         return total
-    meta = decoded.frames
+    meta = decoded.waveform if isinstance(decoded, Audios) else decoded.frames
     cu = decoded.cu_seqlens
     if not isinstance(meta, TensorRef) or cu is None:
-        return total
+        return want
     sample_at_frame = {int(v): i for i, v in enumerate(cu.tolist())}
     frames = 0
     for size in meta.sizes:
@@ -87,6 +87,16 @@ def _ref_aligned_prefix_len(decoded: Any, min_items: int) -> int:
         if sample_idx >= want:
             return sample_idx
     return total
+
+
+def _hydrate_prefix(batch: Any, limit: int) -> Any:
+    """Hydrate the shortest TensorRef-aligned prefix of ``batch`` covering ``limit`` rows."""
+    from unirl.distributed.tensor import hydrate, map_tree
+
+    prefix = _ref_aligned_prefix_len(batch, limit)
+    if 0 < prefix < len(batch):
+        batch = batch.slice(0, prefix)
+    return map_tree(batch, hydrate)
 
 
 def build_media_preview_for_part(
@@ -100,21 +110,18 @@ def build_media_preview_for_part(
     decoded = part.primitives.get("image")
     if decoded is None:
         decoded = part.primitives.get("video")
-    if not isinstance(decoded, (Images, Videos)):
+    if decoded is None:
+        decoded = part.primitives.get("audio")
+    if not isinstance(decoded, (Images, Videos, Audios)):
         return None
     limit = max(1, int(max_items))
 
-    from unirl.distributed.tensor import hydrate, map_tree
-
-    prefix = _ref_aligned_prefix_len(decoded, limit)
-    if 0 < prefix < len(decoded):
-        decoded = decoded.slice(0, prefix)
-    decoded = map_tree(decoded, hydrate)
+    decoded = _hydrate_prefix(decoded, limit)
 
     prompt_texts: List[str] = [str(p) for p in prompts] if prompts is not None else []
     rewards_flat: List[float] = []
     if part.rewards is not None and torch.is_tensor(part.rewards):
-        rewards_flat = [float(v) for v in part.rewards.detach().cpu().reshape(-1).tolist()]
+        rewards_flat = [float(v) for v in part.rewards[:limit].detach().cpu().reshape(-1).tolist()]
 
     images: List[Any] = []
     videos: List[Any] = []
@@ -123,17 +130,15 @@ def build_media_preview_for_part(
     if isinstance(decoded, Images):
         from unirl.utils.media import hstack_pils, tensor_frame_to_pil
 
-        per_sample = decoded.to_list()
+        per_sample = decoded.slice(0, min(limit, len(decoded))).to_list()
         if not per_sample:
             return None
         input_pixels: Optional[List[Any]] = None
         if isinstance(input_image, Images):
-            input_image = map_tree(input_image, hydrate)
+            input_image = _hydrate_prefix(input_image, limit)
             input_pixels = [image.pixels for image in input_image.to_list()]
         show_edit_pairs = input_pixels is not None and len(input_pixels) >= len(per_sample)
         for idx, image in enumerate(per_sample):
-            if len(selected_indices) >= limit:
-                break
             out_pil = tensor_frame_to_pil(image.pixels[:3])
             if show_edit_pairs:
                 input_tensor = input_pixels[idx]
@@ -142,16 +147,17 @@ def build_media_preview_for_part(
             else:
                 images.append(out_pil)
             selected_indices.append(idx)
-    else:
-        per_sample = decoded.to_list()
+    elif isinstance(decoded, Videos):
+        per_sample = decoded.slice(0, min(limit, len(decoded))).to_list()
         for idx, video in enumerate(per_sample):
-            if len(selected_indices) >= limit:
-                break
             frames = video.frames
             if frames.dim() != 4:
-                continue
+                raise ValueError(f"Expected video frames [T, C, H, W], got {tuple(frames.shape)}")
             videos.append(frames.permute(1, 0, 2, 3).contiguous().detach().cpu().to(dtype=torch.float32))
             selected_indices.append(idx)
+
+    else:
+        selected_indices = list(range(min(limit, len(decoded))))
 
     if not selected_indices:
         return None
@@ -160,9 +166,10 @@ def build_media_preview_for_part(
     audio_sr: Optional[int] = None
     decoded_audio = part.primitives.get("audio")
     if isinstance(decoded_audio, Audios):
-        from unirl.distributed.tensor import hydrate, map_tree
-
-        decoded_audio = map_tree(decoded_audio, hydrate)
+        if isinstance(decoded, Audios):
+            decoded_audio = decoded
+        else:
+            decoded_audio = _hydrate_prefix(decoded_audio, limit)
         audio_list = decoded_audio.to_list()
         for idx in selected_indices:
             if idx < len(audio_list):
