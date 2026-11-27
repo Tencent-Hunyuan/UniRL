@@ -16,6 +16,7 @@ from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.distributed.group.remote import Remote
 from unirl.train.backend.base import ExpertWeightExportTransform, LrSchedulerConfig, OptimizerConfig
 from unirl.train.backend.sharded_state import (
+    SparseAdamWLoadPlanner,
     StateDict,
     _current_rank,
     drop_meta_entries,
@@ -23,6 +24,7 @@ from unirl.train.backend.sharded_state import (
     gather_lora_state_dict,
     gather_state_dict,
     load_model_state_dict,
+    load_optimizer_state_dict,
     move_optimizer_state,
     trainable_params,
 )
@@ -439,7 +441,6 @@ class BaseFSDP2Backend(Remote):
                 get_model_state_dict,
                 get_optimizer_state_dict,
                 set_model_state_dict,
-                set_optimizer_state_dict,
             )
 
             meta: Dict[str, object] = torch.load(metadata_path, map_location="cpu")
@@ -459,22 +460,17 @@ class BaseFSDP2Backend(Remote):
                 "model": model_sd,
                 "optim": optim_sd,
             }
-            dcp.load(sharded_state, checkpoint_id=path)
+            planner = SparseAdamWLoadPlanner() if isinstance(self.optimizer, torch.optim.AdamW) else None
+            dcp.load(sharded_state, checkpoint_id=path, planner=planner)
 
             set_model_state_dict(
                 self.model,
                 sharded_state["model"],
                 options=StateDictOptions(full_state_dict=False, strict=strict),
             )
-            set_optimizer_state_dict(
-                self.model,
-                self.optimizer,
-                optim_state_dict=sharded_state["optim"],
-                options=sharded_options,
+            load_optimizer_state_dict(
+                self.model, self.optimizer, optim_sd, full_state_dict=False, broadcast_from_rank0=False
             )
-            if isinstance(self.optimizer, torch.optim.AdamW):
-                for param in [p for p, entry in self.optimizer.state.items() if float(entry["step"]) == 0]:
-                    del self.optimizer.state[param]
             if self.scheduler is not None and "scheduler_state_dict" in meta:
                 self.scheduler.load_state_dict(meta["scheduler_state_dict"])
             self._optimizer_step_count = meta["optimizer_step_count"]
