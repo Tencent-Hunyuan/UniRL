@@ -101,6 +101,25 @@ pipe, so vLLM's imports stay out of the Worker process.
   trainer, PE, and agentic paths already stamp this. `temperature` / `top_p` /
   `top_k` / `max_new_tokens` are gone from `SGLangEngineConfig` — there is no
   engine-config fallback.
+- **Capped LoRA pools use one SGLang request per candidate.** With
+  `max_loaded_loras` set and a synced adapter active, UniRL splits `n > 1`
+  payloads into `n = 1` requests in prompt order. SGLang 0.5.19 over-releases
+  the adapter usage counter on the `n > 1` path, so eviction waits indefinitely
+  for zero (#671). The split reuses the payloads UniRL already built and keeps
+  replay aligned with the original prompt groups; the server prefills each
+  request on its own, and `concurrency` then bounds candidates in flight, not
+  prompts. Recheck the workaround on a SGLang bump.
+  Without a cap, each synced adapter stays in the server's host memory.
+- **`keep_diffusion_resident` is for diffusion servers that cannot sleep.** The
+  Qwen-Image-Edit SGLang server fails to move its transformer to CPU, so the
+  composed engine leaves it on the GPU and sleeps only the AR child. Both
+  children then share the GPU for the whole run; the image-editing PE recipe
+  peaks near 110 GB on one device. `PETrainer` wakes the AR child before the
+  trainer offloads, so the cache left by the last backward is still on the GPU
+  at that moment. The recipe empties it after every train step but the first
+  (`logging.memory.empty_cache_at: [ar_train]`; the monitor wraps the phases
+  once the first step returns); without that, about 5% of
+  rollouts in a 300-rollout run spiked 12-31 GB higher, up to 142.6 GB.
 - **Explicit vLLM-Omni AR seeds use one call per sample.** HI3 and Qwen3-Omni
   derive each request's seed from `ARSamplingParams.seed` and the AR Part's
   `sample_id`, using the same `derive_sampling_seed` mapping as SGLang. In

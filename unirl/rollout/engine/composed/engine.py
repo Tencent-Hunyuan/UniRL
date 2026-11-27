@@ -49,7 +49,7 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             self.child_by_name["ar"] = self.ar
             self.diffusion = config.diffusion.make_engine(strategy=strategy, **deps)
             self.child_by_name["diffusion"] = self.diffusion
-            if config.sleep_diffusion_on_start:
+            if config.sleep_diffusion_on_start and not config.keep_diffusion_resident:
                 self.diffusion.sleep()
         except BaseException:
             self.shutdown()
@@ -69,8 +69,9 @@ class ComposedRolloutEngine(BaseRolloutEngine):
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def sleep(self) -> None:
-        for child in self.child_by_name.values():
-            child.sleep()
+        for name, child in self.child_by_name.items():
+            if not (name == "diffusion" and self.cfg.keep_diffusion_resident):
+                child.sleep()
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def wake_up(self) -> None:
@@ -146,11 +147,13 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             M = len(diffusion_shell.sample_ids) // len(ar_shell.sample_ids)
 
             self.ar.wake_up()
-            self.diffusion.sleep()
+            if not self.cfg.keep_diffusion_resident:
+                self.diffusion.sleep()
 
+            source = input_part.primitives.get("image")
             ar_input = Part.input(
                 sample_ids=list(input_part.sample_ids),
-                primitives={"text": text_primitive},
+                primitives={"text": text_primitive} if source is None else {"text": text_primitive, "image": source},
                 control=ar_child_control(input_part.control, system_instruction=self.cfg.pe_instruction),
             )
             ar_out = self.ar.generate(Sample(parts=[ar_input, ar_shell]))
@@ -190,10 +193,10 @@ class ComposedRolloutEngine(BaseRolloutEngine):
             self.diffusion.wake_up()
 
             # Re-root diffusion prompts because composed PE IDs are not valid child roots.
-            pe_input = Part.input(
-                sample_ids=[f"pe{k}" for k in range(P * N)],
-                primitives={"text": pe_texts},
-            )
+            pe_primitives = {"text": pe_texts}
+            if source is not None:
+                pe_primitives["image"] = source.select(torch.arange(P).repeat_interleave(N))  # [P*N]
+            pe_input = Part.input(sample_ids=[f"pe{k}" for k in range(P * N)], primitives=pe_primitives)
             diff_child_shell = pe_input.fork(
                 M,
                 sampling_params=diffusion_shell.sampling_params,

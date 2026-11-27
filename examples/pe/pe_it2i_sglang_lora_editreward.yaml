@@ -1,0 +1,244 @@
+# @package _global_
+# Image-aware PE for image editing — SGLang composed rollout, FROZEN editor.
+#
+# Same task as pe_it2i_trainside_editreward.yaml, but the rollout runs on two
+# colocated SGLang servers: a Qwen2.5-VL server writes N rewrites per (source
+# image, instruction), then a Qwen-Image-Edit server renders M edits per rewrite
+# from the same source image. EditReward scores each edit against the source
+# image and the ORIGINAL instruction; GRPO trains the rewriter as a LoRA adapter
+# that is pushed into the VLM server's LoRA pool every rollout.
+#
+# `freeze_diffusion: true`: the editor is only the SGLang server — PETrainer
+# builds no trainer-side diffusion model, backend or weight sync for it, so the
+# `diffusion:` block carries just the model config the engine boots from and
+# `sync:` has only the `ar` track.
+#
+# Pairs with unirl/train_pe.py (PETrainer). Geometry:
+# P=4 prompts × N=4 rewrites × M=2 edits = 32 edits / 16 rewrites per rollout and device;
+# the diffusion server renders them in chunks of forward_batch_size.
+# Validated on one H200 (143 GB) only: both servers stay on the GPU, peak about 110 GB
+# with the trainer cache emptied after every train step but the first (`logging.memory` below).
+# Not run with num_devices > 1 or on a smaller GPU.
+#
+# Needs the sglang environment (INSTALL.md) and REWARD_SERVICE_URL
+# (unirl-reward-service with the editreward scorer on its own GPU). Optional
+# overrides: QWEN_VL_PATH, QWEN_IMAGE_EDIT_PLUS_PATH.
+
+num_devices: 1
+batch_size: 4                 # P; MUST be divisible by num_devices (composed rollout = DP_SCATTER)
+weight_sync_interval: 1       # push the trained rewriter LoRA into the VLM server every rollout
+enable_fsdp_offload: true
+
+# Frozen editor: only the rewriter trains.
+freeze_diffusion: true
+
+# The default eval CFG scale (4.0) would switch on negative-prompt CFG for Qwen-Image-Edit.
+eval_cfg_text_scale: 1.0
+
+logging:
+  report_to_wandb: false        # flip to true to enable wandb (rank-0/driver only)
+  project_name: unirl
+  run_name: null
+  entity: null
+  tags: null
+  memory:
+    enabled: true
+    empty_cache_at: [ar_train]  # see the keep_diffusion_resident gotcha in unirl/rollout/engine/README.md
+
+# ── Diffusion side (Qwen-Image-Edit) — FROZEN: engine model config ONLY ─────
+diffusion:
+  bundle:
+    config:
+      _target_: unirl.models.qwen_image_edit_plus.config.QwenImageEditPlusPipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:QWEN_IMAGE_EDIT_PLUS_PATH,Qwen/Qwen-Image-Edit-2511}
+      model_precision: bf16
+      max_sequence_length: 512
+      use_condition_image_prompt: true
+      shift: 3.0
+
+# ── AR side (Qwen2.5-VL rewriter) — trained, LoRA ───────────────────────────
+# Copied from ar/qwen_vl_grpo_geo3k_mc_4x8_lora.yaml.
+ar:
+  bundle:
+    _target_: unirl.models.qwen_vl.bundle.QwenVLBundle.from_config
+    config:
+      _target_: unirl.models.qwen_vl.config.QwenVLPipelineConfig
+      pretrained_model_ckpt_path: ${oc.env:QWEN_VL_PATH,Qwen/Qwen2.5-VL-7B-Instruct}
+      model_precision: bf16
+      attn_implementation: flash_attention_2
+      freeze_vision_tower: true # train the LLM only; ViT frozen
+      use_gradient_checkpointing: true
+      max_prompt_length: 2048
+  pipeline:
+    _target_: unirl.models.qwen_vl.pipeline.QwenVLPipeline.from_bundle
+    max_prompt_length: 2048
+  backend:
+    _target_: unirl.train.backend.fsdp.FSDPBackend
+    block_class_names: ["Qwen2_5_VLDecoderLayer"]
+    trainable_attr: transformer
+    fsdp_cfg:
+      _target_: unirl.train.configs.FSDPConfig
+      param_dtype: bf16
+      cpu_offload: false
+      mixed_precision: true
+      fsdp_mode: full
+      reshard_after_forward: true
+      forward_prefetch: true
+      activation_checkpointing: false # bundle already enables HF gradient checkpointing
+      use_torch_compile: false
+    optimizer_cfg:
+      _target_: unirl.train.backend.base.OptimizerConfig
+      learning_rate: 5.0e-6      # as in pe_sglang_lora_pickscore; 1.0e-4 collapses the N rewrites of a prompt into one
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_epsilon: 1.0e-8
+      weight_decay: 0.0
+    scheduler_cfg:
+      _target_: unirl.train.backend.base.LrSchedulerConfig
+      type: constant
+      warmup_steps: 0
+      total_steps: 10000
+    lora_cfg:
+      _target_: unirl.train.configs.LoraConfig
+      rank: 16
+      alpha: 32
+      dropout: 0.0
+      bias: none
+      task_type: CAUSAL_LM
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+  algorithm:
+    _target_: unirl.algorithms.grpo.GRPO
+    stage_attr: ar
+    clip_range: 1.0e-2
+    clip_schedule: constant
+    conditions_cls:
+      _target_: hydra.utils.get_class
+      path: unirl.models.qwen_vl.conditions.QwenVLARConditions
+    sampling_temperature: ${sampling.ar.temperature}
+  stack:
+    _target_: unirl.train.stack.TrainStack
+    micro_batch_size: 4
+    max_grad_norm: 1.0
+
+# ── Composed SGLang rollout: VLM rewriter server + image-edit server ────────
+rollout:
+  _target_: unirl.rollout.engine.composed.engine.ComposedRolloutEngine
+  model_config: ${diffusion.bundle.config}
+  strategy:
+    _target_: unirl.sde.kernels.FlowSDEStrategy
+  config:
+    _target_: unirl.rollout.engine.composed.config.ComposedRolloutEngineConfig
+    sleep_diffusion_on_start: false
+    # The Qwen-Image-Edit SGLang server cannot release its memory (its transformer holds meta
+    # tensors, so the move to CPU fails); keep it on the GPU and only sleep the VLM server.
+    keep_diffusion_resident: true
+    pe_instruction: |
+      You are an instruction rewriter for an image editing model. You are given a source image and a short edit instruction.
+      Rewrite the instruction so the editing model can carry it out precisely:
+      1. Look at the source image and name the exact object or region the edit applies to (position, color, size).
+      2. State what the result should look like after the edit.
+      3. State that everything the instruction does not mention must stay unchanged.
+      4. Do not add edits the user did not ask for. Keep the user's intent.
+      First explain your reasoning briefly. Then output the final rewritten instruction after the fixed marker "Revised Instruction:" on a new line.
+    # Keep only the substring after the marker; off-format / empty → original instruction.
+    pe_marker: "Revised Instruction:"
+    # Copied from ar/qwen_vl_grpo_geo3k_mc_sglang_4x8_lora.yaml (LoRA-pool sync; Qwen2.5-VL
+    # must route LoRA through lora_backend and keep the default multimodal attention).
+    ar:
+      _target_: unirl.rollout.engine.sglang.config.SGLangEngineConfig
+      backend: native
+      pretrained_model_ckpt_path: ${ar.bundle.config.pretrained_model_ckpt_path}
+      tp_size: 1
+      samples_pre_expanded: true
+      image_token: "<|vision_start|><|image_pad|><|vision_end|>"
+      concurrency: 8
+      engine_kwargs:
+        mem_fraction_static: 0.25
+        skip_server_warmup: true
+        disable_cuda_graph: true
+        enable_memory_saver: true
+        enable_weights_cpu_backup: true
+        enable_lora: true
+        max_lora_rank: ${ar.backend.lora_cfg.rank}
+        lora_target_modules: ${ar.backend.lora_cfg.target_modules}
+        max_loaded_loras: 8
+        lora_backend: triton
+    # Copied from diffusion/qwen_image_edit_plus/qwen_image_edit_plus_nft_sglang.yaml.
+    diffusion:
+      _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
+      model_family: qwen_image_edit_plus
+      populate_conditions: false  # frozen editor: nothing replays its conditions
+      tp_size: 1
+      local_mode: true
+      sampling: ${sampling.diffusion}
+      forward_batch_size: 8
+      engine_kwargs:
+        model_id: Qwen-Image-Edit-2511
+
+# LoRA-pool weight sync for the rewriter only (the editor is frozen).
+sync:
+  ar:
+    _target_: unirl.distributed.weight_sync.lora.LocalLoraWeightSync
+    track_prefix: ar
+    param_prefix: ""
+    adapter_name: default
+    verify: false
+
+reward:
+  _target_: unirl.reward.service.RewardService
+  backend:
+    _target_: unirl.reward.remote.RemoteRewardBackend
+    base_device: cpu
+    config:
+      _target_: unirl.reward.remote.RemoteRewardSpec
+      base_url: ${oc.env:REWARD_SERVICE_URL,http://localhost:8080}
+      required_rewards: [editreward]
+      reward_weights:
+        editreward: 1.0
+      batch_size: 8
+      timeout: 300.0
+      sub_metric_reduce: first
+      aggregation_method: weighted_sum
+      # Score against the user's instruction, not the rewrite, so the rewriter cannot lower the bar.
+      prompt_source: original
+
+data_source:
+  _target_: unirl.data.data_source.MultimodalRLDataSource
+  args:
+    run:
+      data_path: datasets/image_edit/train.jsonl
+      eval_data_path: datasets/image_edit/test.jsonl
+      seed: 42
+    algorithm:
+      prompts_per_rollout: ${batch_size}
+
+# Modality-keyed sampling dict drives PEPipeline's fan-out: ar.samples_per_prompt = N
+# rewrites, diffusion.samples_per_prompt = M edits per rewrite.
+sampling:
+  ar:
+    _target_: unirl.types.sampling.ARSamplingParams
+    samples_per_prompt: 4       # N rewrites per prompt
+    temperature: 0.7
+    top_p: 0.9
+    top_k: 1024
+    max_new_tokens: 256
+  diffusion:
+    _target_: unirl.types.sampling.DiffusionSamplingParams
+    samples_per_prompt: 2       # M edits per rewrite
+    num_inference_steps: 12
+    guidance_scale: 1.0
+    height: 384
+    width: 384
+    eta: 0.0                    # frozen editor: deterministic sampling, no log-prob needed
+    seed: 42
+    init_same_noise: false
+    scheduler:
+      _target_: unirl.sde.index_schedule.AllSDEScheduler
+      num_timesteps: ${..num_inference_steps}
+      num_sde_steps: 0          # no SDE steps recorded for a frozen editor
+
+num_rollouts: 300
