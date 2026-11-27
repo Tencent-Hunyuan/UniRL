@@ -108,6 +108,25 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   `loss_agg_mode`. `TrainStack` and the `UnifiedModelTrainStack` AR track share the resolution
   (`train/stack/loss_scale.py`); `train/readme.md` Gotchas define "one update" per stack (an
   accumulation window averages its parts) and the zero-token behaviour.
+- **`DiffusionTeacherProvider` contract, lifecycle, and isolation** — `DiffusionOPD`
+  delegates teacher replay to a `DiffusionTeacherProvider`. Replay always runs under
+  `torch.no_grad()` and returns detached means `[B, S', *latent]`, never leaking teacher
+  gradients or entering the student optimizer/checkpoint (`assert_isolation`).
+  `FullModelTeacherProvider` provides explicit device placement and CPU offload/wake
+  management (`offload_to_cpu: true`); its `teardown_on_failure` contract ensures any
+  associated remote role or pinned GPU memory is cleaned up if replay raises.
+- **Full-model teacher ownership** — pass an independently constructed teacher
+  `stage` (which may own `stage.model` or `stage.bundle`), a teacher `model`/bundle
+  to bind to a shallow copy of a non-bundle student stage, or both with `model is
+  stage_model`. Explicit mismatches fail before freezing or moving parameters.
+  `_teacher_module()` resolves `stage.trainable_module()` first (falling back to
+  `model` / `model.transformer`) for freezing, isolation, and device placement.
+  Bundle-backed stages require an explicit teacher `stage` (auto-copying a student
+  bundle stage is rejected); when `stage.model` holds a `.transformer` wrapper, a
+  bare transformer is likewise rejected rather than wrapped with missing attributes.
+  Placement manages the replay transformer, not auxiliary encoders/decoders.
+  D3 targets synchronous same-family SD3.5-M teachers; Wan2.1 / other-family
+  end-to-end validation remains D4 work.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,
