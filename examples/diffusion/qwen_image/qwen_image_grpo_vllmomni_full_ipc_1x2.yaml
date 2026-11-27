@@ -1,0 +1,15 @@
+# @package _global_
+# Two FSDP ranks colocated with two independent single-GPU rollout replicas.
+defaults:
+  - qwen_image_grpo_vllmomni_full_ipc_1x1
+  - _self_
+
+num_devices: 2
+devices_per_node: 2
+batch_size: 2
+layout: colocate
+train_resident: true
+
+backend:
+  fsdp_cfg:
+    cpu_offload: false
