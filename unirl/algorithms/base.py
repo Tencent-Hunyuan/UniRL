@@ -339,9 +339,9 @@ def require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *
 
 @dataclass(frozen=True)
 class AlgorithmStepResult:
-    """Result of one micro-step under the stage-driven contract."""
+    """A tensor loss and its metrics are detached device scalars pending optimizer-boundary extraction."""
 
-    loss: float
+    loss: float | torch.Tensor
     metrics: Mapping[str, Any]
     num_steps_or_tokens: int
     has_backward: bool

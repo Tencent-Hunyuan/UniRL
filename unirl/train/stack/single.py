@@ -31,6 +31,17 @@ from unirl.utils.metrics import aggregate_numeric_metrics
 logger = logging.getLogger(__name__)
 
 
+def _materialize_micro_results(results: List[AlgorithmStepResult]) -> None:
+    """Read all deferred scalar losses and diagnostics in one transfer after the update."""
+    pending = [(i, result) for i, result in enumerate(results) if isinstance(result.loss, torch.Tensor)]
+    if not pending:
+        return
+    scalars = [value for _, result in pending for value in (result.loss, *result.metrics.values())]
+    values = iter(torch.stack(scalars).tolist())
+    for i, result in pending:
+        results[i] = replace(result, loss=next(values), metrics={key: next(values) for key in result.metrics})
+
+
 class TrainStack(BaseTrainStack):
     """Single-stage stage-driven train stack — family-agnostic."""
 
@@ -113,8 +124,6 @@ class TrainStack(BaseTrainStack):
                 "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
             )
         micro_results: List[AlgorithmStepResult] = []
-        total_loss = 0.0
-        has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
         last_micro = len(micros) - 1
@@ -131,13 +140,8 @@ class TrainStack(BaseTrainStack):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            total_loss += result.loss * loss_scales[i]
-            has_backward = has_backward or result.has_backward
 
-        aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
-            [r.metrics for r in micro_results if r.metrics]
-        )
-
+        has_backward = any(result.has_backward for result in micro_results)
         window_backward = prior_backward or has_backward
         # The stepping backward must run when deferred gradient sync is enabled.
         if (
@@ -165,6 +169,13 @@ class TrainStack(BaseTrainStack):
                 "%s._run_update: no micro reported backward; skipping optimizer step.",
                 type(self).__name__,
             )
+        _materialize_micro_results(micro_results)
+        total_loss = 0.0
+        for result, scale in zip(micro_results, loss_scales):
+            total_loss += result.loss * scale
+        aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
+            [r.metrics for r in micro_results if r.metrics]
+        )
         if torch.cuda.is_available():
             # CUDA memory footprint per optimizer step (leak diagnosis: tp2 path showed progressive OOM).
             aggregated_metrics = {

@@ -396,6 +396,7 @@ class DiffusionART(StageAlgorithm):
                     )
                     losses.append(loss.mean())
                     for name, value in diagnostics.items():
+                        value = value.detach()
                         metrics[name] = (
                             torch.maximum(metrics.get(name, value), value)
                             if name.endswith("_max")
@@ -404,10 +405,9 @@ class DiffusionART(StageAlgorithm):
                 chunk_loss = torch.stack(losses).sum() / steps
                 total += chunk_loss.detach()
                 (chunk_loss * loss_scale).backward()
-        total, *values = torch.stack([total, *metrics.values()]).tolist()
         return AlgorithmStepResult(
             loss=total,
-            metrics={"policy_loss": total, **dict(zip(metrics, values))},
+            metrics={"policy_loss": total, **metrics},
             num_steps_or_tokens=steps,
             has_backward=True,
         )
