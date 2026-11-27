@@ -1,0 +1,21 @@
+# @package _global_
+# MixGRPO-Flash (#516): sd3_mixgrpo plus a compressed DPM-Solver++ tail after the SDE window.
+# Steps after max(sde_indices) are resampled to int((T - window_end) * compress_ratio) points;
+# window steps, their log-probs and replay are unchanged. iters_per_window follows the paper's 20.
+
+defaults:
+  - sd3_mixgrpo
+  - _self_
+
+sampling:
+  post_window_ode:
+    _target_: unirl.types.sampling.PostWindowODE
+    order: 2
+    compress_ratio: 0.4
+  scheduler:
+    config:
+      iters_per_window: 20
+
+logging:
+  run_name: ${oc.env:WANDB_RUN_NAME,sd3_mixgrpo_flash}
+  tags: ["sd3.5", "mixgrpo", "mixgrpo-flash", "grpo", "trainside", "v2"]
