@@ -40,16 +40,33 @@ def prepare_segment_anchors(
             raise ValueError("ART requires two disjoint update windows.")
         if part.segment.art_old_predictions is not None:
             return
-        for start, end in plan[1]:
-            micro = arranged_slice(part, order, start, end)
-            algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
-            predictions = micro.segment.art_old_predictions
-            if start == plan[1][0][0]:
-                anchors = predictions.new_zeros((part.batch_size, *predictions.shape[1:]))
-            if order is None:
-                anchors[start:end] = predictions
-            else:
-                anchors.index_copy_(0, order[start:end].to(anchors.device), predictions)
+        replay_start, replay_end = plan[1][0][0], plan[1][-1][1]
+        staged = None
+        stream = None
+        try:
+            for start, end in plan[1]:
+                micro = arranged_slice(part, order, start, end)
+                algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
+                predictions = micro.segment.art_old_predictions
+                if staged is None:
+                    if predictions.is_cuda:
+                        stream = torch.cuda.current_stream(predictions.device)
+                    staged = torch.empty(
+                        (replay_end - replay_start, *predictions.shape[1:]),
+                        dtype=predictions.dtype,
+                        device="cpu",
+                        pin_memory=stream is not None,
+                    )
+                staged[start - replay_start : end - replay_start].copy_(predictions, non_blocking=stream is not None)
+                del micro, predictions
+        finally:
+            if stream is not None:
+                stream.synchronize()
+        anchors = staged.new_zeros((part.batch_size, *staged.shape[1:]))
+        if order is None:
+            anchors[replay_start:replay_end] = staged
+        else:
+            anchors.index_copy_(0, order[replay_start:replay_end].to(anchors.device), staged)
         part.segment.art_old_predictions = anchors
         part.segment.art_self_anchor = True
         return

@@ -250,7 +250,7 @@ class DiffusionART(StageAlgorithm):
         with self._prediction_mode():
             segment.art_old_predictions = torch.stack(
                 [self._predict(conditions, segment, step).detach() for step in range(steps)], dim=1
-            ).cpu()
+            )
 
     @torch.no_grad()
     def prepare_part(self, part: Part) -> Part:
