@@ -129,9 +129,8 @@ def fsdp_wrap(
             CheckpointImpl,
             apply_activation_checkpointing,
             checkpoint_wrapper,
+            offload_wrapper,
         )
-
-        from unirl.train.backend.activation_offload import parameter_aware_offload_wrapper
 
         block_ids = {id(layer) for layer in block_instances}
         wrapped_blocks: Dict[int, nn.Module] = {}
@@ -147,7 +146,7 @@ def fsdp_wrap(
                 else block
             )
             if activation_offload:
-                wrapped = parameter_aware_offload_wrapper(wrapped)
+                wrapped = offload_wrapper(wrapped)
             wrapped_blocks[id(block)] = wrapped
             return wrapped
 
