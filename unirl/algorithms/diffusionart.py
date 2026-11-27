@@ -377,7 +377,9 @@ class DiffusionART(StageAlgorithm):
                 has_backward=False,
             )
         conditions = typed_conditions(conditions, self.conditions_cls)
-        old_predictions = None if cached is None else cached.to(device=segment.latents.device)
+        old_predictions = (
+            None if cached is None else cached.to(device=segment.latents.device, non_blocking=segment.latents.is_cuda)
+        )
         metrics, total = {}, segment.latents.new_zeros((), dtype=torch.float32)
         with self._prediction_mode():
             for start in range(0, steps, self.config.timestep_chunk_size):
