@@ -80,25 +80,28 @@ backend:
 
 For recipes that omit the field, pass `+backend.fsdp_cfg.activation_offload=true`.
 
-`fsdp_wrap` uses PyTorch's `offload_wrapper` (`save_on_cpu(pin_memory=True)`),
-preserving tensor dtype. With activation checkpointing, offload wraps the
-checkpoint wrapper and moves its saved inputs; recomputed intermediates stay
-on the GPU. `ac_wrap_order` still chooses whether FSDP wraps the outer activation
-wrapper (`outside`) or the original block (`inside`). Checkpoint and weight-export
-keys retain their canonical names. Blocks must match `block_class_names`;
-an unmatched selection raises.
+`fsdp_wrap` wraps each selected block in `ParameterAwareOffloadWrapper`
+(`activation_offload_context`), moving saved CUDA activation tensors to pinned
+CPU memory while preserving tensor dtype and skipping `nn.Parameter`s,
+`DTensor`s, and views backed by block parameter storage (such as `weight.t()`
+in `F.linear`) so FSDP2's post-forward parameter reshard stays zero-byte
+instead of duplicating unsharded weights in host RAM. With activation
+checkpointing, offload wraps the checkpoint wrapper and moves its saved inputs;
+recomputed intermediates stay on the GPU. `ac_wrap_order` still chooses whether
+FSDP wraps the outer activation wrapper (`outside`) or the original block
+(`inside`). Checkpoint and weight-export keys retain their canonical names.
+Blocks must match `block_class_names`; an unmatched selection raises.
 
-`veomni_parallelize` applies the same `save_on_cpu(pin_memory=True)` context to
+`veomni_parallelize` applies the same `activation_offload_context` to
 each selected block's forward, outside its optional checkpoint call. It keeps
 the existing module hierarchy, EP parameter groups, and weight names intact.
 This path works with the pinned `veomni==0.1.12`; it does not use newer VeOmni
 async-offload APIs. `ac_wrap_order` applies only to `FSDPBackend`.
 
-CPU memory and CPU–GPU transfers replace GPU storage. Without checkpointing,
-PyTorch also copies parameter tensors saved by operations inside these blocks.
-The native wrapper does not prefetch future layers; pinned memory alone does not
-guarantee transfer/computation overlap or faster training. Compare peak GPU/host
-memory and step time at fixed batch size before changing training geometry.
+CPU memory and CPU–GPU transfers replace GPU storage. The wrapper does not
+prefetch future layers; pinned memory alone does not guarantee
+transfer/computation overlap or faster training. Compare peak GPU/host memory
+and step time at fixed batch size before changing training geometry.
 
 ## Choosing HSDP (hybrid sharding)
 

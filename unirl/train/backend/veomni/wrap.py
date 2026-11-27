@@ -83,16 +83,17 @@ def veomni_parallelize(
             layer.forward = _make_ckpt_forward(layer.forward)
 
     if activation_offload:
+        from unirl.train.backend.activation_offload import activation_offload_context
 
-        def _make_offload_forward(orig_fwd: object) -> object:
+        def _make_offload_forward(layer_mod: nn.Module, orig_fwd: object) -> object:
             def wrapped(*args: object, **kwargs: object) -> object:
-                with torch.autograd.graph.save_on_cpu(pin_memory=True):
+                with activation_offload_context(layer_mod):
                     return orig_fwd(*args, **kwargs)
 
             return wrapped
 
         for layer in block_instances:
-            layer.forward = _make_offload_forward(layer.forward)
+            layer.forward = _make_offload_forward(layer, layer.forward)
 
     if use_torch_compile:
         for layer in block_instances:
