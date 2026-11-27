@@ -107,6 +107,8 @@ rollout:
       # 512-sample activations) headroom; ~24GB KV still ample for the batch.
       mem_fraction_static: 0.25
       skip_server_warmup: true
+      # Pinned off flashinfer, see unirl/rollout/README.md (Gotchas).
+      attention_backend: triton
       # disable_cuda_graph frees server memory for the per-rollout full-weight push.
       disable_cuda_graph: true
       # FULL fine-tuning: no LoRA pool; full dense weights pushed via TensorWeightSync.
