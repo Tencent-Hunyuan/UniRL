@@ -13,7 +13,7 @@ from unirl.models.types.post_materialize import apply_deferred_ops
 from unirl.train.backend.base import LrSchedulerConfig, OptimizerConfig, resolve_trainable_module
 from unirl.train.backend.base_backend import BaseFSDP2Backend
 from unirl.train.backend.fsdp.state import clip_grad_norm, fsdp_offload, fsdp_onload
-from unirl.train.backend.fsdp.wrap import fsdp_wrap
+from unirl.train.backend.fsdp.wrap import finalize_fsdp_root_init, fsdp_wrap
 from unirl.train.backend.sharded_load import load_trainable_weights
 from unirl.train.backend.sharded_state import (
     StateDict,
@@ -141,6 +141,7 @@ class FSDPBackend(BaseFSDP2Backend):
         )
 
         apply_deferred_ops(model)
+        finalize_fsdp_root_init(model)
 
         self._finalize_construction(
             model,
