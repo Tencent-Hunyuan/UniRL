@@ -202,7 +202,7 @@ def _select_value(
     if isinstance(value, torch.Tensor):
         if value.dim() > 0 and int(value.shape[0]) == batch_size:
             idx = indices if isinstance(indices, torch.Tensor) else torch.tensor(indices, dtype=torch.long)
-            return value.index_select(0, idx.to(value.device))
+            return value.index_select(0, idx.to(value.device, non_blocking=value.is_cuda))
         return value
     if isinstance(value, (list, tuple)) and len(value) == batch_size:
         idx_list = indices.tolist() if isinstance(indices, torch.Tensor) else indices
