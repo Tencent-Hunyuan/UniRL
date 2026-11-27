@@ -187,7 +187,8 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 
 `diffusionart.DiffusionART` uses ODE rollouts (`eta: 0`, `guidance_scale: 1`),
 plain LoRA without EMA, and exactly two disjoint optimizer updates per rollout.
-Set `stack.num_updates_per_batch: 2` and sync weights every rollout. Every
+Set `stack.num_updates_per_batch: 2` and `weight_sync_interval: 1` for scalar and pairwise ART.
+Each new rollout must sample the current policy so the first update can reuse its prediction as the rollout reference. Every
 visited state plus the final endpoint must be present in `LatentSegment`;
 sparse trajectories, packed latents, and joint audio/video predictions raise.
 The stack calls `validate_part` once on the full shard before any anchor

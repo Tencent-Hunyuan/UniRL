@@ -74,6 +74,7 @@ class AsyncDiffusionTrainer(AsyncRolloutTrainerMixin, DiffusionTrainer):
 
         self._max_inflight = max_inflight
         self._per_worker_inflight = per_worker_inflight
+        self._validate_weight_sync_interval(weight_sync_interval)
         self._weight_sync_interval = weight_sync_interval
         self._max_staleness = self._weight_sync_interval - 1
         self._num_updates_per_batch = diffusion_kwargs["stack_cfg"].get("num_updates_per_batch", 1)
