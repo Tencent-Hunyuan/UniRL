@@ -52,7 +52,7 @@ not just three-tensor arithmetic.
   it ignores advantages and picks its teacher from the batch's `metadata["domain"]`
   (`diffusionopd.py`). AROPD is its AR sibling — a gap-weighted stop-gradient policy
   gradient over the student's own sampled tokens against one frozen-LoRA same-backbone
-  teacher (`aropd.py`).
+  teacher (`aropd.py`; Qwen3 and Qwen2.5-VL recipes).
 - **The anchor contract — the subtle part.** bf16 forwards are batch-shape
   sensitive, so a π_old anchor computed at a different geometry than `new_logp`
   drifts the on-policy ratio off 1 (and FlowDPPO's KL off 0). Algorithms just declare

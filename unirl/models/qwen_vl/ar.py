@@ -130,6 +130,51 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
     def trainable_module(self) -> "torch.nn.Module":
         return self.model.transformer
 
+    def _check_replay_inputs(
+        self,
+        conditions: QwenVLARConditions,
+        segment: TextSegment,
+        prompt_ids: torch.Tensor,
+        prompt_mask: torch.Tensor,
+    ) -> None:
+        """Raise on prompt/response row skew or rows whose image tokens, grid and pixels disagree; one host sync."""
+        config = self.model.transformer.config
+        merge = config.vision_config.spatial_merge_size**2
+        batch_size = int(prompt_ids.shape[0])
+        if int(segment.lengths.shape[0]) != batch_size:
+            raise ValueError(
+                f"QwenVLARStage.replay: {int(segment.lengths.shape[0])} response rows for {batch_size} prompts"
+            )
+        pvs = list(conditions.pixel_values or [None] * batch_size)
+        grids = list(conditions.image_grid_thw or [None] * batch_size)
+        if len(pvs) != batch_size or len(grids) != batch_size:
+            raise ValueError(
+                f"QwenVLARStage.replay: {len(pvs)} pixel_values / {len(grids)} image_grid_thw rows for {batch_size} prompts"
+            )
+        device = prompt_ids.device
+        image_tokens = ((prompt_ids == config.image_token_id) & prompt_mask.bool()).sum(dim=1)  # [B]
+        rows: List[torch.Tensor] = []
+        pv_rows: List[int] = []
+        for b, (pv, grid) in enumerate(zip(pvs, grids)):
+            if (pv is None) != (grid is None):
+                raise ValueError(f"QwenVLARStage.replay: row {b} has only one of pixel_values / image_grid_thw")
+            if grid is None:
+                rows.append(torch.zeros(2, dtype=torch.long, device=device))
+                pv_rows.append(0)
+                continue
+            patches = grid.to(device=device, dtype=torch.long).prod(dim=-1).sum()
+            rows.append(torch.stack([patches, (~torch.isfinite(pv)).sum().to(device=device, dtype=torch.long)]))
+            pv_rows.append(int(pv.shape[0]))
+        stats = torch.cat([image_tokens[:, None], torch.stack(rows)], dim=1).tolist()  # [B, 3]
+        for b, (n_tokens, n_patches, n_nonfinite) in enumerate(stats):
+            if n_tokens * merge != n_patches or pv_rows[b] != n_patches:
+                raise ValueError(
+                    f"QwenVLARStage.replay: row {b} has {n_tokens} image tokens, {n_patches} grid patches "
+                    f"(-> {n_patches // merge} tokens) and {pv_rows[b]} pixel_values rows"
+                )
+            if n_nonfinite:
+                raise ValueError(f"QwenVLARStage.replay: row {b} pixel_values has {n_nonfinite} non-finite entries")
+
     def autoregress(
         self,
         conditions: QwenVLARConditions,
@@ -278,6 +323,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         prompt_ids = conditions.prompt.input_ids.to(device)
         prompt_mask = conditions.prompt.attention_mask.to(device)
         batch_size = int(prompt_ids.shape[0])
+        self._check_replay_inputs(conditions, segment, prompt_ids, prompt_mask)
 
         pv = concat_optional_tensors(conditions.pixel_values)
         igt = concat_optional_tensors(conditions.image_grid_thw)
@@ -377,6 +423,7 @@ class QwenVLARStage(ARStage[QwenVLARConditions]):
         batch_size = int(prompt_ids.shape[0])
         if batch_size <= 1:
             return None
+        self._check_replay_inputs(conditions, segment, prompt_ids, prompt_mask)
         pv = concat_optional_tensors(conditions.pixel_values)
         igt = concat_optional_tensors(conditions.image_grid_thw)
         if pv is not None:

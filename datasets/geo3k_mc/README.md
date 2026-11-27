@@ -6,7 +6,8 @@ letter.
 
 - Recipes: [`examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml`](../../examples/ar/qwen_vl_grpo_geo3k_mc_4x8.yaml)
   and its `_lora` / `sglang_` variants,
-  [`examples/ar/qwen3_5_grpo_9b_geo3k_mc_sglang.yaml`](../../examples/ar/qwen3_5_grpo_9b_geo3k_mc_sglang.yaml)
+  [`examples/ar/qwen3_5_grpo_9b_geo3k_mc_sglang.yaml`](../../examples/ar/qwen3_5_grpo_9b_geo3k_mc_sglang.yaml),
+  [`examples/ar/qwen_vl_aropd_geo3k_mc_trainside.yaml`](../../examples/ar/qwen_vl_aropd_geo3k_mc_trainside.yaml) (reward-free OPD)
 - Converter: [`prepare_geo3k_mc.py`](prepare_geo3k_mc.py) — `--help` carries the full record contract
 - Loader contract: [`unirl/data/data_source.py`](../../unirl/data/data_source.py) + [`unirl/data/datasets.py`](../../unirl/data/datasets.py)
 
