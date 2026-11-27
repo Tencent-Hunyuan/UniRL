@@ -3,7 +3,7 @@
 > **Where it fits:** one model package under [`unirl/models/`](../README.md). It serves the
 > two droid100 SFT recipes (`examples/sft/cosmos3_droid100_{videopred,action_bc}.yaml`), and
 > `Cosmos3Pipeline.generate` plus `Cosmos3DiffusionStage.replay` serve the FlowGRPO recipes
-> `examples/diffusion/cosmos3/cosmos3_nano_trainside.yaml` (single-frame text-to-image) and
+> `examples/diffusion/cosmos3/cosmos3_{nano,super}_trainside.yaml` (single-frame text-to-image) and
 > `cosmos3_nano_i2v_trainside.yaml` (image-to-video).
 
 ## What it is
@@ -108,7 +108,7 @@ rejected: it has no parity or log-prob evidence. `DiffusionSamplingParams.num_fr
 defaults to 16, so a recipe must set it. `Cosmos3DiffusionStage.diffuse`
 loops over samples, because the transformer takes one packed sequence per call, and
 `Cosmos3DiffusionStep.predict_noise` reuses `pack_joint_sequence`.
-Latents are `[B, 48, T_gen, H/16, W/16]` for `nvidia/Cosmos3-Nano`, with `T_gen = 1` for an
+Latents are `[B, 48, T_gen, H/16, W/16]` for Nano and Super, with `T_gen = 1` for an
 image and `(num_frames - 1) / 4` for a video. The sigma schedule comes
 from `Cosmos3Pipeline.build_schedule_policy` (static flow shift, the required `shift`
 constructor argument); the solver is the injected `StepStrategy`. The running latent is
@@ -148,6 +148,23 @@ each, 9 frames), so it is a smoke baseline, not evidence of video RL gains.
 The two SDE steps per rollout are drawn from steps 10-12 of 16 (sigma 0.750, 0.694, 0.625 at
 shift 5). That is the sigma band of the text-to-image recipe (0.75 to 0.58 at shift 3)
 re-derived for the shift-5 grid, not a setting tuned for video.
+
+## Cosmos3-Super
+
+`nvidia/Cosmos3-Super` (64.0B parameters, 64 layers, hidden size 5120, 128 GB in bf16) is
+Nano at a larger size: its transformer config differs from Nano's only in `hidden_size`,
+`intermediate_size`, `num_attention_heads` and `num_hidden_layers`, and its VAE, scheduler,
+tokenizer and `model_index.json` equal Nano's. `cosmos3_super_trainside.yaml` inherits
+`cosmos3_nano_trainside` and overrides only the checkpoint, run name and tags.
+
+- **`fsdp_mode: no_shard` needs about 166 GiB per GPU.** Each rank holds the full bf16 base
+  (119 GiB). Measured on B200 (179 GiB) with the recipe's two SDE steps per backward: 161
+  GiB allocated per GPU, 166 GiB in `nvidia-smi` with PickScore. On one card without FSDP,
+  replay with gradients peaks at 140 GiB with one SDE step per backward and 158 GiB with
+  two, so an H200 (141 GB) or an 80 GB card does not fit `no_shard` training.
+  `fsdp_mode: full` on smaller cards is not validated.
+- **Scope.** The recipe is smoke-tested only (4 prompts x 8 samples, 3 rollouts, 2x B200,
+  torch 2.13 / cu130). The default scale, a reward trend and H20 are not validated.
 
 ## Gotchas
 

@@ -1,0 +1,24 @@
+# @package _global_
+# Cosmos3-Super text-to-image FlowGRPO + PickScore with trainside rollout (LoRA on the generation stream).
+# Inherits cosmos3_nano_trainside.yaml and changes only the checkpoint, run name and tags: Super's configs equal
+# Nano's except the transformer sizes. Each rank holds the full 128 GB bf16 base (fsdp_mode: no_shard), so it needs
+# B200-class GPUs.
+# Smoke-tested on 2x B200 with torch 2.13 / cu130 at 4 prompts x 8 samples, 3 rollouts (peak 161 GiB allocated per
+# GPU, 166 GiB in nvidia-smi with the reward model). The default scale and a reward trend are not validated.
+# Memory and scope notes: unirl/models/cosmos3/README.md (Cosmos3-Super).
+#
+# Launch (needs the `cosmos3` extra):
+#   PRETRAINED_MODEL=/path/to/Cosmos3-Super \
+#   python -m unirl.train_diffusion --config-name diffusion/cosmos3/cosmos3_super_trainside
+
+defaults:
+  - cosmos3_nano_trainside
+  - _self_
+
+logging:
+  run_name: cosmos3-super-grpo
+  tags: [cosmos3, super, t2i, trainside, lora]
+
+bundle:
+  config:
+    pretrained_model_ckpt_path: ${oc.env:PRETRAINED_MODEL,nvidia/Cosmos3-Super}
