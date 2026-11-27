@@ -840,7 +840,8 @@ class DiffusionTrainer(BaseTrainer):
             for step in sorted(positions_by_step)
         ]
 
-    def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
+    @staticmethod
+    def _stamp_sde_index_per_sample(sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
         frontier = sample.parts[-1]
         segment = frontier.segment
@@ -906,9 +907,15 @@ class DiffusionTrainer(BaseTrainer):
             )
         return stack
 
-    @contextmanager
-    def _rollout_window(self, *, sync_weights: bool, sleep_rollout: bool) -> Iterator[None]:
-        """One wake / push / EMA window spanning every generate call made inside it."""
+    def _generate_with_residency(
+        self,
+        samples: Sequence[Sample],
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool = False,
+    ) -> List[Sample]:
+        """Generate one or more request samples inside one wake/push/EMA/offload window."""
         # No EMA term: _build_residency_planner already rejected the EMA x
         # parked-train x colocated-external combination at startup, fail-fast
         # instead of silently skipping the requested policy.
@@ -930,45 +937,6 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            yield
-            generation_succeeded = True
-        finally:
-            cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
-            if ema_apply_attempted:
-                cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
-            _run_cleanup_steps(cleanup_steps)
-            # The trainer is deliberately not reloaded here. It stays parked
-            # through the reward phase and comes back once, before the optimizer
-            # step, which is the only point that needs it.
-            if sleep_rollout or not generation_succeeded:
-                self._residency.set(Role.ROLLOUT, False)
-
-    def _generate_with_residency(
-        self,
-        sample: Sample,
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool = False,
-    ) -> Sample:
-        """Generate with exception-safe EMA and residency cleanup."""
-        return self._generate_many_with_residency(
-            [sample],
-            sync_weights=sync_weights,
-            sleep_rollout=sleep_rollout,
-            score_inline=score_inline,
-        )[0]
-
-    def _generate_many_with_residency(
-        self,
-        samples: Sequence[Sample],
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool,
-    ) -> List[Sample]:
-        """Generate every sample inside ONE wake/offload window (FlashGRPO's step groups)."""
-        with self._rollout_window(sync_weights=sync_weights, sleep_rollout=sleep_rollout):
             results: List[Sample] = []
             group_timings: List[List[Dict[str, float]]] = []
             for item in samples:
@@ -981,7 +949,18 @@ class DiffusionTrainer(BaseTrainer):
                 self.reward_stack.collect_garbage()
                 if group_timings:
                     self._log_reward_stack_timing(group_timings)
-        return results
+            generation_succeeded = True
+            return results
+        finally:
+            cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
+            if ema_apply_attempted:
+                cleanup_steps.append(("EMA restore", self.backend.restore_from_eval))
+            _run_cleanup_steps(cleanup_steps)
+            # The trainer is deliberately not reloaded here. It stays parked
+            # through the reward phase and comes back once, before the optimizer
+            # step, which is the only point that needs it.
+            if sleep_rollout or not generation_succeeded:
+                self._residency.set(Role.ROLLOUT, False)
 
     def _log_reward_stack_timing(self, group_timings: Sequence[Sequence[Mapping[str, float]]]) -> None:
         """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
@@ -1018,7 +997,7 @@ class DiffusionTrainer(BaseTrainer):
         group_sde_indices: Optional[Sequence[int]],
     ) -> Tuple[Sample, float]:
         """One ``rollout → reward → advantage`` pass over one or more request Samples."""
-        generated = self._generate_many_with_residency(
+        generated = self._generate_with_residency(
             samples,
             sync_weights=sync_weights,
             sleep_rollout=not self._residency.policy.rollout_resident,
@@ -1241,12 +1220,12 @@ class DiffusionTrainer(BaseTrainer):
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self._generate_with_residency(
-                request,
+                [request],
                 # Engines whose sleep releases the adapter (e.g. SGLang) need
                 # the requested policy re-pushed after every eval-chunk wake.
                 sync_weights=sync_pending or resync_after_sleep,
                 sleep_rollout=sleep_rollout,
-            )
+            )[0]
             sync_pending = False
             first_scored: Optional[Sample] = None
             with self._reward_phase(preserve_rollout=not sleep_rollout):
