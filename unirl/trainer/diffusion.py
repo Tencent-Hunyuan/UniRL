@@ -23,7 +23,7 @@ from unirl.trainer.hydra import parse_hydra_cfg, remote_hydra
 from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, ResidencyPolicy, Role
 from unirl.types.primitives import Texts
 from unirl.types.sample import Sample
-from unirl.types.sampling import BaseSamplingParams, DiffusionSamplingParams, total_samples_per_prompt
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -747,6 +747,11 @@ class DiffusionTrainer(BaseTrainer):
     def _flash_candidate_pool(self) -> List[int]:
         """SDE steps FlashGRPO's per-prompt draw may pick, from the scheduler's candidate pool."""
         diffusion = self.sampling_params["diffusion"]
+        if diffusion.sde_indices is not None:
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path draws from sampling.scheduler and does not accept "
+                f"fixed sampling.sde_indices={diffusion.sde_indices}; drop sampling.sde_indices."
+            )
         scheduler = diffusion.scheduler
         if not isinstance(scheduler, AllSDEScheduler):
             raise ValueError(
@@ -770,13 +775,16 @@ class DiffusionTrainer(BaseTrainer):
 
     def _check_flash_rectification_pool(self, algorithm_cfg: Any) -> None:
         """Fail fast when the rectification normalizer disagrees with the SDE candidate pool."""
-        pool = sorted(self._flash_candidate_pool())
+        pool = self._flash_candidate_pool()
         if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
             raise ValueError(
                 "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
                 f"candidate pool {pool}; got None."
             )
-        rectification_sorted = sorted(int(i) for i in algorithm_cfg["rectification_indices"])
+        raw_indices = algorithm_cfg["rectification_indices"]
+        if any(not isinstance(i, int) or isinstance(i, bool) for i in raw_indices):
+            raise ValueError(f"FlashGRPO rectification_indices must contain integers; got {list(raw_indices)!r}.")
+        rectification_sorted = sorted(raw_indices)
         if rectification_sorted != pool:
             raise ValueError(
                 f"FlashGRPO rectification_indices {rectification_sorted} must equal the SDE candidate "
@@ -836,18 +844,24 @@ class DiffusionTrainer(BaseTrainer):
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
         frontier = sample.parts[-1]
         segment = frontier.segment
-        if segment is None:
-            raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
+        if segment is None or segment.latents is None or segment.indices is None:
+            raise ValueError(
+                "FlashGRPO: a step group's rollout must return a segment with latents and indices "
+                "to stamp sde_index_per_sample."
+            )
+        expected = [sde_index, sde_index + 1, frontier.sampling_params.num_inference_steps]
+        if (
+            segment.latents.shape is None
+            or len(segment.latents.shape) < 2
+            or tuple(segment.latents.shape[:2]) != (frontier.batch_size, 3)
+            or hydrate(segment.indices).tolist() != expected
+        ):
+            raise ValueError("FlashGRPO requires rollout latent slots [before, after, final].")
         segment.sde_index_per_sample = torch.full((frontier.batch_size,), sde_index, dtype=torch.long)
-        if segment.indices is not None and segment.latents is not None:
-            expected = [sde_index, sde_index + 1, frontier.sampling_params.num_inference_steps]
-            if segment.latents.shape[1] != 3 or hydrate(segment.indices).tolist() != expected:
-                raise ValueError("FlashGRPO requires rollout latent slots [before, after, final].")
-            segment.indices = torch.arange(3, dtype=torch.long)
+        segment.indices = torch.arange(3, dtype=torch.long)
         if segment.sde_indices is not None:
             segment.sde_indices = torch.zeros(1, dtype=torch.long)
-        if isinstance(frontier.sampling_params, DiffusionSamplingParams):
-            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
+        frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
     def _prepare_for_save(self) -> None:
         """Checkpointing reads the trainer's weights, and evaluate() may have parked them."""
@@ -955,27 +969,34 @@ class DiffusionTrainer(BaseTrainer):
     ) -> List[Sample]:
         """Generate every sample inside ONE wake/offload window (FlashGRPO's step groups)."""
         with self._rollout_window(sync_weights=sync_weights, sleep_rollout=sleep_rollout):
-            results = [
-                self.reward_stack.rollout_and_score(item) if score_inline else self.rollout.generate(item)
-                for item in samples
-            ]
+            results: List[Sample] = []
+            group_timings: List[List[Dict[str, float]]] = []
+            for item in samples:
+                if score_inline:
+                    results.append(self.reward_stack.rollout_and_score(item))
+                    group_timings.append(self.reward_stack.timing())
+                else:
+                    results.append(self.rollout.generate(item))
             if score_inline:
                 self.reward_stack.collect_garbage()
-                self._log_reward_stack_timing()
+                if group_timings:
+                    self._log_reward_stack_timing(group_timings)
         return results
 
-    def _log_reward_stack_timing(self) -> None:
+    def _log_reward_stack_timing(self, group_timings: Sequence[Sequence[Mapping[str, float]]]) -> None:
         """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
-        per_rank = self.reward_stack.timing()
         keys = ("generate_s", "score_s", "wall_s")
-        peak = {k: max(float(t[k]) for t in per_rank) for k in keys}
-        mean = {k: sum(float(t[k]) for t in per_rank) / len(per_rank) for k in keys}
+        ranks = len(group_timings[0])
+        rows = sum(int(per_rank[0]["rows"]) for per_rank in group_timings)
+        micros = sum(int(per_rank[0]["micros"]) for per_rank in group_timings)
+        peak = {k: sum(max(float(t[k]) for t in per_rank) for per_rank in group_timings) for k in keys}
+        mean = {k: sum(sum(float(t[k]) for t in per_rank) / len(per_rank) for per_rank in group_timings) for k in keys}
         logger.info(
             "reward stack timing: ranks=%d rows=%d micros=%d generate_s=%.2f/%.2f score_s=%.2f/%.2f "
             "wall_s=%.2f/%.2f (max/mean)",
-            len(per_rank),
-            int(per_rank[0]["rows"]),
-            int(per_rank[0]["micros"]),
+            ranks,
+            rows,
+            micros,
             peak["generate_s"],
             mean["generate_s"],
             peak["score_s"],

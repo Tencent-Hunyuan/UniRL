@@ -520,9 +520,9 @@ without driver-authored x_T. `media_log_interval` does not apply
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
 - **FlashGRPO assigns one SDE step per prompt, by stratification.** `requires_per_sample_sde_index`
-  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group,
-  stamp `segment.sde_index_per_sample`, and concatenate the groups into one track *inside a single
-  residency window*. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
+  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group
+  *inside a single residency window*, then stamp `segment.sde_index_per_sample` and concatenate the
+  groups into one track. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
   prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
   whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
 - **The FlashGRPO batch must satisfy `batch_size % (pool_size * rollout dp_size) == 0`.** Each step

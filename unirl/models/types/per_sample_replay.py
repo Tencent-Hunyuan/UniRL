@@ -30,15 +30,20 @@ class PerSampleStepReplayMixin:
         name = type(self).__name__
         if segment.sigmas is None or segment.latents is None:
             raise ValueError(f"{name}.replay_per_sample: segment.sigmas / latents missing")
-        num_samples = segment.latents.shape[0]
-        if segment.latents.shape[1] < 2:
+        if segment.latents.ndim < 2 or segment.latents.shape[1] < 2:
             raise ValueError(
                 f"{name}.replay_per_sample: expected latents with a [before, after, ...] slot layout "
-                f"(K >= 2); got K={segment.latents.shape[1]}."
+                f"(ndim >= 2, K >= 2); got shape={tuple(segment.latents.shape)}."
             )
-        if segment.sigmas.shape[0] < 2:
-            raise ValueError(f"{name}.replay_per_sample: expected sigmas length >= 2; got {segment.sigmas.shape[0]}.")
+        num_samples = segment.latents.shape[0]
+        if segment.sigmas.ndim != 1 or segment.sigmas.shape[0] < 2:
+            raise ValueError(
+                f"{name}.replay_per_sample: expected 1-D sigmas with length >= 2; "
+                f"got shape={tuple(segment.sigmas.shape)}."
+            )
         raw_idx = segment.sde_index_per_sample
+        if raw_idx is None:
+            raise ValueError(f"{name}.replay_per_sample: segment.sde_index_per_sample missing")
         if raw_idx.ndim != 1 or raw_idx.dtype not in (torch.int32, torch.int64):
             raise ValueError(
                 f"{name}.replay_per_sample: sde_index_per_sample must be a 1-D integer tensor; "
@@ -61,7 +66,7 @@ class PerSampleStepReplayMixin:
         sigma_next = sigmas.index_select(0, step_idx + 1)
         sigma_max = sigmas[1]
         # Fixed slots, not latents_at(): after the per-step groups merge, the shared
-        # ``indices`` map holds one group's steps and is not per-sample valid.
+        # ``indices`` map is normalized to slot positions [0, 1, 2], not per-sample steps.
         sample = segment.latents[:, 0].to(device)
         prev_sample = segment.latents[:, 1].to(device)
 
