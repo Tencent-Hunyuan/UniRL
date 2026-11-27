@@ -178,6 +178,23 @@ def fsdp_wrap(
                 f"every fully_shard group (e.g. {stray[:3]}); their grads would never be "
                 "DP-synced and replicas drift. Enable training.fsdp.root_wrap or freeze them.",
             )
+        if not isinstance(model, FSDPModule) and any(isinstance(m, FSDPModule) for m in model.modules()):
+            # Link child FSDP blocks under a parameterless FSDP root so they share
+            # one _comm_ctx and recycle reduce-scatter input buffers across backward
+            # while leaving leftover peripheral parameters unsharded at their stored dtype.
+            buf_devices = [(buf, buf.device) for buf in model.buffers() if not buf.is_meta]
+            unsharded_params = {p for p in model.parameters() if not isinstance(p, DTensor)}
+            root_link_kwargs: Dict[str, object] = {
+                "reshard_after_forward": False,
+                "mp_policy": MixedPrecisionPolicy(cast_forward_inputs=False),
+                "ignored_params": unsharded_params,
+            }
+            if mesh is not None:
+                root_link_kwargs["mesh"] = mesh
+            fully_shard(model, **root_link_kwargs)
+            for buf, dev in buf_devices:
+                if buf.device != dev:
+                    buf.data = buf.to(dev)
 
     if copy_engine_all_gather:
         import torch.distributed as dist
@@ -201,11 +218,13 @@ def fsdp_wrap(
     if forward_prefetch:
         if not isinstance(model, FSDPModule):
             raise ValueError(
-                "fsdp_wrap: forward_prefetch=True needs the model root-wrapped so FSDP2 "
-                "initializes the shared all-gather comm context, but root_wrap did not run "
-                "(training.fsdp.root_wrap=False). Set root_wrap=True, or forward_prefetch=False."
+                "fsdp_wrap: forward_prefetch=True needs at least one FSDP-wrapped module so FSDP2 "
+                "initializes the shared all-gather comm context, but neither blocks nor the root "
+                "were wrapped (training.fsdp.root_wrap=False with no matched blocks)."
             )
-        fsdp_groups = [m for m in model.modules() if isinstance(m, FSDPModule)]
+        fsdp_groups = [
+            m for m in model.modules() if isinstance(m, FSDPModule) and m._get_fsdp_state()._fsdp_param_groups
+        ]
         for cur, nxt in zip(fsdp_groups, fsdp_groups[1:]):
             cur.set_modules_to_forward_prefetch([nxt])
 
@@ -215,6 +234,7 @@ def fsdp_wrap(
 
     # Rollout may temporarily retain unsharded params across cached decode.
     model._unirl_fsdp_reshard_after_forward = fsdp_kwargs["reshard_after_forward"]
+    finalize_fsdp_root_init(model)
 
     if _current_rank() == 0:
         logger.info(
@@ -314,6 +334,24 @@ def _validate_hsdp_mesh(model: nn.Module, *, expected_mesh: object) -> None:
         f"fsdp_wrap: hybrid mode requested mesh {expected[0]}={expected[1]}, "
         f"but the wrapped parameters use {actual[0]}={actual[1]}.",
     )
+
+
+def finalize_fsdp_root_init(model: nn.Module) -> None:
+    """Initialize a parameterless FSDP root once sharded child parameters leave meta."""
+    from torch.distributed.fsdp import FSDPModule
+
+    if not isinstance(model, FSDPModule):
+        return
+    state = model._get_fsdp_state()
+    if state._is_root is not None or state._fsdp_param_groups:
+        return
+    for module in model.modules():
+        if not isinstance(module, FSDPModule):
+            continue
+        for param_group in module._get_fsdp_state()._fsdp_param_groups:
+            if any(fsdp_param.sharded_param.is_meta for fsdp_param in param_group.fsdp_params):
+                return
+    state._lazy_init()
 
 
 def _current_rank() -> int:
