@@ -104,6 +104,8 @@ class RewardService(Remote):
 
         if self.truncated_reward == "keep" or request.response_lengths is None:
             return reward_response
+        if not self.backend.supports_truncation_penalty:
+            raise ValueError("Pairwise rewards on variable-length AR outputs require reward.truncated_reward: keep.")
         rewards = torch.tensor(reward_response.rewards, dtype=torch.float32)
         lengths = torch.tensor(request.response_lengths, dtype=torch.float32)
         max_len = request.max_new_tokens
@@ -197,7 +199,12 @@ def score_and_attach(reward: Any, sample: Sample) -> Sample:
     component_rewards = {
         name: torch.tensor(values, dtype=torch.float32) for name, values in reward_response.component_rewards.items()
     }
-    scored = replace(frontier, rewards=rewards, component_rewards=component_rewards)
+    scored = replace(
+        frontier,
+        rewards=rewards,
+        component_rewards=component_rewards,
+        has_pairwise_labels=reward_response.has_pairwise_labels,
+    )
     return sample.with_parts([*sample.parts[:-1], scored])
 
 

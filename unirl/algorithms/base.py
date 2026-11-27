@@ -339,9 +339,9 @@ def require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *
 
 @dataclass(frozen=True)
 class AlgorithmStepResult:
-    """Result of one micro-step under the stage-driven contract."""
+    """A tensor loss and its metrics are detached device scalars pending optimizer-boundary extraction."""
 
-    loss: float
+    loss: float | torch.Tensor
     metrics: Mapping[str, Any]
     num_steps_or_tokens: int
     has_backward: bool
@@ -365,10 +365,21 @@ class StageAlgorithm(Remote, ABC):
 
     requires_ema_rollout: bool = False
     supports_multi_update: bool = False
+    required_num_updates: Optional[int] = None
     requires_backend: bool = False
     requires_advantages: bool = True
+    first_update_self_anchor: bool = False
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
+
+    @property
+    def update_group_size(self) -> Optional[int]:
+        """Optional prompt group size for prompt-balanced two-update membership."""
+        return None
+
+    def validate_part(self, part: "Part") -> None:
+        """Optional full-shard preflight before anchor slicing or model execution."""
+        return None
 
     def prepare_segment(
         self,

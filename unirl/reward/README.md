@@ -96,8 +96,10 @@ it returns a fresh one sharing every non-reward field. Per call it:
    scaled by `overlong_penalty_factor`.
 6. **Attaches** the merged `rewards` + `component_rewards` and returns the Sample.
 
-Built-in backends score rows independently, so splitting a GRPO group across reward
-shards is safe; sibling aggregation stays a driver-side advantage concern.
+Pointwise backends score rows independently, so splitting a GRPO group across reward
+shards is safe; group backends such as `PairwiseRewardBackend` set
+`requires_complete_groups = True` and require contiguous prompt groups aligned with
+reward DP shards.
 
 A backend is just `compute_rewards(request) -> RewardResponse`. Local scorers
 (`local/`) subclass `LocalRewardBackend` and implement `_compute_model_rewards`;
@@ -117,16 +119,17 @@ concatenates the scored Parts back into one Sample. The driver then skips
 ```yaml
 reward_stack:
   _target_: unirl.reward.stack.RewardStack
-  micro_batch_size: 8      # rows per micro; a micro can be one row unless the engine packs whole groups
+  micro_batch_size: 8      # rows per micro; whole-group engines/rewards can extend the boundary
   overlap: false           # true: score each micro on a thread while the next ones generate
 ```
 
-A micro can be as small as one row. The exception is an engine that packs a whole
+A micro can be as small as one row. An engine that packs a whole
 `samples_per_prompt` group into one request (the vLLM-Omni SD3 and Qwen-Image t2i
-adapters), which the engine reports through `packs_groups`; there a micro is
+adapters) reports this through `packs_groups`; there a micro is
 extended to the end of the group it would otherwise split, so the group is the floor.
 vLLM-Omni BAGEL packs whatever contiguous siblings a micro holds, so it, SGLang and the
-trainside engine take micros of any size.
+trainside engine take micros of any size unless the reward backend sets
+`requires_complete_groups`, as `PairwiseRewardBackend` does.
 
 It pays for a reward that costs real time relative to generation, which in practice
 means one served from other GPUs: colocated with PickScore the stack recovers 0.15 s of a
@@ -156,6 +159,47 @@ no-stack path; `gc.collect` alone recovers it, `empty_cache` alone does not. The
 per-rank split (`reward stack timing: ... generate_s=<max>/<mean> score_s=... wall_s=...`)
 and adds `stack_generate` / `stack_score` to the perf phases; the driver-side `generate`
 and `reward` timers do not fire under the stack.
+
+### Pairwise feedback
+
+The [SD3 DiffusionART pairwise recipe](../../examples/diffusion/sd3/sd3_diffusionart_pairwise.yaml)
+compares two candidates per prompt (`K=2`). Set `PAIRWISE_JUDGE_ENDPOINT` to the full
+OpenAI-compatible chat completions URL and `PAIRWISE_JUDGE_MODEL` to a multimodal model
+that accepts two images. For a protected endpoint, set `PAIRWISE_JUDGE_API_KEY` in the
+reward workers' environment. Run from the repo root:
+
+```bash
+bash examples/run_experiment_single_node.sh diffusion/sd3/sd3_diffusionart_pairwise
+```
+
+[`PairwiseImageJudge`](pairwise.py) sends each prompt and both generated images in one
+request. It accepts `A`, `B`, or `TIE`. Failed or malformed replies abort scoring.
+This judge supports text-to-image generation without conditioning media.
+
+For a pointwise model such as PickScore, set `reward.backend.judge` to the following
+mapping in place of the HTTP judge. `ScalarComparisonJudge` scores each candidate
+independently and compares the two finite scores. Equal scores yield a tie.
+For variable-length AR text, set `reward.truncated_reward: keep`. Scoring rejects
+per-candidate truncation penalties because they can change a winner or break a tie.
+
+```yaml
+judge:
+  _target_: unirl.reward.pairwise.ScalarComparisonJudge
+  backend:
+    _target_: unirl.reward.local.pickscore.PickScoreRewardScorer
+    base_device: cuda
+    config:
+      _target_: unirl.reward.local.pickscore.PickScoreSpec
+```
+
+Each candidate enters exactly one comparison within its parent prompt. A winner
+receives 1, a loser 0, and both candidates in a tie receive 0.5. DiffusionART
+uses these labels in its usual covariance. The mean label is always 0.5 over a
+complete group. The scorer marks the rewards as pairwise so ART can keep tied
+rows at the old velocity whenever the rollout contains a decisive comparison.
+To measure absolute quality, add a separate scalar scorer under
+`eval_rewards` and set a positive `eval_interval` (for example, `eval_interval: 20`).
+The default interval of zero disables periodic evaluation and its extra scorers.
 
 ### Managed image scorers
 
@@ -206,6 +250,16 @@ new remote reward needs no UniRL code — add it to the server and list its name
 
 ## Gotchas
 
+- **Pairwise scoring requires complete parent-prompt groups at the reward worker.**
+  `RewardService.score` shards `RewardRequest` into contiguous equal chunks (keep
+  `batch_size` divisible by `reward.dp_size` and siblings contiguous); `RewardStack`
+  extends micro boundaries to retain all siblings, including interleaved groups. A direct
+  partial request fails even if its candidate count is even. Keep train and eval
+  `samples_per_prompt` equal to the even `group_size`. Candidate IDs must be
+  unique and supplied group IDs must match their parents. The judge receives
+  adjacent pairs; the backend restores labels to input row order. Pairing uses
+  sorted candidate IDs and a private RNG seeded by the parent ID and `seed`,
+  so the same IDs retain their partners across row order and DP placement.
 - **`reward_stack:` is colocate-only and DP-only** — the trainer rejects `layout:
   separate`, `reward_fraction > 0`, `reward_resident: false`, `sp_size > 1` and
   `tp_size > 1`: the stack needs the engine and the reward as in-process siblings, it

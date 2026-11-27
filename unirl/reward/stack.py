@@ -48,12 +48,19 @@ class RewardStack(Remote):
         total = gen.batch_size
         groups = gen.group_ids
         whole_groups = self.rollout.packs_groups
+        complete_groups = self.reward.backend.requires_complete_groups
+        last_rows = {group: row for row, group in enumerate(groups)} if complete_groups else {}
         bounds: List[Tuple[int, int]] = []
         start = 0
         while start < total:
             end = min(start + self.micro_batch_size, total)
             while whole_groups and end < total and groups[end] == groups[end - 1]:
                 end += 1
+            if complete_groups:
+                row = start
+                while row < end:
+                    end = max(end, last_rows[groups[row]] + 1)
+                    row += 1
             bounds.append((start, end))
             start = end
         self._rows, self._micros, self._generate_s, self._score_s = total, len(bounds), 0.0, 0.0

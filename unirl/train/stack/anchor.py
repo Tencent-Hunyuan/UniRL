@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 import torch
@@ -9,6 +10,13 @@ import torch
 from unirl.algorithms.base import StageAlgorithm
 from unirl.train.stack.planner import Plan, arranged_slice, restore_row_order
 from unirl.types.sample import Part
+
+
+def first_update_part(algorithm: StageAlgorithm, part: Part) -> Part:
+    """Reuse the current prediction as the first ART anchor without gathering cached velocities."""
+    if not algorithm.first_update_self_anchor or not part.segment.art_self_anchor:
+        return part
+    return replace(part, segment=replace(part.segment, art_old_predictions=None))
 
 
 def validate_anchor_contract(algorithm: StageAlgorithm) -> None:
@@ -24,7 +32,43 @@ def prepare_segment_anchors(
     algorithm: StageAlgorithm, part: Part, plan: Plan, *, order: Optional[torch.Tensor]
 ) -> None:
     """Freeze declared anchors over the plan's micros, before any update, and write them back onto ``part``."""
+    algorithm.validate_part(part)
     if part.segment is None:
+        return
+    if algorithm.first_update_self_anchor:
+        if len(plan) != 2:
+            raise ValueError("ART requires two disjoint update windows.")
+        if part.segment.art_old_predictions is not None:
+            return
+        replay_start, replay_end = plan[1][0][0], plan[1][-1][1]
+        staged = None
+        stream = None
+        try:
+            for start, end in plan[1]:
+                micro = arranged_slice(part, order, start, end)
+                algorithm.prepare_segment(conditions=micro.conditions, segment=micro.segment)
+                predictions = micro.segment.art_old_predictions
+                if staged is None:
+                    if predictions.is_cuda:
+                        stream = torch.cuda.current_stream(predictions.device)
+                    staged = torch.empty(
+                        (replay_end - replay_start, *predictions.shape[1:]),
+                        dtype=predictions.dtype,
+                        device="cpu",
+                        pin_memory=stream is not None,
+                    )
+                staged[start - replay_start : end - replay_start].copy_(predictions, non_blocking=stream is not None)
+                del micro, predictions
+        finally:
+            if stream is not None:
+                stream.synchronize()
+        anchors = staged.new_zeros((part.batch_size, *staged.shape[1:]))
+        if order is None:
+            anchors[replay_start:replay_end] = staged
+        else:
+            anchors.index_copy_(0, order[replay_start:replay_end].to(anchors.device), staged)
+        part.segment.art_old_predictions = anchors
+        part.segment.art_self_anchor = True
         return
     micro_slices = [r for update in plan for r in update]
     if not algorithm.recomputes_anchor or len(micro_slices) == 1:
@@ -64,6 +108,9 @@ def prepare_part_for_training(
     model: torch.nn.Module,
 ) -> Part:
     """Freeze ``part``'s anchors in eval mode, run the algorithm's ``prepare_part`` hook, then restore the mode."""
+    if algorithm.first_update_self_anchor:
+        # A fallback buffer covers only update B and belongs to this particular plan.
+        part = replace(part, segment=replace(part.segment))
     was_training = model.training
     model.eval()
     try:

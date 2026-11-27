@@ -182,3 +182,90 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
   this: the operands are already rounded when the forward returns them. DiffusionOPD's
   `fp32 before squaring` is not the same situation — it upcasts scheduler-computed
   `prev_sample_means`, not raw network output.
+
+## DiffusionART
+
+`diffusionart.DiffusionART` uses ODE rollouts (`eta: 0`, `guidance_scale: 1`),
+plain LoRA without EMA, and exactly two disjoint optimizer updates per rollout.
+Set `stack.num_updates_per_batch: 2` and `weight_sync_interval: 1` for scalar and pairwise ART.
+Each new rollout must sample the current policy so the first update can reuse its prediction as the rollout reference. Every
+visited state plus the final endpoint must be present in `LatentSegment`;
+sparse trajectories, packed latents, and joint audio/video predictions raise.
+The stack calls `validate_part` once on the full shard before any anchor
+forward and exchanges validation failures so all ranks fail together; numeric schedule and dense-index checks belong there. Anchor and
+training micros repeat metadata-only shape checks without device scalar reads.
+Standalone callers must invoke `validate_part(part)` before `prepare_segment` and `prepare_part`
+and keep the shared schedule/indices unchanged throughout that rollout.
+SD3 and the dense HunyuanVideo/Wan stages share the same prediction interface.
+
+Video recipes preserve their FlowGRPO baseline's model, LoRA, batch geometry,
+reward, resolution, frame count, and optimizer. They change the algorithm,
+select every ODE state, and set `eta: 0`; the reference mask still uses nu 0.8.
+
+| Recipe | GPUs | LoRA rank / alpha | Video dimensions | Rollout steps | Train microbatch |
+|---|---:|---:|---|---:|---:|
+| [`hunyuan_video10_t2v_art_trainside`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_art_trainside.yaml) | 8 | 64 / 256 | 1280 × 720, 5 frames | 10 | 1 |
+| [`hunyuan_video10_t2v_art_sglang`](../../examples/diffusion/hunyuan_video10/hunyuan_video10_t2v_art_sglang.yaml) | 8 | 64 / 256 | 1280 × 720, 5 frames | 10 | 1 |
+| [`wan21_i2v_art`](../../examples/diffusion/wan21/wan21_i2v_art.yaml) | 8 | 64 / 128 | 1280 × 720, 9 frames | 14 | 1 |
+
+Set `PRETRAINED_MODEL` and `DATA_PATH` before using
+`bash examples/run_experiment_single_node.sh diffusion/hunyuan_video10/hunyuan_video10_t2v_art_trainside`.
+Wan I2V requires a dataset with input-image conditioning, as in `wan21_i2v`.
+The 8-GPU Wan ART recipe enables activation checkpointing. With checkpointing disabled,
+the 720p run exhausted device memory during training before its first optimizer update.
+SGLang uses the baseline's merged-LoRA weight sync and populated training
+conditions. It uses the train-side fallback described below.
+These dimensions are frame counts, not video durations in seconds.
+
+`prepare_part` groups scalar advantages by sample lineage, using the same
+parent layer as `Part.compute_advantages`.
+The group size must match `params.samples_per_prompt`. Train workers exchange
+sample metadata and compute intact groups locally. For groups spanning DP shards,
+they reduce centered endpoint and reward moments in FP64. SP/TP replicas count
+once per sample. Each optimizer update receives half of each prompt's samples,
+and each DP rank has the same number of rows in both updates. This requires an
+even group size and an even local row count.
+
+Guidance is the per-prompt reward/endpoint covariance divided by its RMS.
+The precision guard compares the covariance norm to the product of the centered
+endpoint and reward norms scaled by the input precision. Unresolved groups have
+zero guidance. Scalar SD3 uses the default `restore_zero_signal: false`; these
+rows contribute zero loss, and a globally inactive rollout skips both optimizer
+steps. The HunyuanVideo and Wan recipes use `restore_zero_signal: true`: rows
+with zero guidance regress to their frozen old velocity and both optimizer
+windows run even when every group has zero guidance.
+
+Pairwise winner, loser and tie labels enter the same full-group covariance.
+Only winners and losers receive the resulting direction. If any rank has a
+decisive comparison, tied rows regress toward their frozen old velocity. An entirely
+tied rollout skips both optimizer steps. All modes use the original row
+denominator and agree across ranks on whether to run backward.
+
+Both updates use velocities from the rollout policy. Native SD3, HunyuanVideo
+and Wan ART recipes cache scheduler-input velocities during rollout in host memory
+(`cache_art_old_predictions: true`) and reuse them on both updates. Engines
+without this field use the first update's own detached velocity there and
+replay only the second update's microbatches before the first optimizer step. Training
+transfers cached velocities to the device per microbatch. Metrics are transferred together
+after the microbatch's backward passes. Skipped disjoint updates do not advance
+the checkpointed optimizer counter.
+Both prediction passes keep the transformer in training mode, including during
+the stack's eval-mode anchor hook, and temporarily disable only PyTorch dropout
+modules. This preserves training-gated activation checkpointing and prevents
+dropout from introducing artificial drift; every module's previous mode is
+restored after backward. Stateful BatchNorm stages raise, and custom stochastic
+prediction paths are unsupported.
+
+UniRL predicts epsilon minus x0, so the regression target is **old minus
+guidance**. Loss is sigma times the mean squared velocity residual, averaged
+over every original row and timestep; masked rows remain in the denominator.
+The correction mask drops a row when reference Gaussian KL is at least
+`kl_mask_threshold` (default `1e-5`) and drift dotted with the remaining target
+residual is positive. It uses `FlowSDEStrategy` reference noise `reference_nu`
+(default `0.8`), independently of rollout eta. At sigma one the reference
+standard deviation is nu and the velocity coefficient is the step size;
+elsewhere they are `nu * sqrt(sigma / (1-sigma) * h)` and
+`h * (1 + nu**2/2)`. This deliberately differs from the rollout scheduler's
+`sigma_max` fallback. `timestep_chunk_size` (default one) bounds replay graphs
+and never changes anchor microbatch geometry. Metrics report mask fraction,
+zero-signal fraction, prediction drift, and reference KL.

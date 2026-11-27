@@ -130,6 +130,7 @@ class DiffusionSamplingParams(BaseSamplingParams):
     distilled_guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
     strength: Optional[float] = None
+    cache_art_old_predictions: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -145,6 +146,9 @@ class DiffusionSamplingParams(BaseSamplingParams):
         self.num_frames = _coerce_type(self.num_frames, int, f"{cls}.num_frames")
         self.seed = _coerce_type(self.seed, int, f"{cls}.seed", True)
         self.init_same_noise = _coerce_type(self.init_same_noise, bool, f"{cls}.init_same_noise")
+        self.cache_art_old_predictions = _coerce_type(
+            self.cache_art_old_predictions, bool, f"{cls}.cache_art_old_predictions"
+        )
         self.disable_driver_xt = _coerce_type(self.disable_driver_xt, bool, f"{cls}.disable_driver_xt")
         self.eta = _coerce_type(self.eta, float, f"{cls}.eta")
         self.max_sequence_length = _coerce_type(self.max_sequence_length, int, f"{cls}.max_sequence_length", True)

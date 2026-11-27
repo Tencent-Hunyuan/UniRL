@@ -116,6 +116,7 @@ rollout:
   config:
     _target_: unirl.rollout.engine.sglang_diffusion.config.SGLangDiffusionEngineConfig
     model_family: hunyuan_video10
+    sampling: ${sampling}
     populate_conditions: true
     init_same_noise: ${sampling.init_same_noise}
     forward_batch_size: 1
@@ -123,8 +124,6 @@ rollout:
     tp_size: 1
     local_mode: true
     engine_kwargs:
-      # Hunyuan guidance is PipelineConfig.embedded_cfg_scale, not request guidance_scale.
-      embedded_cfg_scale: ${sampling.guidance_scale}
       flow_shift: ${model_config.shift}
   model_config: ${model_config}
   strategy: ${strategy}

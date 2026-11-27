@@ -13,7 +13,7 @@ import torch
 from unirl.algorithms.base import AlgorithmStepResult, StageAlgorithm
 from unirl.distributed.group.dispatch import Dispatch, distributed
 from unirl.train.backend.fsdp import FSDPBackend
-from unirl.train.stack.anchor import prepare_part_for_training, validate_anchor_contract
+from unirl.train.stack.anchor import first_update_part, prepare_part_for_training, validate_anchor_contract
 from unirl.train.stack.base import BaseTrainStack, TrainStepResult, aggregate_update_results
 from unirl.train.stack.loss_scale import resolve_loss_scales
 from unirl.train.stack.planner import (
@@ -29,6 +29,17 @@ from unirl.types.sample import Part
 from unirl.utils.metrics import aggregate_numeric_metrics
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_micro_results(results: List[AlgorithmStepResult]) -> None:
+    """Read all deferred scalar losses and diagnostics in one transfer after the update."""
+    pending = [(i, result) for i, result in enumerate(results) if isinstance(result.loss, torch.Tensor)]
+    if not pending:
+        return
+    scalars = [value for _, result in pending for value in (result.loss, *result.metrics.values())]
+    values = iter(torch.stack(scalars).tolist())
+    for i, result in pending:
+        results[i] = replace(result, loss=next(values), metrics={key: next(values) for key in result.metrics})
 
 
 class TrainStack(BaseTrainStack):
@@ -113,8 +124,6 @@ class TrainStack(BaseTrainStack):
                 "supervision (0/0 loss NaNs destroyed checkpoints in verl #785)."
             )
         micro_results: List[AlgorithmStepResult] = []
-        total_loss = 0.0
-        has_backward = False
 
         single_micro = len(micros) == 1 and micros[0] == (0, bs)
         last_micro = len(micros) - 1
@@ -131,13 +140,8 @@ class TrainStack(BaseTrainStack):
                 loss_scale=loss_scales[i] * loss_weight,
             )
             micro_results.append(result)
-            total_loss += result.loss * loss_scales[i]
-            has_backward = has_backward or result.has_backward
 
-        aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
-            [r.metrics for r in micro_results if r.metrics]
-        )
-
+        has_backward = any(result.has_backward for result in micro_results)
         window_backward = prior_backward or has_backward
         # The stepping backward must run when deferred gradient sync is enabled.
         if (
@@ -165,6 +169,13 @@ class TrainStack(BaseTrainStack):
                 "%s._run_update: no micro reported backward; skipping optimizer step.",
                 type(self).__name__,
             )
+        _materialize_micro_results(micro_results)
+        total_loss = 0.0
+        for result, scale in zip(micro_results, loss_scales):
+            total_loss += result.loss * scale
+        aggregated_metrics: Mapping[str, object] = aggregate_numeric_metrics(
+            [r.metrics for r in micro_results if r.metrics]
+        )
         if torch.cuda.is_available():
             # CUDA memory footprint per optimizer step (leak diagnosis: tp2 path showed progressive OOM).
             aggregated_metrics = {
@@ -249,11 +260,14 @@ class TrainStack(BaseTrainStack):
             )
         for part in window:
             self._align_track_inputs(part)
+        ri = self.rank_info or self.fsdp_backend.rank_info
         arranged = self.update_planner.arrange_many(
             window,
             num_updates=self.num_updates_per_batch,
             micro_batch_size=self.micro_batch_size,
             shuffle_step=rollout_id,
+            prompt_group_size=self.algorithm.update_group_size,
+            dp_rank=ri.dp_rank if ri is not None else 0,
         )
         from unirl.utils.profiling import profile_mode
 
@@ -334,9 +348,12 @@ class TrainStack(BaseTrainStack):
 
         scope_update = profile_mode() == "one-update"
         results = []
-        for micros in plans:
+        for index, micros in enumerate(plans):
             cm = maybe_profile_update(self, self.fsdp_backend._rank) if scope_update else nullcontext()
             with cm:
-                results.append(self._run_update(part, micros=micros, order=order, training_progress=training_progress))
+                update_part = first_update_part(self.algorithm, part) if index == 0 else part
+                results.append(
+                    self._run_update(update_part, micros=micros, order=order, training_progress=training_progress)
+                )
         results[0] = self._guard_first_update_ratio(results[0])
         return aggregate_update_results(results, include_per_update=True)

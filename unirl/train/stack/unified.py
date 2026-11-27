@@ -54,6 +54,8 @@ class UnifiedModelTrainStack(BaseTrainStack):
             max_grad_norm=max_grad_norm,
             num_updates_per_batch=num_updates_per_batch,
         )
+        if any(algo.first_update_self_anchor for algo in (ar_algorithm, image_algorithm)):
+            raise ValueError("UnifiedModelTrainStack does not support ART's prompt-balanced, self-anchored updates.")
         self.ar_algorithm = ar_algorithm
         self.image_algorithm = image_algorithm
         validate_anchor_contract(self.ar_algorithm)

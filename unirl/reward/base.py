@@ -16,6 +16,8 @@ class RewardBackend(ABC):
     """Turn a :class:`RewardRequest` into a :class:`RewardResponse`."""
 
     input_kind = "image"
+    requires_complete_groups: bool = False
+    supports_truncation_penalty: bool = True
 
     def __init__(
         self,

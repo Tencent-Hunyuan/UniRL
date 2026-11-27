@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Dict, List, Optional, Set, Tuple
 import torch
 
 from unirl.models.types.batched_replay import BatchedStepReplayMixin
-from unirl.models.types.diffusion import DiffusionStage, DiffusionStep
+from unirl.models.types.diffusion import DiffusionStage, DiffusionStep, RolloutPredictionCache
 from unirl.models.types.replay_result import ReplayResult
 from unirl.sde.kernels import GeneratorLike, StepStrategy
 from unirl.sde.noise import make_denoise_step_generators
@@ -140,9 +140,12 @@ class WAN21DiffusionStep(DiffusionStep[WAN21Bundle, WAN21Conditions]):
         eta: float = 1.0,
         step_index: int = 0,
         generator: GeneratorLike = None,
+        prediction_cache: Optional[RolloutPredictionCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run model forward + SDE transition. End-to-end one diffusion step."""
         noise_pred = self.predict_noise(model, sample, sigma, conditions, guidance_scale=guidance_scale)
+        if prediction_cache is not None:
+            prediction_cache.store(step_index, noise_pred)
         return self.forward(
             strategy=strategy,
             noise_pred=noise_pred,
@@ -305,6 +308,12 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
         )
         sigma_max = float(schedule[1].item()) if int(schedule.shape[0]) > 1 else 0.99
 
+        if params.cache_art_old_predictions and len(needed) != T + 1:
+            raise ValueError(
+                f"WAN21DiffusionStage.diffuse: cache_art_old_predictions=True requires dense trajectory storage "
+                f"(all {T + 1} positions), got {len(needed)}."
+            )
+        prediction_cache = RolloutPredictionCache(T) if params.cache_art_old_predictions else None
         for i in range(T):
             sigma = schedule[i].to(device)
             sigma_next = schedule[i + 1].to(device)
@@ -320,7 +329,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
             )
 
             with torch.no_grad(), autocast_ctx:
-                new_latents, log_prob, _ = self.step.step_with_logp(
+                new_latents, log_prob, _ = self.step.step(
                     self.model,
                     conditions,
                     strategy=self.strategy,
@@ -332,6 +341,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
                     sigma_max=sigma_max,
                     step_index=i,
                     generator=step_generators,
+                    prediction_cache=prediction_cache,
                 )
             latents = new_latents.to(dtype=self.trajectory_dtype)
 
@@ -351,6 +361,7 @@ class WAN21DiffusionStage(BatchedStepReplayMixin, DiffusionStage[WAN21Conditions
 
         return make_video_segment(
             latents=latents_stacked,
+            art_old_predictions=prediction_cache.finish() if prediction_cache is not None else None,
             sigmas=schedule,
             indices=indices_tensor,
             sde_logp=sde_logp,

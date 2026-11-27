@@ -197,7 +197,14 @@ _RETIRED_RESIDENCY_KEYS = {
 # the params as a bare dict and only blow up deep inside the first eval's request
 # build (``'dict' object has no attribute 'get_sde_indices'``). Rejected by name.
 _UNSUPPORTED_OVERLAY_FIELDS = frozenset(
-    {"scheduler", "sde_strategy", "sigmas", "noise_group_ids", "init_noise_latent_shape"}
+    {
+        "cache_art_old_predictions",
+        "scheduler",
+        "sde_strategy",
+        "sigmas",
+        "noise_group_ids",
+        "init_noise_latent_shape",
+    }
 )
 
 
@@ -239,7 +246,7 @@ def build_eval_sampling(
         raise ValueError("build_eval_sampling: sampling params carry no `diffusion` entry to override.")
     field_names = {f.name for f in dataclasses.fields(base)}
 
-    updates: Dict[str, Any] = {"eta": eta}
+    updates: Dict[str, Any] = {"eta": eta, "cache_art_old_predictions": False}
     if samples_per_prompt is not None:
         updates["samples_per_prompt"] = samples_per_prompt
     updates.update(_resolve_overrides(overrides, field_names))
@@ -343,6 +350,8 @@ class DiffusionTrainer(BaseTrainer):
         elif sync_cfg is None:
             raise ValueError("DiffusionTrainer: dedicated rollout engine requires a `sync:` block.")
         algo_cls = get_class(algorithm_cfg["_target_"])
+        self._first_update_self_anchor = algo_cls.first_update_self_anchor
+        self._rollout_sync_interval(cfg.get("weight_sync_interval", 1))
         self._uses_ema = algo_cls.requires_ema_rollout
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
@@ -528,6 +537,15 @@ class DiffusionTrainer(BaseTrainer):
             reward_dp_size=self.reward.dp_size if self.reward is not None else 1,
             train_dp_size=self.stack.dp_size,
             require_rollout_dp_divisibility=not self._prompt_local_rollout,
+        )
+
+    def _rollout_sync_interval(self, interval: int) -> int:
+        if not self._first_update_self_anchor:
+            return interval
+        if str(interval) == "1":
+            return 1
+        raise ValueError(
+            f"DiffusionART requires weight_sync_interval=1 to roll out the current policy, got {interval!r}."
         )
 
     def _validate_accumulation(self, stack_cfg: DictConfig) -> None:
@@ -895,6 +913,7 @@ class DiffusionTrainer(BaseTrainer):
         force_sync_at: Optional[int] = None,
     ) -> Tuple[TrainStepResult, float]:
         """One accumulation window: rollouts → one optimizer step → one log point."""
+        weight_sync_interval = self._rollout_sync_interval(weight_sync_interval)
         t0 = time.perf_counter()
         samples: List[Sample] = []
         window_rewards: List[float] = []
@@ -1107,7 +1126,7 @@ class DiffusionTrainer(BaseTrainer):
         # ${oc.env:...} interpolations arrive as strings.
         num_rollouts = int(num_rollouts)
         save_interval = int(save_interval)
-        interval = max(1, int(weight_sync_interval))
+        interval = max(1, int(self._rollout_sync_interval(weight_sync_interval)))
         start_rollout = self.maybe_load_checkpoint(load_dir, num_rollouts=num_rollouts)
         resumed = bool(load_dir)
         # A window is ONE train_track call, so checkpoints can never split it;
