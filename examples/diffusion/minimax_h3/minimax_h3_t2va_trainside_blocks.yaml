@@ -1,0 +1,24 @@
+# @package _global_
+# MiniMax-H3 t2va Flow-GRPO — full-parameter transformer-block training (2 nodes x 8 GPUs).
+#
+# Launch:
+#   bash examples/run_experiment_multinode_taiji.sh diffusion/minimax_h3/minimax_h3_t2va_trainside_blocks
+
+defaults:
+  - minimax_h3_t2va_trainside
+  - _self_
+
+num_devices: 16
+batch_size: 16
+
+bundle:
+  config:
+    full_finetune_blocks: true
+
+backend:
+  lora_cfg: null
+  fsdp_cfg:
+    checkpoint_format: dcp
+
+algorithm:
+  timestep_chunk_size: 1

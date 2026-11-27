@@ -103,6 +103,7 @@ class MiniMaxH3PipelineConfig:
 
     weight_sync_param_name_prefix: str = "transformer."
 
+    full_finetune_blocks: bool = False
     use_lora: bool = False
     lora_target_modules: Optional[List[str]] = None
 
