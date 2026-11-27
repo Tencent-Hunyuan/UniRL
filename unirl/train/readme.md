@@ -238,9 +238,14 @@ use LoRA adapter mode. Formats and export live in
 - **`fsdp_wrap` shards the leftover params (embed / final norm / lm_head) into a
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
-  submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a trainable param left outside every group fails fast
-  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  submodules of the wrapped object directly (bagel, janus_pro) or that keep frozen
+  mixed-dtype peripherals outside sharding (minimax_h3, cosmos3, hunyuan_image3);
+  when child blocks are wrapped, `fsdp_wrap` still installs a parameterless root
+  `fully_shard(..., ignored_params=...)` group and initializes its root state after
+  weight materialization so all blocks share one communication context and recycle
+  reduce-scatter buffers during backward without sharding or casting the leftover
+  parameters. A trainable param left outside every group fails fast at
+  `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
   param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
   (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a

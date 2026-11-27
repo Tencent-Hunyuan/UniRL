@@ -3,7 +3,7 @@
 # Settings follow the Miles Nano T2I recipe
 # (github.com/radixark/miles_diffusion scripts/run_diffusion_grpo_cosmos3_pickscore_t2i_4gpu.py):
 # 832x480 single frame, 16 steps, guidance 4.0, eta 0.7, two SDE steps per rollout drawn from steps 8-11.
-# Validated on 4x H100 80GB with torch 2.13 / cu130; the bf16 base is not validated on H20.
+# Validated on 4x H100 80GB, 4x H200, and 4x H20 96GB with torch 2.13 / cu130.
 # Precision and schedule notes: unirl/models/cosmos3/README.md.
 #
 # Launch (needs the `cosmos3` extra):
