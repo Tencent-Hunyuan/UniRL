@@ -28,6 +28,7 @@ def prepare_input_sample(
     caller: str,
     control: Optional[Dict[str, Any]] = None,
     require_single_input_part: bool = False,
+    rng_id: Optional[int] = None,
 ) -> Sample:
     """Prepare a data-source input tree for one rollout without rebuilding it."""
     if not isinstance(inputs, Sample):
@@ -56,7 +57,8 @@ def prepare_input_sample(
     metadata = root.metadata or [{} for _ in root.sample_ids]
     if len(metadata) != len(root.sample_ids):
         raise ValueError(f"{caller}: root metadata has {len(metadata)} rows for {len(root.sample_ids)} root samples.")
-    root = replace(root, metadata=[{**(row or {}), "rollout_id": int(rollout_id)} for row in metadata])
+    stamp = {"rollout_id": int(rollout_id)} if rng_id is None else {"rollout_id": int(rollout_id), "rng_id": rng_id}
+    root = replace(root, metadata=[{**(row or {}), **stamp} for row in metadata])
     if control is not None:
         root = replace(root, control={**root.control, **control})
     return namespaced.with_parts([root, *namespaced.parts[1:]])
@@ -360,10 +362,21 @@ class BaseTrainer:
         trainer_state_path = os.path.join(path, "trainer_state.json")
         trainer_state_tmp = f"{trainer_state_path}.tmp"
         with open(trainer_state_tmp, "w") as f:
-            json.dump({"wandb_run_id": self.wandb_logger.run_id, "optimizer_step": self.wandb_logger.optimizer_step}, f)
+            json.dump(
+                {
+                    "wandb_run_id": self.wandb_logger.run_id,
+                    "optimizer_step": self.wandb_logger.optimizer_step,
+                    **self._extra_trainer_state(),
+                },
+                f,
+            )
         os.replace(trainer_state_tmp, trainer_state_path)
         if step >= num_rollouts:
             self._wait_for_checkpoints()
+
+    def _extra_trainer_state(self) -> Dict[str, Any]:
+        """Trainer-specific fields saved into ``trainer_state.json``. Default none."""
+        return {}
 
     def maybe_load_checkpoint(self, load_dir: Optional[str], *, num_rollouts: Optional[int] = None) -> int:
         """Restore training state from ``load_dir``; return the rollout step to resume from."""

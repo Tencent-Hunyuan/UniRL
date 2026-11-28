@@ -26,6 +26,7 @@ def prepare_segment_anchors(
     """Freeze declared anchors over the plan's micros, before any update, and write them back onto ``part``."""
     if part.segment is None:
         return
+    algorithm.prepare_anchor(part)
     micro_slices = [r for update in plan for r in update]
     if not algorithm.recomputes_anchor or len(micro_slices) == 1:
         algorithm.prepare_segment(conditions=part.conditions, segment=part.segment)

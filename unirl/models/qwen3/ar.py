@@ -74,10 +74,6 @@ def _replay_aware_forward(
 
     _require_value_head_for_replay(self, return_values)
 
-    # Disable cuDNN SDPA because its bf16 backward can produce NaN gradients.
-    if torch.cuda.is_available():
-        torch.backends.cuda.enable_cudnn_sdp(False)
-
     autocast_ctx = (
         torch.autocast("cuda", autocast_dtype) if autocast_dtype in (torch.float16, torch.bfloat16) else nullcontext()
     )
@@ -244,6 +240,8 @@ class Qwen3ARStage(ARStage[Qwen3ARConditions]):
         self.autocast_dtype = parse_torch_dtype(autocast_precision, field_name="Qwen3ARStage.autocast_precision")
         self.logprob_dtype = parse_torch_dtype(logprob_precision, field_name="Qwen3ARStage.logprob_precision")
         self.replay_kernel_options = replay_kernel_options
+        if torch.cuda.is_available():
+            torch.backends.cuda.enable_cudnn_sdp(False)
         transformer = model.transformer
         if getattr(transformer.forward, "__func__", None) is not _replay_aware_forward:
             transformer.forward = MethodType(_replay_aware_forward, transformer)
