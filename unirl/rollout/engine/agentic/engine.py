@@ -81,9 +81,7 @@ class AgenticRolloutEngine(BaseRolloutEngine):
     @distributed(dispatch_mode=Dispatch.BROADCAST)
     def validate_turn_resumption(self) -> None:
         """Require an environment whose state survives turn-boundary handoff in the Sample."""
-        if not isinstance(self.harness, ToolAgentHarness) or not getattr(
-            self.harness.env, "supports_turn_resumption", False
-        ):
+        if not getattr(self.harness.env, "supports_turn_resumption", False):
             raise ValueError("partial rollout requires an environment supporting turn resumption without worker state")
 
     @distributed(dispatch_mode=Dispatch.BROADCAST)

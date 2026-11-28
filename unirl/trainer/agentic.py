@@ -83,7 +83,10 @@ class AgenticTrainer(BaseTrainer):
 
             if get_class(algorithm_cfg["_target_"]) is not GRPO:
                 raise ValueError("partial agentic rollout currently requires GRPO")
-            if algorithm_cfg.get("old_logp_source", "rollout") != "rollout":
+            if (
+                "old_logp_source" in algorithm_cfg
+                and str(algorithm_cfg["old_logp_source"]).strip().lower() != "rollout"
+            ):
                 raise ValueError("partial agentic rollout requires old_logp_source=rollout")
             if sync_cfg is not None and not sync_cfg.get("flush_cache", True):
                 raise ValueError("partial agentic rollout requires sync.flush_cache=true")
@@ -441,8 +444,9 @@ class AgenticTrainer(BaseTrainer):
             result = TrainStepResult(0.0, 0.0, 0.0, False, [], {}, optimizer_updates=0)
             train_rows = 0
 
-        versions = [part.output_version for trajectory in trajectories for part in trajectory.gen_parts()]
         version_metrics = {}
+        if self._rollout_window_size > 1:
+            versions = [part.output_version for trajectory in trajectories for part in trajectory.gen_parts()]
         if self._rollout_window_size > 1 and versions:
             version_metrics = {
                 "agent/oldest_behavior_version": min(versions),
@@ -451,8 +455,9 @@ class AgenticTrainer(BaseTrainer):
                 "agent/mixed_version_trajectories": sum(
                     len({part.output_version for part in trajectory.gen_parts()}) > 1 for trajectory in trajectories
                 ),
-                "agent/carried_trajectories": len(self._carried),
             }
+            if self._train_fraction is None:
+                version_metrics["agent/carried_trajectories"] = len(self._carried)
         log_sample = self._build_log_sample(trajectories, rewards, advantages, rollout_id)
         self.wandb_logger.log_rollout_step(
             rollout_id,
