@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from typing import TYPE_CHECKING, List, Mapping, Sequence, Tuple
 
+import torch
+
 from unirl.algorithms.base import AlgorithmStepResult
 from unirl.distributed.group.remote import Remote
 from unirl.distributed.tensor.batch import _move_value
@@ -22,7 +24,7 @@ if TYPE_CHECKING:
 class TrainStepResult:
     """Result of one ``train_track`` call, possibly spanning multiple optimizer updates."""
 
-    loss: float
+    loss: float | torch.Tensor
     grad_norm: float
     lr: float
     has_backward: bool

@@ -341,7 +341,7 @@ def require_replay_anchor_for_batched_replay(stage: Any, old_logp_source: str, *
 class AlgorithmStepResult:
     """Result of one micro-step under the stage-driven contract."""
 
-    loss: float
+    loss: float | torch.Tensor
     metrics: Mapping[str, Any]
     num_steps_or_tokens: int
     has_backward: bool
@@ -367,7 +367,7 @@ class StageAlgorithm(Remote, ABC):
     supports_multi_update: bool = False
     requires_backend: bool = False
     requires_advantages: bool = True
-    requires_per_sample_sde_index: bool = False
+    per_sample_sde_layout: str = ""
     recomputes_anchor: bool = False
     anchor_fields: Tuple[str, ...] = ()
 

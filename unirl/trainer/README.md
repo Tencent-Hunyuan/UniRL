@@ -519,10 +519,10 @@ without driver-authored x_T. `media_log_interval` does not apply
   (it reuses the train model) and for DiffusionNFT (its EMA swap touches the backend around `generate`).
 - **The bundle must be shared, not rebuilt** — the trainer injects one bundle into both
   pipeline and backend; a second `from_config` would silently desync replay. See [`../models/README.md`](../models/README.md).
-- **FlashGRPO assigns one SDE step per prompt, by stratification.** `requires_per_sample_sde_index`
-  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group
-  *inside a single residency window*, then stamp `segment.sde_index_per_sample` and concatenate the
-  groups into one track. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
+- **FlashGRPO assigns one SDE step per prompt, by stratification.** `per_sample_sde_layout = "stratified"`
+  makes the trainer put prompt `i` in stratum `i % pool_size`, issue one `generate` per step group,
+  stamp `segment.sde_index_per_sample`, and concatenate the groups into one track *inside a single
+  residency window*. Flash-GRPO wants exactly this granularity: the paper assigns one timestep per
   prompt with all of that prompt's rollouts sharing it, and asks for stratified assignment so the
   whole candidate pool is covered each rollout. Per-trajectory timesteps are not required.
 - **The FlashGRPO batch must satisfy `batch_size % (pool_size * rollout dp_size) == 0`.** Each step
@@ -555,3 +555,15 @@ without driver-authored x_T. `media_log_interval` does not apply
   weight normalizes each sample's coefficient by the mean over `rectification_indices` while the step
   itself is drawn from `sde_candidate_pool()`; the two live in different config blocks, and a mismatch
   silently rescales the loss. The trainer fails fast instead.
+- **TempFlowGRPO branches every prompt at every chosen step.** `per_sample_sde_layout = "branched"`
+  issues one `generate` per step in the pool (or a rotating `branch_steps_per_rollout` subset), each
+  carrying all prompts with `sde_indices=[step]`. A branch is a plain trajectory: x_T is keyed by
+  `(prompt, seed)`, so the `branches_per_seed` rows of a seed run the same deterministic ODE prefix
+  and split only at their step. That needs the driver-authored x_T, so the trainer raises without
+  it. Step groups offset their branch ordinals so sample ids stay unique, and merge via
+  `Part.concat` onto the shared root prompt prefix.
+- **TempFlowGRPO takes advantages before the merge, per step group.** Its rewards are normalized
+  within one branch step (per prompt, or per seed with `advantage_group: seed`), the opposite of
+  FlashGRPO, where the groups merge first. Merging first would mix steps whose reward spreads differ.
+  For the same reason `adv_use_global_std` takes the std over one step group, which is what
+  upstream's `global_std` does (a per-step column std over the batch).

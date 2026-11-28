@@ -308,6 +308,11 @@ use LoRA adapter mode. Formats and export live in
   `torch.stack` and transfer once at end-of-step; `optimizer_step`'s single
   non-finite `grad_norm` check and VeOmni EP `split_sizes` host conversion stay
   within Class B budget (`<= 1` per boundary).
+- **Single-stage algorithms may return detached scalar tensor losses and metrics.**
+  `TrainStack` materializes them together after the optimizer boundary, including
+  across an accumulation window, and returns scalar micro results to the driver.
+  Loss sums stay on the FSDP mesh through reduction before that single host transfer.
+  Float-only algorithm results keep their existing aggregation path.
 - **Backend-specific operators live in their owning backend or `models/<family>/`.**
   Keep `FSDPBackend` (`backend/fsdp/`) and `VeOmniBackend` (`backend/veomni/`) behind
   the `BaseFSDP2Backend` contract (`backend/base_backend.py`) so `TrainStack` and
