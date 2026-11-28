@@ -113,6 +113,7 @@ class FSDPConfig:
     hsdp_shard_size: int = 8
     reshard_after_forward: bool = True
     activation_checkpointing: bool = False
+    activation_offload: bool = False
     # AC/FSDP composition order. "outside" (default) keeps FSDP's gather/cast
     # hooks out of the checkpointed region — the composition every pre-knob AC
     # recipe ran. "inside" re-enters the hooks during recompute; opt in per

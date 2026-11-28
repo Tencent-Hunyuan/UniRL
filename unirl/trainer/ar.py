@@ -15,7 +15,6 @@ from unirl.algorithms.grpo import GRPO
 from unirl.config.validation import validate_memory_saver_contract
 from unirl.distributed.group.placement import placement, remote
 from unirl.distributed.group.results import rank_zero_bool
-from unirl.distributed.tensor import hydrate
 from unirl.reward.service import score_and_attach
 from unirl.train.stack import TrainStepResult
 from unirl.trainer.base import BaseTrainer, build_sampling_dict, pad_eval_inputs, prepare_input_sample
@@ -105,11 +104,11 @@ class ARTrainer(BaseTrainer):
             raise ValueError("dynamic_sampling_max_batches must be an integer >= 0 (0 disables DAPO sampling).")
         self.dynamic_sampling_max_batches = dynamic_sampling_max_batches
         self._data_batches_consumed = 0
+        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
         if dynamic_sampling_max_batches:
             if not issubclass(algorithm_cls, GRPO) or advantage_mode != "grpo" or adv_normalization_scope != "group":
                 raise ValueError("DAPO dynamic sampling requires synchronous AR GRPO with group advantages.")
-            sampling = build_sampling_dict(sampling_cfg)
-            if set(sampling) != {"ar"} or total_samples_per_prompt(sampling) < 2:
+            if set(self.sampling_params) != {"ar"} or total_samples_per_prompt(self.sampling_params) < 2:
                 raise ValueError("DAPO dynamic sampling requires AR sampling with at least two siblings per prompt.")
         if reward_cfg is None:
             if self._algorithm_requires_advantages:
@@ -168,8 +167,6 @@ class ARTrainer(BaseTrainer):
         self._anchored_rollout_awake: Optional[bool] = None
 
         self.data_source = instantiate(data_source_cfg)
-
-        self.sampling_params: Dict[str, BaseSamplingParams] = build_sampling_dict(sampling_cfg)
 
         self.weight_sync = None
         self._gpu_streaming_sync = False
@@ -497,7 +494,6 @@ class ARTrainer(BaseTrainer):
             part = sample.parts[-1]
             if part.rewards is None:
                 raise ValueError("DAPO dynamic sampling requires rewards on every generated batch.")
-            part.rewards = hydrate(part.rewards).cpu()
             for group in sample.split():
                 rewards = group.parts[-1].rewards
                 if rewards.numel() != total_samples_per_prompt(self.sampling_params):
@@ -508,7 +504,7 @@ class ARTrainer(BaseTrainer):
                 reward_count += int(finite.sum())
                 if not bool(finite.all()):
                     invalid_groups += 1
-                elif rewards.numel() > 1 and bool((rewards != rewards[0]).any()):
+                elif bool((rewards != rewards[0]).any()):
                     valid_groups += 1
                     if len(kept) < self.batch_size:
                         kept.append(group)
@@ -521,7 +517,7 @@ class ARTrainer(BaseTrainer):
                     "dynamic_sampling/nonfinite_groups": invalid_groups,
                     "dynamic_sampling/discarded_surplus_groups": valid_groups - len(kept),
                     "dynamic_sampling/unfiltered_reward_mean": reward_sum / max(1, reward_count),
-                    "dynamic_sampling/retained_tokens": int(hydrate(result.parts[-1].segment.lengths).sum()),
+                    "dynamic_sampling/retained_tokens": int(result.parts[-1].segment.lengths.sum()),
                 }
                 return result, metrics
             if attempt + 1 < self.dynamic_sampling_max_batches:
