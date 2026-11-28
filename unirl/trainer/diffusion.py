@@ -24,7 +24,7 @@ from unirl.trainer.residency import DEFAULT_RESIDENCY_POLICY, ResidencyPlanner, 
 from unirl.types.primitives import Texts
 from unirl.types.sample import Part, Sample
 from unirl.types.sample_id import child_id
-from unirl.types.sampling import BaseSamplingParams, DiffusionSamplingParams, total_samples_per_prompt
+from unirl.types.sampling import BaseSamplingParams, total_samples_per_prompt
 from unirl.utils.wandb_metrics import pooled_window_reward_metrics
 
 logger = logging.getLogger(__name__)
@@ -347,12 +347,9 @@ class DiffusionTrainer(BaseTrainer):
             raise ValueError("DiffusionTrainer: dedicated rollout engine requires a `sync:` block.")
         algo_cls = get_class(algorithm_cfg["_target_"])
         self._uses_ema = algo_cls.requires_ema_rollout
-        # Per-sample SDE layout of the algorithm: "stratified" (FlashGRPO, one step per
-        # prompt), "branched" (TempFlowGRPO, every prompt at every chosen step), or "".
         self._per_sample_layout = algo_cls.per_sample_sde_layout
         self._branches_per_seed: Optional[int] = None
         self._branch_steps_per_rollout: Optional[int] = None
-        # Rows per advantage group when it is not the prompt (TempFlowGRPO seed grouping).
         self._advantage_group_size: Optional[int] = None
         # requires_advantages=False algorithms keep rewards for monitoring only.
         self._algo_requires_advantages = algo_cls.requires_advantages
@@ -759,23 +756,28 @@ class DiffusionTrainer(BaseTrainer):
         return request
 
     def _sde_candidate_pool(self) -> List[int]:
-        """SDE steps a per-sample layout may train, from the scheduler's candidate pool."""
+        """SDE steps FlashGRPO's per-prompt draw may pick, from the scheduler's candidate pool."""
         diffusion = self.sampling_params["diffusion"]
+        if diffusion.sde_indices is not None:
+            raise ValueError(
+                "FlashGRPO per-sample SDE-index path draws from sampling.scheduler and does not accept "
+                f"fixed sampling.sde_indices={diffusion.sde_indices}; drop sampling.sde_indices."
+            )
         scheduler = diffusion.scheduler
         if not isinstance(scheduler, AllSDEScheduler):
             raise ValueError(
-                "The per-sample SDE-index path requires sampling_params['diffusion'] to carry "
+                "FlashGRPO per-sample SDE-index path requires sampling_params['diffusion'] to carry "
                 f"an AllSDEScheduler; got scheduler={type(scheduler).__name__ if scheduler is not None else None}."
             )
         pool = scheduler.sde_candidate_pool()
         if not pool:
-            raise ValueError("The per-sample SDE-index path: the scheduler candidate pool is empty.")
+            raise ValueError("FlashGRPO per-sample SDE-index path: the scheduler candidate pool is empty.")
         # The last denoising step stores only {T-1, T} latents while earlier steps
         # store three, so a group that drew it cannot be concatenated with the rest.
         num_inference_steps = diffusion.num_inference_steps
         if max(pool) >= num_inference_steps - 1:
             raise ValueError(
-                f"The per-sample SDE candidate pool reaches step {max(pool)}, but the last denoising "
+                f"FlashGRPO per-sample SDE candidate pool reaches step {max(pool)}, but the last denoising "
                 f"step (num_inference_steps-1 = {num_inference_steps - 1}) stores a different number of "
                 "trajectory latents, so mixed-shape rollout groups cannot be concatenated. Narrow the "
                 "scheduler timestep_fraction so its end maps below the final step."
@@ -784,13 +786,16 @@ class DiffusionTrainer(BaseTrainer):
 
     def _check_flash_rectification_pool(self, algorithm_cfg: Any) -> None:
         """Fail fast when the rectification normalizer disagrees with the SDE candidate pool."""
-        pool = sorted(self._sde_candidate_pool())
+        pool = self._sde_candidate_pool()
         if "rectification_indices" not in algorithm_cfg or algorithm_cfg["rectification_indices"] is None:
             raise ValueError(
                 "FlashGRPO per-sample path requires algorithm.rectification_indices set to the SDE "
                 f"candidate pool {pool}; got None."
             )
-        rectification_sorted = sorted(int(i) for i in algorithm_cfg["rectification_indices"])
+        raw_indices = algorithm_cfg["rectification_indices"]
+        if any(not isinstance(i, int) or isinstance(i, bool) for i in raw_indices):
+            raise ValueError(f"FlashGRPO rectification_indices must contain integers; got {list(raw_indices)!r}.")
+        rectification_sorted = sorted(raw_indices)
         if rectification_sorted != pool:
             raise ValueError(
                 f"FlashGRPO rectification_indices {rectification_sorted} must equal the SDE candidate "
@@ -896,17 +901,29 @@ class DiffusionTrainer(BaseTrainer):
             for step in sorted(positions_by_step)
         ]
 
-    def _stamp_sde_index_per_sample(self, sample: Sample, sde_index: int) -> None:
+    @staticmethod
+    def _stamp_sde_index_per_sample(sample: Sample, sde_index: int) -> None:
         """Stamp ``segment.sde_index_per_sample`` and normalize shared step metadata for group concat."""
         frontier = sample.parts[-1]
         segment = frontier.segment
-        if segment is None:
-            raise ValueError("FlashGRPO: a step group's rollout returned no segment to stamp sde_index_per_sample on.")
+        if segment is None or segment.latents is None or segment.indices is None:
+            raise ValueError(
+                "FlashGRPO: a step group's rollout must return a segment with latents and indices "
+                "to stamp sde_index_per_sample."
+            )
+        expected = [sde_index, sde_index + 1, frontier.sampling_params.num_inference_steps]
+        if (
+            segment.latents.shape is None
+            or len(segment.latents.shape) < 2
+            or tuple(segment.latents.shape[:2]) != (frontier.batch_size, 3)
+            or hydrate(segment.indices).tolist() != expected
+        ):
+            raise ValueError("FlashGRPO requires rollout latent slots [before, after, final].")
         segment.sde_index_per_sample = torch.full((frontier.batch_size,), sde_index, dtype=torch.long)
         segment.indices = torch.arange(3, dtype=torch.long)
-        segment.sde_indices = torch.zeros(1, dtype=torch.long)
-        if isinstance(frontier.sampling_params, DiffusionSamplingParams):
-            frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
+        if segment.sde_indices is not None:
+            segment.sde_indices = torch.zeros(1, dtype=torch.long)
+        frontier.sampling_params = dataclasses.replace(frontier.sampling_params, sde_indices=None)
 
     def _score_and_advantage(self, sample: Sample) -> Sample:
         """Attach rewards (unless scored inline) and, when the algorithm needs them, advantages."""
@@ -969,9 +986,15 @@ class DiffusionTrainer(BaseTrainer):
             )
         return stack
 
-    @contextmanager
-    def _rollout_window(self, *, sync_weights: bool, sleep_rollout: bool) -> Iterator[None]:
-        """One wake / push / EMA window spanning every generate call made inside it."""
+    def _generate_with_residency(
+        self,
+        samples: Sequence[Sample],
+        *,
+        sync_weights: bool,
+        sleep_rollout: bool,
+        score_inline: bool = False,
+    ) -> List[Sample]:
+        """Generate one or more request samples inside one wake/push/EMA/offload window."""
         # No EMA term: _build_residency_planner already rejected the EMA x
         # parked-train x colocated-external combination at startup, fail-fast
         # instead of silently skipping the requested policy.
@@ -993,8 +1016,20 @@ class DiffusionTrainer(BaseTrainer):
             if should_swap_ema:
                 ema_apply_attempted = True
                 self.backend.apply_eval_ema()
-            yield
+            results: List[Sample] = []
+            group_timings: List[List[Dict[str, float]]] = []
+            for item in samples:
+                if score_inline:
+                    results.append(self.reward_stack.rollout_and_score(item))
+                    group_timings.append(self.reward_stack.timing())
+                else:
+                    results.append(self.rollout.generate(item))
+            if score_inline:
+                self.reward_stack.collect_garbage()
+                if group_timings:
+                    self._log_reward_stack_timing(group_timings)
             generation_succeeded = True
+            return results
         finally:
             cleanup_steps: List[Tuple[str, Callable[[], None]]] = []
             if ema_apply_attempted:
@@ -1006,53 +1041,20 @@ class DiffusionTrainer(BaseTrainer):
             if sleep_rollout or not generation_succeeded:
                 self._residency.set(Role.ROLLOUT, False)
 
-    def _generate_with_residency(
-        self,
-        sample: Sample,
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool = False,
-    ) -> Sample:
-        """Generate with exception-safe EMA and residency cleanup."""
-        return self._generate_many_with_residency(
-            [sample],
-            sync_weights=sync_weights,
-            sleep_rollout=sleep_rollout,
-            score_inline=score_inline,
-        )[0]
-
-    def _generate_many_with_residency(
-        self,
-        samples: Sequence[Sample],
-        *,
-        sync_weights: bool,
-        sleep_rollout: bool,
-        score_inline: bool,
-    ) -> List[Sample]:
-        """Generate every sample inside ONE wake/offload window (FlashGRPO's step groups)."""
-        with self._rollout_window(sync_weights=sync_weights, sleep_rollout=sleep_rollout):
-            results = [
-                self.reward_stack.rollout_and_score(item) if score_inline else self.rollout.generate(item)
-                for item in samples
-            ]
-            if score_inline:
-                self.reward_stack.collect_garbage()
-                self._log_reward_stack_timing()
-        return results
-
-    def _log_reward_stack_timing(self) -> None:
+    def _log_reward_stack_timing(self, group_timings: Sequence[Sequence[Mapping[str, float]]]) -> None:
         """Surface the stack's per-rank generate/score split on the driver, where worker logs do not reach."""
-        per_rank = self.reward_stack.timing()
         keys = ("generate_s", "score_s", "wall_s")
-        peak = {k: max(float(t[k]) for t in per_rank) for k in keys}
-        mean = {k: sum(float(t[k]) for t in per_rank) / len(per_rank) for k in keys}
+        ranks = len(group_timings[0])
+        rows = sum(int(per_rank[0]["rows"]) for per_rank in group_timings)
+        micros = sum(int(per_rank[0]["micros"]) for per_rank in group_timings)
+        peak = {k: sum(max(float(t[k]) for t in per_rank) for per_rank in group_timings) for k in keys}
+        mean = {k: sum(sum(float(t[k]) for t in per_rank) / len(per_rank) for per_rank in group_timings) for k in keys}
         logger.info(
             "reward stack timing: ranks=%d rows=%d micros=%d generate_s=%.2f/%.2f score_s=%.2f/%.2f "
             "wall_s=%.2f/%.2f (max/mean)",
-            len(per_rank),
-            int(per_rank[0]["rows"]),
-            int(per_rank[0]["micros"]),
+            ranks,
+            rows,
+            micros,
             peak["generate_s"],
             mean["generate_s"],
             peak["score_s"],
@@ -1074,7 +1076,7 @@ class DiffusionTrainer(BaseTrainer):
         group_sde_indices: Optional[Sequence[int]],
     ) -> Tuple[Sample, float]:
         """One ``rollout → reward → advantage`` pass over one or more request Samples."""
-        generated = self._generate_many_with_residency(
+        generated = self._generate_with_residency(
             samples,
             sync_weights=sync_weights,
             sleep_rollout=not self._residency.policy.rollout_resident,
@@ -1302,12 +1304,12 @@ class DiffusionTrainer(BaseTrainer):
             )
             request = self._build_request_sample(sub, step, sampling=eval_sp)
             generated = self._generate_with_residency(
-                request,
+                [request],
                 # Engines whose sleep releases the adapter (e.g. SGLang) need
                 # the requested policy re-pushed after every eval-chunk wake.
                 sync_weights=sync_pending or resync_after_sleep,
                 sleep_rollout=sleep_rollout,
-            )
+            )[0]
             sync_pending = False
             first_scored: Optional[Sample] = None
             with self._reward_phase(preserve_rollout=not sleep_rollout):

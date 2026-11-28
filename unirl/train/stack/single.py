@@ -200,21 +200,23 @@ class TrainStack(BaseTrainStack):
         pending = [r for r in results if isinstance(r.loss, torch.Tensor)]
         if not pending:
             return results
-        payloads = [(r.loss, [(m.loss, dict(m.metrics)) for m in r.micros]) for r in pending]
+        global_sums = self.fsdp_backend.all_reduce_loss_tensor(torch.stack([r.loss for r in pending]))
+        payloads = [
+            (loss, [(m.loss, dict(m.metrics)) for m in r.micros]) for r, loss in zip(pending, global_sums.unbind())
+        ]
         leaves, spec = tree_flatten(payloads)
         tensors = [v for v in leaves if isinstance(v, torch.Tensor)]
         device = tensors[0].device
         values = iter(torch.stack([v.detach().to(device=device, dtype=torch.float64) for v in tensors]).cpu().tolist())
         payloads = tree_unflatten([next(values) if isinstance(v, torch.Tensor) else v for v in leaves], spec)
-        global_losses = iter(self._all_reduce_sums([loss for loss, _ in payloads]))
         finalized = iter(
             replace(
                 result,
-                loss=next(global_losses) / self.fsdp_backend.gradient_average_world_size(),
+                loss=loss / self.fsdp_backend.gradient_average_world_size(),
                 micros=[replace(m, loss=loss, metrics=metrics) for m, (loss, metrics) in zip(result.micros, micros)],
                 metrics={**aggregate_numeric_metrics([metrics for _, metrics in micros]), **result.metrics},
             )
-            for result, (_, micros) in zip(pending, payloads)
+            for result, (loss, micros) in zip(pending, payloads)
         )
         return [next(finalized) if isinstance(r.loss, torch.Tensor) else r for r in results]
 

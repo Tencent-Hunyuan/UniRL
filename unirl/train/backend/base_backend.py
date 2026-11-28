@@ -567,16 +567,21 @@ class BaseFSDP2Backend(Remote):
         """SUM loss statistics over the same FSDP mesh used for gradients."""
         if not values:
             return []
-        mesh = self._loss_reduction_mesh
-        world_size = self.gradient_average_world_size()
-        if world_size <= 1:
+        if self.gradient_average_world_size() <= 1:
             return list(values)
+        tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
+        return self.all_reduce_loss_tensor(tensor).tolist()
+
+    def all_reduce_loss_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """SUM detached [K] fp64 loss statistics in place on the FSDP mesh without a host transfer."""
+        mesh = self._loss_reduction_mesh
+        if self.gradient_average_world_size() <= 1:
+            return tensor
         if mesh is None or not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError(f"{type(self).__name__}: FSDP loss reduction requires initialized distributed state.")
-        tensor = torch.tensor(values, dtype=torch.float64, device=self._device)
         for group in mesh.get_all_groups():
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-        return tensor.tolist()
+        return tensor
 
     def trainable_module(self) -> nn.Module:
         return self.model

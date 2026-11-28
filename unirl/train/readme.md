@@ -65,6 +65,44 @@ in `backend/base.py`; a multi-update-capable algorithm sets
 `recomputes_anchor` when its anchor must follow the planned micro geometry (see
 `../algorithms/README.md`).
 
+## Activation offload
+
+Set `backend.fsdp_cfg.activation_offload=true` on `FSDPBackend` or `VeOmniBackend` to store tensors
+saved for backward by the selected transformer blocks in pinned CPU memory.
+The default is `false`. For example:
+
+```yaml
+backend:
+  fsdp_cfg:
+    activation_checkpointing: true
+    activation_offload: true
+```
+
+For recipes that omit the field, pass `+backend.fsdp_cfg.activation_offload=true`.
+
+`fsdp_wrap` uses PyTorch's `offload_wrapper` (`save_on_cpu(pin_memory=True)`),
+preserving tensor dtype. With activation checkpointing, offload wraps the
+checkpoint wrapper and moves its saved inputs; recomputed intermediates stay
+on the GPU. `ac_wrap_order` still chooses whether FSDP wraps the outer activation
+wrapper (`outside`) or the original block (`inside`). Checkpoint and weight-export
+keys retain their canonical names. Blocks must match `block_class_names`;
+an unmatched selection raises.
+
+`veomni_parallelize` applies the same `save_on_cpu(pin_memory=True)` context to
+each selected block's forward, outside its optional checkpoint call. It keeps
+the existing module hierarchy, EP parameter groups, and weight names intact.
+This path works with the pinned `veomni==0.1.12`; it does not use newer VeOmni
+async-offload APIs. `ac_wrap_order` applies only to `FSDPBackend`.
+
+CPU memory and CPU–GPU transfers replace GPU storage. Without checkpointing,
+PyTorch's `save_on_cpu` also copies parameter views saved by operations inside
+these blocks (for example `weight.t()` in `F.linear`) into pinned host memory
+before FSDP2 reshards them, which can exhaust host RAM on 30B+ models; pair
+`activation_offload: true` with `activation_checkpointing: true` at large scale.
+The native wrapper does not prefetch future layers; pinned memory alone does not
+guarantee transfer/computation overlap or faster training. Compare peak GPU/host
+memory and step time at fixed batch size before changing training geometry.
+
 ## Choosing HSDP (hybrid sharding)
 
 `fsdp_mode: hybrid` on `FSDPBackend` builds a
@@ -125,6 +163,10 @@ use LoRA adapter mode. Formats and export live in
 
 ## Gotchas
 
+- **Activation offload preserves dtype, not a bitwise-equivalence guarantee.**
+  PyTorch's pinned CPU copies may change saved tensor layouts; validate loss,
+  gradients and updates against the same recipe with offload disabled. GPU
+  memory savings and transfer overhead depend on the model and hardware.
 - **Unified `ar` / `image` results describe one shared optimizer step.** Their
   `optimizer_updates` (total and per update) count the same steps, so summing
   them across tracks double-counts.
@@ -196,9 +238,14 @@ use LoRA adapter mode. Formats and export live in
 - **`fsdp_wrap` shards the leftover params (embed / final norm / lm_head) into a
   root `fully_shard` group by default** (`root_wrap`, on) — the root group never
   reshards after forward. Set `root_wrap: false` for models whose stages call
-  submodules of the wrapped object directly (bagel) or that wrap frozen mixed-dtype
-  siblings (hunyuan_image3); a trainable param left outside every group fails fast
-  at `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
+  submodules of the wrapped object directly (bagel, janus_pro) or that keep frozen
+  mixed-dtype peripherals outside sharding (minimax_h3, cosmos3, hunyuan_image3);
+  when child blocks are wrapped, `fsdp_wrap` still installs a parameterless root
+  `fully_shard(..., ignored_params=...)` group and initializes its root state after
+  weight materialization so all blocks share one communication context and recycle
+  reduce-scatter buffers during backward without sharding or casting the leftover
+  parameters. A trainable param left outside every group fails fast at
+  `world_size > 1`, and on a single rank forces `foreach=False` on its optimizer
   param group (`optim.py`) and explicit norm reduction in `clip_grad_norm`
   (`backend/fsdp/state.py`) because `_foreach_*` rejects mixed `Tensor` and `DTensor`.
 - **`defer_grad_sync` needs the last micro-batch of an optimizer step to run a
@@ -264,6 +311,7 @@ use LoRA adapter mode. Formats and export live in
 - **Single-stage algorithms may return detached scalar tensor losses and metrics.**
   `TrainStack` materializes them together after the optimizer boundary, including
   across an accumulation window, and returns scalar micro results to the driver.
+  Loss sums stay on the FSDP mesh through reduction before that single host transfer.
   Float-only algorithm results keep their existing aggregation path.
 - **Backend-specific operators live in their owning backend or `models/<family>/`.**
   Keep `FSDPBackend` (`backend/fsdp/`) and `VeOmniBackend` (`backend/veomni/`) behind

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, ClassVar, Dict, Mapping, Optional, Type
 
 import torch
@@ -57,8 +58,8 @@ class PerSampleStepGRPO(FlowGRPO):
             conditions_cls=conditions_cls,
         )
         self.adv_clip_max = float(adv_clip_max)
-        if not self.adv_clip_max > 0.0:
-            raise ValueError(f"{name}: adv_clip_max must be > 0; got {adv_clip_max!r}.")
+        if not math.isfinite(self.adv_clip_max) or not self.adv_clip_max > 0.0:
+            raise ValueError(f"{name}: adv_clip_max must be finite and > 0; got {adv_clip_max!r}.")
         # The trainer stamps sde_index_per_sample, so a stage whose replay ignores it
         # would score every row at one group's sigma.
         if not getattr(self.stage, "supports_per_sample_sde_index", False):
@@ -73,6 +74,15 @@ class PerSampleStepGRPO(FlowGRPO):
                 f"{name} requires the stage strategy to be {self.required_strategy.__name__}; "
                 f"got {type(strategy).__name__}."
             )
+
+    def prepare_segment(self, *, conditions: Mapping[str, Condition], segment: LatentSegment) -> None:
+        """Freeze one per-row replay anchor on its device without materializing synthetic shared indices."""
+        if self.old_logp_source == "rollout":
+            super().prepare_segment(conditions=conditions, segment=segment)
+            return
+        typed_conds = typed_conditions(conditions, self.conditions_cls)
+        with torch.no_grad():
+            segment.sde_logp = self.stage.replay(typed_conds, segment=segment, params=self.params).log_probs.detach()
 
     def compute_loss_and_backward(
         self,
