@@ -485,7 +485,7 @@ class ARTrainer(BaseTrainer):
             rollout_id,
             allowed_primitives=self._allowed_input_primitives,
             caller="ARTrainer._build_request_sample",
-            rng_id=rng_id,
+            rng_id=rollout_id if rng_id is None else rng_id,
         )
         return request.fork(total_samples_per_prompt(sp), sampling_params=sp["ar"])
 
@@ -613,11 +613,9 @@ class ARTrainer(BaseTrainer):
             temperature=self.eval_temperature,
         )
         eval_sp = {**self.sampling_params, "ar": eval_ar}
-        eval_batches = list(
-            self.data_source.iter_eval_batches(
-                self.eval_batch_size,
-                eval_num_prompts=self.eval_num_prompts,
-            )
+        eval_batches = self.data_source.iter_eval_batches(
+            self.eval_batch_size,
+            eval_num_prompts=self.eval_num_prompts,
         )
         reward_sum, reward_n, prompt_n, batch_n = 0.0, 0, 0, 0
         # Rollout and reward each DP-split the request, so every dispatched batch is a multiple of both DP sizes.
@@ -654,11 +652,12 @@ class ARTrainer(BaseTrainer):
                     real_prompt_n = eval_inputs.batch_size
                     prompt_n += real_prompt_n
                     dispatch_inputs = pad_eval_inputs(eval_inputs, pad_multiple)
+                    eval_diagonal = rollout_id + batch_index + 1
                     sample = self._build_request_sample(
                         dispatch_inputs,
                         rollout_id,
                         sampling=eval_sp,
-                        rng_id=-1 - ((rollout_id + 1) * len(eval_batches) + batch_index),  # < 0: disjoint from training
+                        rng_id=-1 - (eval_diagonal * (eval_diagonal + 1) // 2 + batch_index),
                     )
                     generated = self.rollout.generate(sample)
                     scored = score_and_attach(self.reward, generated)

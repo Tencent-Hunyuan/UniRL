@@ -8,7 +8,7 @@ from typing import ClassVar, Dict, Optional
 import torch
 
 from unirl.distributed.tensor.batch import Batch, FieldKind, field, packed_field
-from unirl.types.conditions import Condition, Modality, TextTokenCondition
+from unirl.types.conditions import Condition, ImageLatentCondition, Modality, TextTokenCondition
 
 
 @dataclass
@@ -25,10 +25,11 @@ class Cosmos3SFTCondition(Condition):
 
 @dataclass
 class Cosmos3Conditions(Batch):
-    """Generation conditions: right-padded cond / uncond prompt token ids ``[B, L]`` with masks."""
+    """Generation conditions: cond / uncond prompt token ids ``[B, L]`` and the optional clean first latent frame."""
 
     text: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
     negative_text: Optional[TextTokenCondition] = field(kind=FieldKind.CONCAT, default=None)
+    image_latent: Optional[ImageLatentCondition] = field(kind=FieldKind.CONCAT, default=None)  # [B, C, 1, H_lat, W_lat]
 
     @classmethod
     def from_dict(cls, d: Dict[str, Condition]) -> "Cosmos3Conditions":
@@ -45,7 +46,13 @@ class Cosmos3Conditions(Batch):
                 f"Cosmos3Conditions.from_dict: expected d['negative_text'] to be a "
                 f"TextTokenCondition or absent, got {type(negative_text).__name__}"
             )
-        return cls(text=text, negative_text=negative_text)
+        image_latent = d.get("image_latent")
+        if image_latent is not None and not isinstance(image_latent, ImageLatentCondition):
+            raise TypeError(
+                f"Cosmos3Conditions.from_dict: expected d['image_latent'] to be an "
+                f"ImageLatentCondition or absent, got {type(image_latent).__name__}"
+            )
+        return cls(text=text, negative_text=negative_text, image_latent=image_latent)
 
     def to_dict(self) -> Dict[str, Condition]:
         """Convert back to the generic ``Part.conditions`` dict."""
@@ -54,6 +61,8 @@ class Cosmos3Conditions(Batch):
         out: Dict[str, Condition] = {"text": self.text}
         if self.negative_text is not None:
             out["negative_text"] = self.negative_text
+        if self.image_latent is not None:
+            out["image_latent"] = self.image_latent
         return out
 
 
